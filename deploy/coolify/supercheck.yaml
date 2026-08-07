@@ -11,18 +11,18 @@
 
 # YAML anchors for shared configuration
 x-common-env: &common-env # Database Configuration
-  DATABASE_URL: postgresql://postgres:postgres@supercheck-db:5432/supercheck
+  DATABASE_URL: postgresql://postgres:${SERVICE_PASSWORD_POSTGRES}@supercheck-db:5432/supercheck
   DB_HOST: supercheck-db
   DB_PORT: 5432
   DB_USER: postgres
-  DB_PASSWORD: postgres
+  DB_PASSWORD: ${SERVICE_PASSWORD_POSTGRES}
   DB_NAME: supercheck
 
   # Redis Configuration
   REDIS_HOST: supercheck-redis
   REDIS_PORT: 6379
-  REDIS_PASSWORD: supercheck-redis-password
-  REDIS_URL: redis://:supercheck-redis-password@supercheck-redis:6379
+  REDIS_PASSWORD: ${SERVICE_PASSWORD_REDIS}
+  REDIS_URL: redis://:${SERVICE_PASSWORD_REDIS}@supercheck-redis:6379
   REDIS_TLS_ENABLED: false
   REDIS_TLS_REJECT_UNAUTHORIZED: false
 
@@ -170,9 +170,9 @@ services:
     image: postgres:18
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_PASSWORD: ${SERVICE_PASSWORD_POSTGRES}
       POSTGRES_DB: supercheck
-      PGPASSWORD: postgres
+      PGPASSWORD: ${SERVICE_PASSWORD_POSTGRES}
     volumes:
       - supercheck-postgres-data-v10:/var/lib/postgresql
     restart: unless-stopped
@@ -194,12 +194,12 @@ services:
   # Redis Cache & Queue
   supercheck-redis:
     image: redis:8
-    command: sh -c "rm -rf /data/* && redis-server --requirepass \"supercheck-redis-password\" --maxmemory 512mb --maxmemory-policy noeviction --save '' --appendonly no --protected-mode yes --bind 0.0.0.0 --tcp-keepalive 300"
+    command: sh -c "rm -rf /data/* && redis-server --requirepass \"${SERVICE_PASSWORD_REDIS}\" --maxmemory 512mb --maxmemory-policy noeviction --save '' --appendonly no --protected-mode yes --bind 0.0.0.0 --tcp-keepalive 300"
     volumes:
       - supercheck-redis-data-v2:/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "supercheck-redis-password", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${SERVICE_PASSWORD_REDIS}", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
