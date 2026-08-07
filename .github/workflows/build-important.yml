@@ -1,0 +1,78 @@
+name: Build obrazow (important.is)
+
+# Buduje obrazy app i worker z gałęzi `important` i wypycha je do GHCR pod
+# tym repozytorium. Wdrożenie na tests.important.is ciągnie je przez zmienną
+# IMAGE_REPO w Coolify, więc powrót na obrazy upstreamu to zmiana jednej zmiennej.
+#
+# Świadome różnice wobec workflow upstreamu (build-multiarch.yml):
+#   - tylko linux/amd64 (serwer jest x86, arm64 przez QEMU wydłużał build kilkukrotnie)
+#   - logowanie wbudowanym GITHUB_TOKEN zamiast sekretu PAT_TOKEN, którego tu nie ma
+#   - tagi `important` (ruchomy) i pełny SHA commita (do przypięcia i rollbacku)
+
+on:
+  push:
+    branches: [important]
+    paths:
+      - "app/**"
+      - "worker/**"
+      - ".github/workflows/build-important.yml"
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [app, worker]
+
+    steps:
+      - name: Pobierz kod
+        uses: actions/checkout@v4
+
+      - name: Zwolnij miejsce na dysku runnera
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          df -h / | tail -1
+
+      - name: Ustaw buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Zaloguj do GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Metadane obrazu
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.package }}
+          tags: |
+            type=raw,value=important
+            type=sha,format=long
+
+      - name: Zbuduj i wypchnij
+        uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.package }}
+          file: ./${{ matrix.package }}/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.package }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.package }}
+          provenance: false
+
+      - name: Podsumowanie
+        run: |
+          echo "Obrazy: ${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY

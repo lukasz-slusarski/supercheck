@@ -239,7 +239,7 @@ services:
 
   # App (Next.js Frontend + API)
   app:
-    image: ghcr.io/supercheck-io/supercheck/app:${SUPERCHECK_VERSION:-latest}
+    image: ${IMAGE_REPO:-ghcr.io/supercheck-io/supercheck}/app:${SUPERCHECK_VERSION:-latest}
     environment:
       <<: *common-env
     depends_on:
@@ -269,12 +269,12 @@ services:
 
   # Worker (NestJS Test Runner)
   worker:
-    image: ghcr.io/supercheck-io/supercheck/worker:${SUPERCHECK_VERSION:-latest}
+    image: ${IMAGE_REPO:-ghcr.io/supercheck-io/supercheck}/worker:${SUPERCHECK_VERSION:-latest}
     init: true
     user: "1000:1000"
     environment:
       <<: *common-env
-      WORKER_IMAGE: ghcr.io/supercheck-io/supercheck/worker:${SUPERCHECK_VERSION:-latest}
+      WORKER_IMAGE: ${IMAGE_REPO:-ghcr.io/supercheck-io/supercheck}/worker:${SUPERCHECK_VERSION:-latest}
       EXECUTION_NAMESPACE: ${EXECUTION_NAMESPACE:-supercheck-execution}
       KUBECONFIG: /run/secrets/supercheck-kubeconfig
     # The long-lived worker is only the control plane.
