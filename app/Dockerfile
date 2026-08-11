@@ -43,6 +43,7 @@ COPY . .
 # Note: CHATWOOT_* variables are read at runtime via /api/config/chatwoot (not build-time)
 ENV NODE_OPTIONS="--max-old-space-size=4096"
 ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
 
 # Build with standalone output and static optimization
 # Use a build-time placeholder secret that will be overridden at runtime
@@ -64,6 +65,7 @@ LABEL org.opencontainers.image.title="Supercheck App"
 LABEL org.opencontainers.image.description="Next.js frontend service for Supercheck - A comprehensive automation & monitoring platform for modern apps. Includes dashboard, job scheduling, test execution, and monitoring capabilities with multi-tenant support."
 
 ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
 
 # Create user
 RUN groupadd --system --gid 1001 nodejs && \
