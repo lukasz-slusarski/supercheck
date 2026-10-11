@@ -1,7 +1,7 @@
 import { Metadata } from "next/types";
 
 export const metadata: Metadata = {
-  title: "Variables | Supercheck",
+  title: "Variables | Uptime important.is",
   description: "View and manage all variables and secrets",
 };
 

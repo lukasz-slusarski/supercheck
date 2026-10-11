@@ -26,7 +26,7 @@ export const EmailVerificationEmail = ({
         <Text style={paragraph}>Hi {userName},</Text>
 
         <Text style={paragraph}>
-          Thanks for signing up for Supercheck! Please verify your email address
+          Thanks for signing up for Uptime important.is! Please verify your email address
           to complete your registration:
         </Text>
 
@@ -59,7 +59,7 @@ export const EmailVerificationEmail = ({
             enables important features like password recovery.
           </Text>
           <Text style={infoText}>
-            If you didn&apos;t create an account with Supercheck, you can safely
+            If you didn&apos;t create an account with Uptime important.is, you can safely
             ignore this email.
           </Text>
         </Section>

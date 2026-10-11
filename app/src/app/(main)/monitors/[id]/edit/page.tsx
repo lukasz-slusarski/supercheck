@@ -15,7 +15,7 @@ import { Button } from "@/components/ui/button";
 
 // Can't use metadata in client components, remove this
 // export const metadata: Metadata = {
-//   title: "Edit Monitor | Supercheck",
+//   title: "Edit Monitor | Uptime important.is",
 //   description: "Edit your monitor configuration",
 // };
 

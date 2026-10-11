@@ -575,7 +575,7 @@ export function MonitorDetailClient({
                   href="/"
                   className="text-xl font-semibold text-foreground hover:opacity-80 transition-opacity"
                 >
-                  Supercheck
+                  Uptime important.is
                 </Link>
 
                 <span className="mx-2 text-muted-foreground/30">|</span>

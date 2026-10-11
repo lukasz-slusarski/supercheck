@@ -1,7 +1,7 @@
 import { Metadata } from "next";
 
 export const metadata: Metadata = {
-  title: "Invitation | Supercheck",
+  title: "Invitation | Uptime important.is",
   description: "Accept your organization invitation",
 };
 

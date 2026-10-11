@@ -117,11 +117,11 @@ export async function generateMetadata({ params }: MonitorDetailsPageProps): Pro
   const monitor = await getMonitorDetailsDirectly(id);
   if (!monitor) {
     return {
-      title: "Monitor Not Found | Supercheck",
+      title: "Monitor Not Found | Uptime important.is",
     };
   }
   return {
-    title: "Monitor Details | Supercheck",
+    title: "Monitor Details | Uptime important.is",
     description: "Details and results for monitor",
   };
 }

@@ -1,7 +1,7 @@
 import { Metadata } from "next/types";
 
 export const metadata: Metadata = {
-  title: "Status Pages | Supercheck",
+  title: "Status Pages | Uptime important.is",
   description: "View and edit status pages",
 };
 

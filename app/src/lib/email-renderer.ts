@@ -40,7 +40,7 @@ export async function renderPasswordResetEmail(params: {
   const component = PasswordResetEmail(params);
 
   return {
-    subject: "Reset your Supercheck password",
+    subject: "Reset your Uptime important.is password",
     html: await render(component, { pretty: false }),
     text: await render(component, { plainText: true }),
   };
@@ -57,7 +57,7 @@ export async function renderEmailVerificationEmail(params: {
   const component = EmailVerificationEmail(params);
 
   return {
-    subject: "Verify your email address - Supercheck",
+    subject: "Verify your email address - Uptime important.is",
     html: await render(component, { pretty: false }),
     text: await render(component, { plainText: true }),
   };
@@ -75,7 +75,7 @@ export async function renderOrganizationInvitationEmail(params: {
   const component = OrganizationInvitationEmail(params);
 
   return {
-    subject: `You're invited to join ${params.organizationName} on Supercheck`,
+    subject: `You're invited to join ${params.organizationName} on Uptime important.is`,
     html: await render(component, { pretty: false }),
     text: await render(component, { plainText: true }),
   };
@@ -176,7 +176,7 @@ export async function renderTestEmail(params?: {
   const component = TestEmail(params || {});
 
   return {
-    subject: "Test Email from Supercheck",
+    subject: "Test Email from Uptime important.is",
     html: await render(component, { pretty: false }),
     text: await render(component, { plainText: true }),
   };
@@ -206,12 +206,12 @@ export async function renderUsageNotificationEmail(params: {
   const component = UsageNotificationEmail(params);
 
   const subjectMap: Record<string, string> = {
-    usage_50_percent: `[50% Usage] ${params.organizationName} - Supercheck`,
-    usage_80_percent: `[80% Warning] ${params.organizationName} - Supercheck`,
-    usage_90_percent: `[90% Critical] ${params.organizationName} - Supercheck`,
-    usage_100_percent: `[Limit Reached] ${params.organizationName} - Supercheck`,
-    spending_limit_warning: `[Spending Warning] ${params.organizationName} - Supercheck`,
-    spending_limit_reached: `[Spending Limit] ${params.organizationName} - Supercheck`,
+    usage_50_percent: `[50% Usage] ${params.organizationName} - Uptime important.is`,
+    usage_80_percent: `[80% Warning] ${params.organizationName} - Uptime important.is`,
+    usage_90_percent: `[90% Critical] ${params.organizationName} - Uptime important.is`,
+    usage_100_percent: `[Limit Reached] ${params.organizationName} - Uptime important.is`,
+    spending_limit_warning: `[Spending Warning] ${params.organizationName} - Uptime important.is`,
+    spending_limit_reached: `[Spending Limit] ${params.organizationName} - Uptime important.is`,
   };
 
   return {

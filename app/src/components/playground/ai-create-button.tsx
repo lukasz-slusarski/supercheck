@@ -351,7 +351,7 @@ export function AICreateButton({
               <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-purple-500/20 to-pink-500/20">
                 <Sparkles className="h-4 w-4 text-purple-500" />
               </div>
-              <span>Supercheck AI - Create Test</span>
+              <span>important.is AI - Create Test</span>
             </DialogTitle>
             <DialogDescription className="pt-1">
               Create new test scripts or enhance existing ones with AI

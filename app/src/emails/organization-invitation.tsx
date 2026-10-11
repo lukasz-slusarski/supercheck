@@ -22,7 +22,7 @@ export const OrganizationInvitationEmail = ({
 }: OrganizationInvitationEmailProps) => {
   return (
     <BaseLayout
-      preview={`You're invited to join ${organizationName} on Supercheck`}
+      preview={`You're invited to join ${organizationName} on Uptime important.is`}
       title="Team Invitation"
       headerColor="#16a34a" // Green-600
     >
@@ -32,7 +32,7 @@ export const OrganizationInvitationEmail = ({
 
         <Text style={paragraph}>
           You&apos;ve been invited to join <strong>{organizationName}</strong> on
-          Supercheck.
+          Uptime important.is.
         </Text>
 
         <Section style={roleBox}>

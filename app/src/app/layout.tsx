@@ -13,7 +13,7 @@ const systemFonts = {
 };
 
 export const metadata: Metadata = {
-  title: "Dashboard | Supercheck",
+  title: "Dashboard | Uptime important.is",
   description: "Automate and Monitor your applications",
 };
 

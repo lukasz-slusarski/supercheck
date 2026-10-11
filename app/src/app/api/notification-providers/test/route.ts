@@ -220,7 +220,7 @@ async function testSlackConnection(config: NotificationProviderConfig) {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        text: "Test message from Supercheck - Connection test successful!",
+        text: "Test message from Uptime important.is - Connection test successful!",
         channel: typedConfig.channel,
       }),
     });
@@ -273,7 +273,7 @@ async function testWebhookConnection(config: NotificationProviderConfig) {
             typedConfig.bodyTemplate as string,
             {
               title: 'Test "Alert"',
-              message: "Connection test from Supercheck",
+              message: "Connection test from Uptime important.is",
               severity: "error",
               normalizedSeverity: "error",
               status: "down",
@@ -297,7 +297,7 @@ async function testWebhookConnection(config: NotificationProviderConfig) {
           )
         : JSON.stringify({
             test: true,
-            message: "Connection test from Supercheck",
+            message: "Connection test from Uptime important.is",
           });
 
     // Add timeout to prevent hanging connections
@@ -365,7 +365,7 @@ async function testTelegramConnection(config: NotificationProviderConfig) {
       },
       body: JSON.stringify({
         chat_id: typedConfig.chatId,
-        text: "Test message from Supercheck - Connection test successful!",
+        text: "Test message from Uptime important.is - Connection test successful!",
       }),
     });
 
@@ -437,7 +437,7 @@ async function testDiscordConnection(config: NotificationProviderConfig) {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        content: "Test message from Supercheck - Connection test successful!",
+        content: "Test message from Uptime important.is - Connection test successful!",
       }),
     });
 
@@ -519,7 +519,7 @@ async function testTeamsConnection(config: NotificationProviderConfig) {
             body: [
               {
                 type: "TextBlock",
-                text: "✅ Supercheck Connection Test",
+                text: "✅ Uptime important.is Connection Test",
                 weight: "bolder",
                 size: "large",
                 color: "good",
@@ -527,7 +527,7 @@ async function testTeamsConnection(config: NotificationProviderConfig) {
               },
               {
                 type: "TextBlock",
-                text: "This is a test message from Supercheck to verify your Microsoft Teams webhook is configured correctly.",
+                text: "This is a test message from Uptime important.is to verify your Microsoft Teams webhook is configured correctly.",
                 wrap: true,
                 spacing: "medium",
               },

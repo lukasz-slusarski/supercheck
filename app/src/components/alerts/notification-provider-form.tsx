@@ -610,7 +610,7 @@ export function NotificationProviderForm({
                     />
                   </FormControl>
                   <div className="text-sm text-muted-foreground">
-                    Templates must be valid JSON. Supercheck safely escapes
+                    Templates must be valid JSON. Uptime important.is safely escapes
                     variables like{" "}
                     <code>{"{{title}}"}</code>, <code>{"{{status}}"}</code>,
                     <code>{"{{normalizedSeverity}}"}</code>,{" "}

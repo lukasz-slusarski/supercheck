@@ -52,7 +52,7 @@ export const BaseLayout = ({
               {showStandardFooter && (
                 <Text style={standardFooterText}>
                   <Link href="https://supercheck.io" style={footerLink}>
-                    Supercheck
+                    Uptime important.is
                   </Link>
                   {" • "}
                   <Link href="https://supercheck.io/privacy" style={footerLink}>

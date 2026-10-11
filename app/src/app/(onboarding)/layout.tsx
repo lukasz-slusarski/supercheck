@@ -7,7 +7,7 @@ import { SignOutButton } from "@/components/sign-out-button";
 import type { Metadata } from "next";
 
 export const metadata: Metadata = {
-  title: "Subscription | Supercheck",
+  title: "Subscription | Uptime important.is",
   description: "Manage your subscription and billing information",
 };
 
@@ -41,7 +41,7 @@ export default async function OnboardingLayout({
           <div className="container mx-auto px-4 py-4 flex items-center justify-between">
             <div className="flex items-center gap-2">
               <CheckIcon className="h-7 w-7" />
-              <span className="font-semibold text-lg">Supercheck</span>
+              <span className="font-semibold text-lg">Uptime important.is</span>
             </div>
             <div className="flex items-center gap-4">
               <span className="text-sm text-muted-foreground">

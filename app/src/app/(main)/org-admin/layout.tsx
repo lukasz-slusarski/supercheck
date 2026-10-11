@@ -7,7 +7,7 @@ import { getActiveOrganization, getCurrentUser } from "@/lib/session";
 import { Metadata } from "next/types";
 
 export const metadata: Metadata = {
-  title: "Admin | Supercheck",
+  title: "Admin | Uptime important.is",
   description: "View and manage all organization settings",
 };
 

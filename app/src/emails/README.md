@@ -311,7 +311,7 @@ APP_URL=http://localhost:3000
    export const MyNewTemplate = ({ userName }: MyNewTemplateProps) => {
      return (
        <BaseLayout
-         preview="Welcome to Supercheck"
+         preview="Welcome to Uptime important.is"
          title="Welcome!"
        >
          <Text>Hello {userName}!</Text>

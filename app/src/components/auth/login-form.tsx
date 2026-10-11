@@ -117,12 +117,12 @@ export function LoginForm({
               <div className="flex size-14 items-center justify-center rounded-md">
                 <SupercheckLogo className="size-12" />
               </div>
-              <span className="sr-only">Supercheck</span>
+              <span className="sr-only">Uptime important.is</span>
 
               <h1 className="text-2xl font-bold">
                 {inviteData
                   ? `Welcome to ${inviteData.organizationName}`
-                  : "Welcome to Supercheck"}
+                  : "Welcome to Uptime important.is"}
               </h1>
               <FieldDescription>
                 {inviteData ? (

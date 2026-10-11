@@ -10,7 +10,7 @@ import { MonitorTypesPopover } from "@/components/monitors/monitor-types-popover
 import { SuperCheckLoading } from "@/components/shared/supercheck-loading";
 
 export const metadata: Metadata = {
-  title: "Create Monitor | Supercheck",
+  title: "Create Monitor | Uptime important.is",
   description: "Create a new monitor for uptime monitoring",
 };
 

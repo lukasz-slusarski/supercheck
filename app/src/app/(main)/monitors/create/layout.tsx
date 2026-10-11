@@ -2,7 +2,7 @@ import { Metadata } from "next";
 import { PageBreadcrumbs } from "@/components/page-breadcrumbs";
 
 export const metadata: Metadata = {
-  title: "Create Monitor | Supercheck",
+  title: "Create Monitor | Uptime important.is",
   description: "Create a new uptime monitor",
 };
 

@@ -4,8 +4,8 @@ import { redirect } from "next/navigation";
 import type { Metadata } from "next";
 
 export const metadata: Metadata = {
-  title: "Notification | Supercheck",
-  description: "Supercheck alert notification",
+  title: "Notification | Uptime important.is",
+  description: "Uptime important.is alert notification",
 };
 
 export default async function NotificationLayout({

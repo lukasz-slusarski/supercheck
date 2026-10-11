@@ -66,7 +66,7 @@ async function processEmailTemplateJob(
           title: data.title || "Monitor Alert",
           message: data.message || "",
           fields: data.fields || [],
-          footer: data.footer || "Supercheck Monitoring System",
+          footer: data.footer || "Uptime important.is Monitoring System",
           type: type,
           color: color,
         });
@@ -212,7 +212,7 @@ async function renderJobFailureEmail(
     title: `Job Failed - ${params.jobName}`,
     message: `Job "${params.jobName}" has failed. Please review the details below.`,
     fields,
-    footer: "Supercheck Job Monitoring",
+    footer: "Uptime important.is Job Monitoring",
     type: "failure",
     color: COLOR_FAILURE,
   });
@@ -249,7 +249,7 @@ async function renderJobSuccessEmail(
     title: `Job Completed - ${params.jobName}`,
     message: `Job "${params.jobName}" has completed successfully.`,
     fields,
-    footer: "Supercheck Job Monitoring",
+    footer: "Uptime important.is Job Monitoring",
     type: "success",
     color: COLOR_SUCCESS,
   });
@@ -285,7 +285,7 @@ async function renderJobTimeoutEmail(
     title: `Job Timeout - ${params.jobName}`,
     message: `Job "${params.jobName}" timed out after ${params.duration} seconds. No ping received within expected interval.`,
     fields,
-    footer: "Supercheck Job Monitoring",
+    footer: "Uptime important.is Job Monitoring",
     type: "warning",
     color: COLOR_WARNING,
   });
@@ -399,7 +399,7 @@ function generateFallbackHTML(template: string, data: EmailTemplateData): string
           <!-- Header -->
           <tr>
             <td style="background-color: ${config.color}; padding: 20px; text-align: center;">
-              <h1 style="color: #ffffff; font-size: 24px; font-weight: normal; margin: 0;">Supercheck Notification</h1>
+              <h1 style="color: #ffffff; font-size: 24px; font-weight: normal; margin: 0;">Uptime important.is Notification</h1>
             </td>
           </tr>
           
@@ -497,7 +497,7 @@ function getTemplateConfig(template: string, data: EmailTemplateData): {
         message: data.message || "",
         color: color,
         fields: data.fields || [],
-        footer: data.footer || "Supercheck Monitoring System",
+        footer: data.footer || "Uptime important.is Monitoring System",
       };
 
     case "job-failure":
@@ -513,7 +513,7 @@ function getTemplateConfig(template: string, data: EmailTemplateData): {
           ...(data.runId ? [{ title: "Run ID", value: data.runId }] : []),
           ...(data.dashboardUrl ? [{ title: "🔗 Job Details", value: data.dashboardUrl }] : []),
         ],
-        footer: "Supercheck Job Monitoring",
+        footer: "Uptime important.is Job Monitoring",
       };
 
     case "job-success":
@@ -528,7 +528,7 @@ function getTemplateConfig(template: string, data: EmailTemplateData): {
           ...(data.runId ? [{ title: "Run ID", value: data.runId }] : []),
           ...(data.dashboardUrl ? [{ title: "🔗 Job Details", value: data.dashboardUrl }] : []),
         ],
-        footer: "Supercheck Job Monitoring",
+        footer: "Uptime important.is Job Monitoring",
       };
 
     case "job-timeout":
@@ -543,7 +543,7 @@ function getTemplateConfig(template: string, data: EmailTemplateData): {
           ...(data.runId ? [{ title: "Run ID", value: data.runId }] : []),
           ...(data.dashboardUrl ? [{ title: "🔗 Job Details", value: data.dashboardUrl }] : []),
         ],
-        footer: "Supercheck Job Monitoring",
+        footer: "Uptime important.is Job Monitoring",
       };
 
     case "password-reset":
@@ -614,8 +614,8 @@ function getTemplateConfig(template: string, data: EmailTemplateData): {
 
     case "test-email":
       return {
-        title: "Supercheck Test Email",
-        message: data.testMessage || "This is a test email from Supercheck to verify your email configuration.",
+        title: "Uptime important.is Test Email",
+        message: data.testMessage || "This is a test email from Uptime important.is to verify your email configuration.",
         color: COLOR_SUCCESS,
         fields: [],
         footer: "If you received this email, your notification system is working correctly.",
@@ -623,14 +623,14 @@ function getTemplateConfig(template: string, data: EmailTemplateData): {
 
     default:
       return {
-        title: "Supercheck Notification",
-        message: "A notification has been sent from Supercheck.",
+        title: "Uptime important.is Notification",
+        message: "A notification has been sent from Uptime important.is.",
         color: COLOR_INFO,
         fields: Object.entries(data).map(([key, value]) => ({
           title: key.charAt(0).toUpperCase() + key.slice(1),
           value: String(value),
         })),
-        footer: "Supercheck Notification System",
+        footer: "Uptime important.is Notification System",
       };
   }
 }

@@ -255,11 +255,11 @@ export default function InvitePage({
               <div className="flex size-14 items-center justify-center rounded-md">
                 <CheckIcon className="size-12" />
               </div>
-              <span className="sr-only">Supercheck</span>
+              <span className="sr-only">Uptime important.is</span>
             </Link>
             <h1 className="text-2xl font-bold">You&apos;re Invited!</h1>
             <FieldDescription>
-              Join {invitation.organizationName} on Supercheck
+              Join {invitation.organizationName} on Uptime important.is
             </FieldDescription>
           </div>
 

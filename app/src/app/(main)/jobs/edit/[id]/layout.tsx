@@ -3,7 +3,7 @@ import { Metadata } from "next/types";
 // Generate metadata with the job ID
 export async function generateMetadata(): Promise<Metadata> {
   return {
-    title: `Edit Job | Supercheck`,
+    title: `Edit Job | Uptime important.is`,
     description: `Edit configuration for job`,
   };
 }

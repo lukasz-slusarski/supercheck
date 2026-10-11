@@ -4,7 +4,7 @@ import { PageBreadcrumbs } from "@/components/page-breadcrumbs";
 import { notFound } from "next/navigation";
 
 export const metadata: Metadata = {
-  title: "Edit Alert Settings | Supercheck",
+  title: "Edit Alert Settings | Uptime important.is",
   description: "Edit notification provider configuration",
 };
 

@@ -19,7 +19,7 @@ export const PasswordResetEmail = ({
 }: PasswordResetEmailProps) => {
   return (
     <BaseLayout
-      preview="Reset your Supercheck password"
+      preview="Reset your Uptime important.is password"
       title="Password Reset Request"
       headerColor="#1f2937" // Gray-800
     >
@@ -28,7 +28,7 @@ export const PasswordResetEmail = ({
         <Text style={heading}>Reset Your Password</Text>
 
         <Text style={paragraph}>
-          You requested a password reset for your Supercheck account:
+          You requested a password reset for your Uptime important.is account:
         </Text>
 
         <Text style={emailHighlight}>{userEmail}</Text>

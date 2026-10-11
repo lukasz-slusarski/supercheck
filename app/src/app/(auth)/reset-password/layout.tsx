@@ -1,8 +1,8 @@
 import { Metadata } from "next";
 
 export const metadata: Metadata = {
-  title: "Reset Password | Supercheck",
-  description: "Reset your Supercheck account password",
+  title: "Reset Password | Uptime important.is",
+  description: "Reset your Uptime important.is account password",
 };
 
 export default function ResetPasswordLayout({

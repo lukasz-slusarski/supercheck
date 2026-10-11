@@ -19,7 +19,7 @@ import { ProjectContextProvider } from "@/hooks/use-project-context";
 import { Metadata } from "next/types";
 
 export const metadata: Metadata = {
-  title: "Super Admin | Supercheck",
+  title: "Super Admin | Uptime important.is",
   description: "View and manage all super admin settings",
 };
 

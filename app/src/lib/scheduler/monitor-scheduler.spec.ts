@@ -68,9 +68,11 @@ import {
 } from "@/lib/location-registry";
 import {
   isMonitorLocationResolutionError,
+  partitionMonitorLocationsByAvailability,
   resolveDefaultMonitorLocations,
   resolveMonitorLocations,
 } from "@/lib/monitor-location-routing";
+import { getQueues } from "@/lib/queue";
 import { processScheduledMonitor } from "./monitor-scheduler";
 
 const mockMonitorsFindFirst = db.query.monitors.findFirst as jest.Mock;
@@ -140,6 +142,81 @@ describe("monitor-scheduler", () => {
     );
     expect(mockGetFirstVisibleProjectRestrictionCode).toHaveBeenCalledWith(
       "project-1"
+    );
+  });
+
+  it("ignores the first scheduling failure after a healthy check (worker restart)", async () => {
+    const noWorkersError =
+      "Monitor monitor-1: no jobs enqueued \u2014 none of the expected locations [local] have live workers.";
+
+    mockResolveMonitorLocations.mockResolvedValue(["local"]);
+    mockIsMonitorLocationResolutionError.mockReturnValue(false);
+    (partitionMonitorLocationsByAvailability as jest.Mock).mockResolvedValue({
+      enqueuedLocations: [],
+      skippedLocations: ["local"],
+    });
+    (getQueues as jest.Mock).mockResolvedValue({
+      monitorExecutionQueue: {},
+      monitorSchedulerQueue: {},
+    });
+    mockMonitorResultsFindFirst.mockResolvedValue({
+      location: "local",
+      isUp: true,
+      consecutiveFailureCount: 0,
+      alertsSentForFailure: 0,
+    });
+
+    await expect(
+      processScheduledMonitor({
+        data: {
+          monitorId: "monitor-1",
+          projectId: "project-1",
+          type: "website",
+          target: "https://example.com",
+        },
+      } as never)
+    ).rejects.toThrow(/no jobs enqueued/);
+
+    expect(mockInsertValues).not.toHaveBeenCalled();
+    expect(db.update).not.toHaveBeenCalled();
+  });
+
+  it("records the scheduling failure when the previous check already failed", async () => {
+    mockResolveMonitorLocations.mockResolvedValue(["local"]);
+    mockIsMonitorLocationResolutionError.mockReturnValue(false);
+    (partitionMonitorLocationsByAvailability as jest.Mock).mockResolvedValue({
+      enqueuedLocations: [],
+      skippedLocations: ["local"],
+    });
+    (getQueues as jest.Mock).mockResolvedValue({
+      monitorExecutionQueue: {},
+      monitorSchedulerQueue: {},
+    });
+    mockMonitorResultsFindFirst.mockResolvedValue({
+      location: "local",
+      isUp: false,
+      consecutiveFailureCount: 1,
+      alertsSentForFailure: 0,
+    });
+
+    await expect(
+      processScheduledMonitor({
+        data: {
+          monitorId: "monitor-1",
+          projectId: "project-1",
+          type: "website",
+          target: "https://example.com",
+        },
+      } as never)
+    ).rejects.toThrow(/no jobs enqueued/);
+
+    expect(mockInsertValues).toHaveBeenCalledWith(
+      expect.objectContaining({
+        monitorId: "monitor-1",
+        status: "error",
+        isUp: false,
+        consecutiveFailureCount: 2,
+      })
     );
   });
 });

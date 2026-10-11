@@ -240,6 +240,10 @@ services:
   # App (Next.js Frontend + API)
   app:
     image: ${IMAGE_REPO:-ghcr.io/supercheck-io/supercheck}/app:${SUPERCHECK_VERSION:-latest}
+    labels:
+      # Dozzle wyswietla te nazwe zamiast identyfikatora kontenera.
+      # UWAGA: Coolify NIE podstawia ${ZMIENNYCH} w sekcji labels, wartosc musi byc wprost.
+      - dev.dozzle.name=tests.important.is
     environment:
       <<: *common-env
     depends_on:
@@ -270,6 +274,8 @@ services:
   # Worker (NestJS Test Runner)
   worker:
     image: ${IMAGE_REPO:-ghcr.io/supercheck-io/supercheck}/worker:${SUPERCHECK_VERSION:-latest}
+    labels:
+      - dev.dozzle.name=tests.important.is · worker
     init: true
     user: "1000:1000"
     environment:

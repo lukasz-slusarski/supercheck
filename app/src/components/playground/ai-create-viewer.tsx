@@ -176,7 +176,7 @@ export function AICreateViewer({
                 <Sparkles className="h-4 w-4 text-purple-500" />
               </div>
               <h2 className="text-base font-semibold flex items-center gap-2">
-                Supercheck AI - Generated Script
+                important.is AI - Generated Script
                 {isStreaming && (
                   <Loader2 className="h-4 w-4 animate-spin text-purple-500" />
                 )}

@@ -1,36 +1,47 @@
+/* eslint-disable @next/next/no-img-element */
 import * as React from "react";
 
 /**
- * SupercheckLogo - The official Supercheck brand logo
- * 
- * Design: Green rounded rectangle with a white checkmark inside
- * This is the single source of truth for the Supercheck logo across the app.
+ * Logo important.is — nasze wdrożenie wewnętrzne.
+ *
+ * Nazwa komponentu i ścieżka pliku celowo pozostają bez zmian (SupercheckLogo),
+ * żeby nie ruszać dwudziestu kilku miejsc importu i nie mnożyć konfliktów przy
+ * zaciąganiu zmian z upstreamu. Podmieniona jest wyłącznie treść.
+ *
+ * Źródło grafiki: oryginalny plik marki, 4320x4320 z przezroczystością,
+ * przeskalowany do 512 px i zapisany w app/public/important-logo.png.
+ * Nie odtwarzamy logo ścieżkami SVG: kształt liter jest autorski, a ręczna
+ * rekonstrukcja daje wynik podobny, lecz nie identyczny.
+ *
+ * Sygnatura zostaje zgodna z oryginałem (React.SVGProps), bo komponent jest
+ * wołany na trzy sposoby: z samym className, z width i height (loader), oraz
+ * z aria-hidden (branding status page). Wszystkie trzy muszą działać dalej.
+ *
+ * UWAGA licencyjna: to zmiana brandingu interfejsu na użytek wewnętrzny,
+ * dozwolona przez PERMITTED USE licencji Supercheck ("modify", "internal
+ * deployment"). Atrybucja autorów, plik LICENSE i nagłówki copyright muszą
+ * pozostać nietknięte, wymaga tego RESTRICTIONS punkt 4.
  */
-export function SupercheckLogo(props: React.SVGProps<SVGSVGElement>) {
+export function SupercheckLogo({
+  className,
+  width,
+  height,
+  style,
+  ...reszta
+}: React.SVGProps<SVGSVGElement>) {
   return (
-    <svg
-      viewBox="0 0 58 58"
-      xmlns="http://www.w3.org/2000/svg"
-      fill="none"
-      {...props}
-    >
-      {/* White background layer - makes the checkmark appear white */}
-      <rect
-        x="1.8"
-        y="1.5"
-        width="54.8"
-        height="54.9"
-        rx="15"
-        fill="white"
-      />
-      {/* Green outer shape with checkmark cutout */}
-      <path
-        d="M56.6095 17.7393C44.1095 26.8793 33.3295 38.8793 23.6895 48.9493C22.9795 49.6593 22.0495 50.1593 21.0495 50.1593C19.8395 50.1593 18.9095 49.4493 18.0495 48.1593C15.5495 44.4493 11.7695 35.4493 10.0495 31.5193C8.68954 28.3093 9.40954 25.6593 12.6195 24.3093C15.8295 23.0193 19.3995 22.8093 20.2595 26.4493C20.2595 26.4493 21.8995 32.8093 22.3995 34.6593C32.3295 25.4493 44.5395 15.6693 54.8895 9.66929C52.3195 4.80929 47.2495 1.5293 41.4695 1.5293H16.9795C8.54954 1.5293 1.76953 8.30929 1.76953 16.6693V41.2293C1.76953 49.5793 8.54954 56.3693 16.9795 56.3693H41.4695C49.8195 56.3693 56.6095 49.5893 56.6095 41.2293V17.7393V17.7393Z"
-        fill="#16a34a"
-      />
-    </svg>
+    <img
+      src="/important-logo.png"
+      alt="important.is"
+      className={className}
+      width={width as number | string | undefined}
+      height={height as number | string | undefined}
+      style={{ objectFit: "contain", ...(style as React.CSSProperties) }}
+      aria-hidden={reszta["aria-hidden"]}
+    />
   );
 }
 
-// Export alias for backward compatibility
+// Alias zachowany z wersji upstream: cztery ekrany autoryzacji importują logo
+// pod nazwą CheckIcon. Bez tego eksportu build pada na TS2305.
 export { SupercheckLogo as CheckIcon };

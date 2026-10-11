@@ -288,7 +288,7 @@ export const IncidentNotificationEmail = ({
             <Text style={copyright}>
               {t.poweredBy}{" "}
               <Link href="https://supercheck.io" style={footerLink}>
-                Supercheck
+                Uptime important.is
               </Link>
             </Text>
           </Section>

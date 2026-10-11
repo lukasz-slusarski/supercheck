@@ -2,7 +2,7 @@ import { Metadata } from "next";
 import React from "react";
 
 export const metadata: Metadata = {
-  title: "Alerts | Supercheck",
+  title: "Alerts | Uptime important.is",
   description: "Monitor alert history and manage notification channels",
 };
 

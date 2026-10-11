@@ -324,7 +324,7 @@ export function RecordButton({
             </div>
 
             <p className="text-sm text-muted-foreground">
-              Please open Supercheck in a Chromium-based browser to use the browser recording feature.
+              Please open Uptime important.is in a Chromium-based browser to use the browser recording feature.
             </p>
           </div>
 

@@ -188,6 +188,32 @@ async function recordSchedulingFailure(
   try {
     const now = new Date();
 
+    // Read the latest result first: it decides both whether this failure is
+    // worth recording at all and how consecutive failures are counted.
+    const lastResult = await db.query.monitorResults.findFirst({
+      where: eq(monitorResults.monitorId, monitorId),
+      orderBy: [desc(monitorResults.checkedAt)],
+      columns: {
+        location: true,
+        isUp: true,
+        consecutiveFailureCount: true,
+        alertsSentForFailure: true,
+      },
+    });
+
+    // A redeploy takes the worker offline for less than one check interval, so
+    // the first scheduling failure right after a healthy check is almost always
+    // ours and not the monitored target's. Skip it. A worker that is really
+    // gone misses the next check too and gets recorded then, which keeps the
+    // original intent: a monitor must not stay falsely UP indefinitely.
+    if (lastResult?.isUp) {
+      logger.warn(
+        { monitorId, errorMessage },
+        'Scheduling failure ignored — first miss after a healthy check (most likely a worker restart)'
+      );
+      return;
+    }
+
     // Update monitor status
     await db
       .update(monitors)
@@ -209,18 +235,6 @@ async function recordSchedulingFailure(
     const monitorConfig = monitor?.config as MonitorConfig | null;
     const locationConfig = monitorConfig?.locationConfig as LocationConfig | null;
     const configuredLocations = locationConfig?.locations;
-
-    // Read the latest result to maintain consecutive failure counting
-    const lastResult = await db.query.monitorResults.findFirst({
-      where: eq(monitorResults.monitorId, monitorId),
-      orderBy: [desc(monitorResults.checkedAt)],
-      columns: {
-        location: true,
-        isUp: true,
-        consecutiveFailureCount: true,
-        alertsSentForFailure: true,
-      },
-    });
 
     let location: MonitoringLocation | undefined;
 

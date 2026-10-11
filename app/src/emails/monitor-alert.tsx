@@ -40,7 +40,7 @@ export const MonitorAlertEmail = ({
     { title: "Status", value: "Failed" },
     { title: "Dashboard Link", value: "https://supercheck.io/dashboard" },
   ],
-  footer = "Supercheck Monitoring System",
+  footer = "Uptime important.is Monitoring System",
   type = "failure",
   color,
 }: MonitorAlertEmailProps) => {
@@ -59,7 +59,7 @@ export const MonitorAlertEmail = ({
   return (
     <BaseLayout
       preview={title}
-      title="Supercheck Notification"
+      title="Uptime important.is Notification"
       headerColor={statusColor}
       // We use the standard footer from BaseLayout, but append the custom footer text if needed
       // or just rely on the standard one. The prompt asked for a proper footer consistent across all templates.
@@ -68,8 +68,8 @@ export const MonitorAlertEmail = ({
       // Let's pass the custom footer text as a simple text block above the standard footer links if it's unique.
       footer={
         footer && 
-        footer !== "Supercheck Monitoring System" && 
-        footer !== "Supercheck Job Monitoring" ? (
+        footer !== "Uptime important.is Monitoring System" && 
+        footer !== "Uptime important.is Job Monitoring" ? (
           <Text style={customFooterText}>{footer}</Text>
         ) : undefined
       }

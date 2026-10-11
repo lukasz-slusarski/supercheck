@@ -200,7 +200,7 @@ function ResetPasswordPageContent() {
               <div className="flex size-14 items-center justify-center rounded-md">
                 <CheckIcon className="size-12" />
               </div>
-              <span className="sr-only">Supercheck</span>
+              <span className="sr-only">Uptime important.is</span>
             </Link>
             <h1 className="text-2xl font-bold">Reset password</h1>
             <FieldDescription>Enter your new password below.</FieldDescription>

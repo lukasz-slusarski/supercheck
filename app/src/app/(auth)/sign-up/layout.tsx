@@ -1,8 +1,8 @@
 import { Metadata } from "next"
 
 export const metadata: Metadata = {
-  title: "Sign Up | Supercheck",
-  description: "Create your Supercheck account",
+  title: "Sign Up | Uptime important.is",
+  description: "Create your Uptime important.is account",
 }
 
 export default function SignUpLayout({

@@ -99,7 +99,7 @@ export function ProjectSwitcher() {
               <SupercheckLogo className="size-7" />
             </div>
             <div className="grid flex-1 text-left text-sm leading-tight">
-              <span className="truncate font-medium">Supercheck</span>
+              <span className="truncate font-medium">Uptime important.is</span>
               <div className="flex items-center gap-1">
                 <Loader2 className="h-3 w-3 animate-spin" />
                 <span className="truncate text-xs">Loading...</span>
@@ -127,7 +127,7 @@ export function ProjectSwitcher() {
                 <SupercheckLogo className="size-7" />
               </div>
               <div className="grid flex-1 text-left text-sm leading-tight">
-                <span className="truncate font-medium">Supercheck</span>
+                <span className="truncate font-medium">Uptime important.is</span>
                 <span className="truncate text-xs">
                   {currentProject?.name || "No project"}
                 </span>

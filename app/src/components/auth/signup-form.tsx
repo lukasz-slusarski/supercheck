@@ -128,7 +128,7 @@ export function SignupForm({
             <div className="flex size-14 items-center justify-center rounded-md">
               <SupercheckLogo className="size-12" />
             </div>
-            <span className="sr-only">Supercheck</span>
+            <span className="sr-only">Uptime important.is</span>
           </Link>
           <h1 className="text-2xl font-bold">Registration Closed</h1>
           <p className="text-sm text-muted-foreground max-w-[300px]">
@@ -174,7 +174,7 @@ export function SignupForm({
                 <div className="flex size-14 items-center justify-center rounded-md">
                   <SupercheckLogo className="size-12" />
                 </div>
-                <span className="sr-only">Supercheck</span>
+                <span className="sr-only">Uptime important.is</span>
               </Link>
               <h1 className="text-2xl font-bold">
                 {isInviteMode
@@ -190,7 +190,7 @@ export function SignupForm({
                     </span>
                   </>
                 ) : (
-                  "Sign up to get started with Supercheck"
+                  "Sign up to get started with Uptime important.is"
                 )}
               </FieldDescription>
             </div>

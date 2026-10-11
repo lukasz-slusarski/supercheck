@@ -1,7 +1,7 @@
 import { Metadata } from "next/types";
 
 export const metadata: Metadata = {
-  title: "Quick Create | Supercheck",
+  title: "Quick Create | Uptime important.is",
   description: "Create a new resource",
 };
 

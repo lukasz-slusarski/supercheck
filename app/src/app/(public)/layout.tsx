@@ -26,7 +26,7 @@ const systemFonts = {
 };
 
 export const metadata: Metadata = {
-  title: "Status Page | Supercheck",
+  title: "Status Page | Uptime important.is",
   description: "Public status page for monitoring service availability",
 };
 

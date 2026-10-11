@@ -11,7 +11,7 @@ export const TestEmail = ({
 }: TestEmailProps) => {
   return (
     <BaseLayout
-      preview="Test Email from Supercheck"
+      preview="Test Email from Uptime important.is"
       title="Email Configuration Test"
       headerColor="#3b82f6" // Blue-500
     >
@@ -33,7 +33,7 @@ export const TestEmail = ({
         </Section>
 
         <Text style={smallText}>
-          This is an automated test email from Supercheck. If you received this, your email
+          This is an automated test email from Uptime important.is. If you received this, your email
           notifications are configured correctly.
         </Text>
       </Section>

@@ -333,7 +333,7 @@ export function AIDiffViewer({
                 <Sparkles className="h-4 w-4 text-purple-500" />
               </div>
               <h2 className="text-base font-semibold flex items-center gap-2">
-                Supercheck AI - Fix Review
+                important.is AI - Fix Review
                 {isStreaming && (
                   <Loader2 className="h-4 w-4 animate-spin text-purple-500" />
                 )}
