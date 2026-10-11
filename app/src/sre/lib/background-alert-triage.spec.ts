@@ -15,7 +15,7 @@ jest.mock("@/utils/db", () => ({
 
 import { isSreBackgroundAlertTriageEnabled } from "@/sre/lib/feature-gates";
 import { db } from "@/utils/db";
-import { processSreBackgroundAlertTriageJob } from "./background-alert-triage";
+import { getAutomaticTriageDailyLimit, processSreBackgroundAlertTriageJob } from "./background-alert-triage";
 
 const mockIsSreBackgroundAlertTriageEnabled = isSreBackgroundAlertTriageEnabled as jest.Mock;
 const mockDb = db as jest.Mocked<typeof db>;
@@ -52,4 +52,28 @@ describe("processSreBackgroundAlertTriageJob", () => {
     expect(mockDb.select).not.toHaveBeenCalled();
   });
 
+});
+
+describe("getAutomaticTriageDailyLimit", () => {
+  const original = process.env.SRE_AUTOMATION_MAX_PER_DAY;
+  afterEach(() => {
+    if (original === undefined) delete process.env.SRE_AUTOMATION_MAX_PER_DAY;
+    else process.env.SRE_AUTOMATION_MAX_PER_DAY = original;
+  });
+
+  it("defaults to 5 when unset or invalid", () => {
+    delete process.env.SRE_AUTOMATION_MAX_PER_DAY;
+    expect(getAutomaticTriageDailyLimit()).toBe(5);
+    process.env.SRE_AUTOMATION_MAX_PER_DAY = "abc";
+    expect(getAutomaticTriageDailyLimit()).toBe(5);
+    process.env.SRE_AUTOMATION_MAX_PER_DAY = "-1";
+    expect(getAutomaticTriageDailyLimit()).toBe(5);
+  });
+
+  it("accepts explicit values including 0", () => {
+    process.env.SRE_AUTOMATION_MAX_PER_DAY = "0";
+    expect(getAutomaticTriageDailyLimit()).toBe(0);
+    process.env.SRE_AUTOMATION_MAX_PER_DAY = "20";
+    expect(getAutomaticTriageDailyLimit()).toBe(20);
+  });
 });

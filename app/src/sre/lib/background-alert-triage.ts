@@ -1,6 +1,6 @@
 import { validateAIConfiguration } from "@/lib/ai/ai-provider";
 import { createHash } from "crypto";
-import { and, desc, eq, gte, isNotNull, ne, or, sql } from "drizzle-orm";
+import { and, count, desc, eq, gte, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 import { z } from "zod";
 
 import {
@@ -11,6 +11,7 @@ import {
   sreIncidentAlerts,
   sreIncidents,
   sreIncidentTimelineEvents,
+  sreInvestigationRuns,
   sreServiceDependencies,
   sreServiceResources,
   sreServices,
@@ -31,6 +32,34 @@ import { db } from "@/utils/db";
 const logger = createLogger({ module: "sre-background-alert-triage" }) as {
   warn: (data: unknown, message?: string) => void;
 };
+
+// important.is: automatyczna analiza to płatne wywołanie modelu przy każdej
+// nowej awarii, a w self-hosted nie ma limitu wydatków. Ograniczamy liczbę
+// automatycznych analiz na organizację w ciągu 24 h; ręczne (z przycisku)
+// nie są liczone ani blokowane. 0 wstrzymuje automat bez wyłączania AI SRE.
+const DEFAULT_AUTOMATIC_TRIAGE_DAILY_LIMIT = 5;
+
+export function getAutomaticTriageDailyLimit() {
+  const parsed = Number.parseInt(process.env.SRE_AUTOMATION_MAX_PER_DAY ?? "", 10);
+  return Number.isFinite(parsed) && parsed >= 0
+    ? parsed
+    : DEFAULT_AUTOMATIC_TRIAGE_DAILY_LIMIT;
+}
+
+async function countAutomaticTriageRunsLast24h(organizationId: string) {
+  const [row] = await db
+    .select({ value: count() })
+    .from(sreInvestigationRuns)
+    .where(
+      and(
+        eq(sreInvestigationRuns.organizationId, organizationId),
+        eq(sreInvestigationRuns.agentType, "triage"),
+        isNull(sreInvestigationRuns.createdByUserId),
+        gte(sreInvestigationRuns.createdAt, sql`now() - interval '24 hours'`),
+      ),
+    );
+  return Number(row?.value ?? 0);
+}
 
 const backgroundTriageJobSchema = z.object({
   alertHistoryId: z.string().uuid(),
@@ -63,7 +92,8 @@ export type SreBackgroundAlertTriageResult =
         | "resolved_alert"
         | "already_triaged"
         | "unsupported_source"
-        | "ai_not_configured";
+        | "ai_not_configured"
+        | "daily_limit_reached";
     }
   | {
       success: false;
@@ -516,6 +546,17 @@ export async function processSreBackgroundAlertTriageJob(
 
   if (incident.alreadyTriaged) {
     return { success: true, skipped: true, reason: "already_triaged" };
+  }
+
+  // Incydent zostaje założony, więc analizę można odpalić ręcznie.
+  const dailyLimit = getAutomaticTriageDailyLimit();
+  const usedToday = await countAutomaticTriageRunsLast24h(incident.organizationId);
+  if (usedToday >= dailyLimit) {
+    logger.warn(
+      { organizationId: incident.organizationId, incidentId: incident.incidentId, usedToday, dailyLimit },
+      "Automatic SRE triage skipped: daily limit reached",
+    );
+    return { success: true, skipped: true, reason: "daily_limit_reached" };
   }
 
   const triage = await runSreIncidentTriage({
