@@ -4,17 +4,21 @@ description: Manage organization members, projects, and settings
 icon: UserCog
 ---
 
-Manage your organization's members, projects, and view audit trails from the Admin panel.
+Manage your organization's projects, members, CLI tokens, AI SRE setup, and audit trails from the Admin panel.
 
-## Overview
+![Organization Admin Overview](/screenshots/org-admin-overview.png)
 
-The organization admin dashboard provides a summary of your organization's activity, including member count, project count, and recent activity.
+## Your default organization
 
-![Organization Overview](/screenshots/org-admin-overview.png)
+Signup assigns one default organization and a default project. There is no organization creation or switching menu. Create and switch projects using the project selector and **Admin → Projects**.
+
+You can accept invitations to projects in other organizations while keeping your default organization. Those projects appear in the project selector with their team name. All active projects in a joined team are visible and selectable with read-only access. Project editor and project admin assignments grant additional permissions only in the selected projects; they do not hide other team projects. Owning your default organization does not grant administrative access to another team.
+
+New users signing up through an invitation join the inviting team without creating a separate organization. Use the project selector to choose the team and project you need.
 
 ## Projects
 
-Manage all projects within your organization. Create, edit, or archive projects as needed.
+Organization administrators can create and manage projects. Project admins can update their assigned projects.
 
 ![Projects List](/screenshots/org-admin-projects.png)
 
@@ -42,7 +46,7 @@ Invite and manage team members with role-based access control.
 3. Enter email and select role
 4. Send invitation
 
-![Invite Member Dialog](/screenshots/org-admin-member-intvite-dialog.png)
+![Invite Member Dialog](/screenshots/org-admin-member-invite-dialog.png)
 
 </Tab>
 <Tab value="Email Invitation">
@@ -56,12 +60,12 @@ The invited member receives an email with a link to join your organization.
 
 New members accept the invitation to join the organization.
 
-![Accept Invitation](/screenshots/org-admin-member-invite-aceptance.png)
+![Accept Invitation](/screenshots/org-admin-member-invite-acceptance.png)
 
 </Tab>
 <Tab value="Signup">
 
-After accepting the invitation, new members can sign up or sign in to join the organization.
+Sign up or sign in with the invited email address, then accept the invitation to access the assigned projects.
 
 ![Invitation Signup](/screenshots/org-admin-member-invite-signup.png)
 
@@ -78,7 +82,7 @@ The system uses a 6-role RBAC system with specialized roles for organization and
 | Role | Permissions |
 |------|-------------|
 | **Super Admin** | System-wide control, user management, and full access to everything. |
-| **Org Owner** | Full organization control, billing, and member management. |
+| **Org Owner** | Full organization control, including deletion and member management. |
 | **Org Admin** | Managing members and organization settings (cannot delete org). |
 
 </Tab>
@@ -92,6 +96,32 @@ The system uses a 6-role RBAC system with specialized roles for organization and
 
 </Tab>
 </Tabs>
+
+## Delete an organization
+
+Only the organization owner can request deletion. Organizations with projects or protected dependencies cannot be deleted through the organization API. Contact your administrator or support to review and remove related data safely.
+
+## CLI Tokens
+
+Create project-scoped CLI tokens for API access and automation. Tokens inherit their owner's permissions; use a separate token for each pipeline or integration.
+
+1. Go to **Admin → CLI Tokens**
+2. Click **Create Token**
+3. Enter a name and optional expiry date for a token in the current project
+4. Copy the generated token securely
+
+## AI SRE Setup
+
+Administrators configure project-level AI SRE setup from **Admin** so responders do not need to manage setup screens during an incident.
+
+The setup tabs are:
+
+- **Services** — Open the top-level **Services** page to register production services and ownership metadata used to map alerts, incidents, and connector evidence.
+- **Integrations** — Configure read-only evidence connectors and link alert notification providers to connector context.
+- **Diagnostic Recipes** — Save bounded, allowlisted read-only query recipes for common incident questions.
+- **Private Agents** — [Register and deploy an agent](/docs/app/deployment/private-agent) to use private evidence sources in investigations.
+
+See [AI SRE setup](/docs/app/admin/ai-sre-setup) for the full setup flow.
 
 ## Audit Log
 

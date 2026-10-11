@@ -49,9 +49,14 @@ x-common-env: &common-env # Database Configuration
   STATUS_PAGE_DOMAIN: ${STATUS_PAGE_DOMAIN:-localhost}
   # Hide the public status page branding footer globally when set to true
   STATUS_PAGE_HIDE_BRANDING: ${STATUS_PAGE_HIDE_BRANDING:-false}
-  BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-CHANGE_THIS_GENERATE_32_CHAR_HEX}
+  BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-CHANGE_THIS_GENERATE_64_CHAR_HEX}
+  INVITE_RATE_LIMIT_MAX: ${INVITE_RATE_LIMIT_MAX:-10}
   NODE_ENV: ${NODE_ENV:-production}
   SHOW_COMMUNITY_LINKS: ${SHOW_COMMUNITY_LINKS:-true}
+  # AI SRE is on by default with a configured AI provider.
+  # Disable automation to prevent AI work triggered by delivered alerts.
+  SRE_ENABLED: ${SRE_ENABLED:-true}
+  SRE_AUTOMATION_ENABLED: ${SRE_AUTOMATION_ENABLED:-true}
 
   # CORS: Allow browser-based integrations (Azure DevOps widgets, Grafana panels, etc.)
   # Comma-separated origins. Supports wildcard subdomains (e.g., https://*.visualstudio.com)
@@ -166,10 +171,10 @@ x-common-env: &common-env # Database Configuration
   # ==========================================================================
   # --------------------------------------------------------------------------
   # AI Model Configuration
-  # Set AI_PROVIDER to one of: openai, azure, anthropic, gemini, google-vertex, bedrock, openrouter
+  # Set AI_PROVIDER to one of: openai, azure, anthropic, gemini, google-vertex, bedrock, openrouter, deepseek
   # --------------------------------------------------------------------------
   AI_PROVIDER: ${AI_PROVIDER:-openai}
-  AI_MODEL: ${AI_MODEL:-gpt-4o-mini}
+  AI_MODEL: ${AI_MODEL:-gpt-6-luna}
   AI_TIMEOUT_MS: ${AI_TIMEOUT_MS:-90000}
   AI_MAX_RETRIES: ${AI_MAX_RETRIES:-2}
   AI_TEMPERATURE: ${AI_TEMPERATURE:-0.1}
@@ -179,6 +184,8 @@ x-common-env: &common-env # Database Configuration
   # Get your API key from: https://platform.openai.com/api-keys
   # --------------------------------------------------------------------------
   OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  # DeepSeek V4.1 Flash (opt-in): AI_PROVIDER=deepseek, AI_MODEL=deepseek-flash
+  DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
 
   # --------------------------------------------------------------------------
   # Provider B: Azure OpenAI
@@ -300,8 +307,8 @@ services:
     image: supercheck-worker:latest
     # init: Use tini as PID 1 to avoid zombie processes (Playwright recommendation)
     init: true
-    # GVISOR-006: Run as non-root user (pwuser UID 1000 from Playwright image)
-    user: "1000:1000"
+    # GVISOR-006: Run as the Playwright image's non-root pwuser account.
+    user: "pwuser:pwuser"
     # GVISOR-006: Read-only root filesystem with writable tmpfs mounts
     read_only: true
     environment:
@@ -312,8 +319,8 @@ services:
       # Note: MAX_CONCURRENT_EXECUTIONS=1 is hardcoded in worker code (scale via replicas)
     tmpfs:
       - /tmp:size=2G,uid=1000,gid=1000,mode=1777
-      - /home/pwuser/.cache:size=256M,uid=1000,gid=1000,mode=0700
-      - /home/pwuser/.npm:size=256M,uid=1000,gid=1000,mode=0700
+      - /home/pwuser/.cache:size=256M,uid=1001,gid=1001,mode=0700
+      - /home/pwuser/.npm:size=256M,uid=1001,gid=1001,mode=0700
     volumes:
       - worker-playwright-reports:/worker/playwright-reports
       - worker-k6-reports:/worker/k6-reports
@@ -420,7 +427,7 @@ services:
 
   # MinIO (S3-compatible storage)
   minio:
-    image: minio/minio:latest
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     environment:
       - MINIO_ROOT_USER=minioadmin
       - MINIO_ROOT_PASSWORD=minioadmin

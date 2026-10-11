@@ -9,6 +9,7 @@ import {
   JobStatus,
   TestRunStatus,
   alertHistory,
+  AlertDeliveryMetadata,
   AlertType,
   AlertStatus,
 } from '../../db/schema'; // Specifically import reports table
@@ -17,6 +18,7 @@ import { ReportMetadata } from '../interfaces'; // Import our interface
 import { NotificationProvider } from '../../notification/notification.service';
 import { decryptNotificationProviderConfig } from '../../common/notification-provider-crypto';
 import { DB_PROVIDER_TOKEN } from '../../db/db.constants';
+import type { ExecutionUsageTransaction } from './execution-usage-receipts';
 
 // Re-export from canonical location for backward compatibility.
 // All new code should import directly from '../../db/db.constants'.
@@ -191,6 +193,7 @@ export class DbService implements OnModuleInit {
     status: TestRunStatus,
     duration?: string,
     errorDetails?: string,
+    transaction?: ExecutionUsageTransaction,
   ): Promise<void> {
     this.logger.debug(
       `Updating run ${runId} with status ${status} and duration ${duration}`,
@@ -198,6 +201,7 @@ export class DbService implements OnModuleInit {
 
     try {
       const now = new Date();
+      const database = transaction ?? this.dbInstance;
       const updateData: {
         status: TestRunStatus;
         durationMs?: number;
@@ -237,7 +241,7 @@ export class DbService implements OnModuleInit {
         // If no duration provided, calculate from startedAt
         if (!duration) {
           try {
-            const existingRun = await this.dbInstance
+            const existingRun = await database
               .select({ startedAt: runs.startedAt })
               .from(runs)
               .where(eq(runs.id, runId))
@@ -262,10 +266,7 @@ export class DbService implements OnModuleInit {
       }
 
       // Update the database
-      await this.dbInstance
-        .update(runs)
-        .set(updateData)
-        .where(eq(runs.id, runId));
+      await database.update(runs).set(updateData).where(eq(runs.id, runId));
 
       this.logger.log(
         `Successfully updated run ${runId} with status ${status}`,
@@ -431,7 +432,8 @@ export class DbService implements OnModuleInit {
     message: string,
     errorMessage?: string,
     jobNameOverride?: string,
-  ): Promise<void> {
+    deliveryMetadata?: AlertDeliveryMetadata,
+  ): Promise<{ id: string; status: AlertStatus }> {
     try {
       let jobName = jobNameOverride;
 
@@ -441,21 +443,26 @@ export class DbService implements OnModuleInit {
         jobName = job?.name || `Job ${jobId}`;
       }
 
-      await this.db.insert(alertHistory).values({
-        jobId,
-        type,
-        provider,
-        status,
-        message,
-        sentAt: new Date(),
-        errorMessage,
-        target: jobName,
-        targetType: 'job',
-      });
+      const [created] = await this.db
+        .insert(alertHistory)
+        .values({
+          jobId,
+          type,
+          provider,
+          status,
+          message,
+          sentAt: new Date(),
+          errorMessage,
+          deliveryMetadata,
+          target: jobName,
+          targetType: 'job',
+        })
+        .returning({ id: alertHistory.id, status: alertHistory.status });
 
       this.logger.log(
         `Successfully saved alert history for job ${jobId} with status: ${status}`,
       );
+      return created;
     } catch (error) {
       this.logger.error(
         `Failed to save alert history for job ${jobId}:`,

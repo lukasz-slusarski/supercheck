@@ -5,6 +5,9 @@ import { Role } from "@/lib/rbac/permissions";
 import { billingSettingsService } from "@/lib/services/billing-settings.service";
 import { auditBillingSettingsChange } from "@/lib/audit-log";
 import { z } from "zod";
+import { NextRequest } from "next/server";
+import { requireSameOriginRequest } from "@/lib/security/same-origin";
+import { BillingSettingsValidationError } from "@/lib/billing-errors";
 
 /**
  * GET /api/billing/settings
@@ -17,7 +20,7 @@ export async function GET() {
     if (!organizationId) {
       return NextResponse.json(
         { error: "No active organization found" },
-        { status: 400 }
+        { status: 400 },
       );
     }
 
@@ -27,7 +30,7 @@ export async function GET() {
     if (!isOrgAdmin) {
       return NextResponse.json(
         { error: "Insufficient permissions" },
-        { status: 403 }
+        { status: 403 },
       );
     }
 
@@ -37,42 +40,64 @@ export async function GET() {
   } catch (error) {
     if (isAuthError(error)) {
       return NextResponse.json(
-        { error: error instanceof Error ? error.message : "Authentication required" },
-        { status: 401 }
+        {
+          error:
+            error instanceof Error ? error.message : "Authentication required",
+        },
+        { status: 401 },
       );
     }
     console.error("Error fetching billing settings:", error);
     return NextResponse.json(
       { error: "Failed to fetch billing settings" },
-      { status: 500 }
+      { status: 500 },
     );
   }
 }
 
+const MAX_NOTIFICATION_EMAILS = 10;
+
 // Validation schema for billing settings update
 const updateSettingsSchema = z.object({
-  monthlySpendingLimitDollars: z.number().min(0).nullable().optional(),
+  organizationId: z.string().uuid().optional(),
+  monthlySpendingLimitDollars: z
+    .number()
+    .finite()
+    .min(0)
+    .max(21474836.47)
+    .multipleOf(0.01)
+    .nullable()
+    .optional(),
   enableSpendingLimit: z.boolean().optional(),
   hardStopOnLimit: z.boolean().optional(),
   notifyAt50Percent: z.boolean().optional(),
   notifyAt80Percent: z.boolean().optional(),
   notifyAt90Percent: z.boolean().optional(),
   notifyAt100Percent: z.boolean().optional(),
-  notificationEmails: z.array(z.string().email()).optional(),
+  // Org admins already receive alerts; extra recipients are bounded so a
+  // settings change cannot fan billing email out to arbitrary lists.
+  notificationEmails: z
+    .array(z.string().trim().toLowerCase().email().max(254))
+    .max(MAX_NOTIFICATION_EMAILS)
+    .transform((emails) => Array.from(new Set(emails)))
+    .optional(),
 });
 
 /**
  * PATCH /api/billing/settings
  * Update billing settings for the active organization
  */
-export async function PATCH(request: Request) {
+export async function PATCH(request: NextRequest) {
+  const originError = requireSameOriginRequest(request);
+  if (originError) return originError;
+
   try {
     const { userId, organizationId } = await requireUserAuthContext();
 
     if (!organizationId) {
       return NextResponse.json(
         { error: "No active organization found" },
-        { status: 400 }
+        { status: 400 },
       );
     }
 
@@ -82,24 +107,31 @@ export async function PATCH(request: Request) {
     if (!isOrgAdmin) {
       return NextResponse.json(
         { error: "Insufficient permissions" },
-        { status: 403 }
+        { status: 403 },
       );
     }
 
-    const body = await request.json();
+    const body = await request.json().catch(() => null);
     const validation = updateSettingsSchema.safeParse(body);
 
     if (!validation.success) {
       return NextResponse.json(
         { error: "Invalid request body", details: validation.error.errors },
-        { status: 400 }
+        { status: 400 },
       );
     }
 
     const data = validation.data;
+    if (data.organizationId && data.organizationId !== organizationId) {
+      return NextResponse.json(
+        { error: "Selected organization changed. Refresh before saving billing controls." },
+        { status: 409 },
+      );
+    }
 
     // Get current settings for audit logging
-    const previousSettings = await billingSettingsService.getSettings(organizationId);
+    const previousSettings =
+      await billingSettingsService.getSettings(organizationId);
 
     const effectiveLimitDollars =
       data.monthlySpendingLimitDollars !== undefined
@@ -119,17 +151,19 @@ export async function PATCH(request: Request) {
           error:
             "A positive monthly spending limit is required when spending limits are enabled",
         },
-        { status: 400 }
+        { status: 400 },
       );
     }
 
     // Convert dollars to cents if provided
-    const updates: Parameters<typeof billingSettingsService.updateSettings>[1] = {};
+    const updates: Parameters<typeof billingSettingsService.updateSettings>[1] =
+      {};
 
     if (data.monthlySpendingLimitDollars !== undefined) {
-      updates.monthlySpendingLimitCents = data.monthlySpendingLimitDollars !== null
-        ? Math.round(data.monthlySpendingLimitDollars * 100)
-        : null;
+      updates.monthlySpendingLimitCents =
+        data.monthlySpendingLimitDollars !== null
+          ? Math.round(data.monthlySpendingLimitDollars * 100)
+          : null;
     }
 
     if (data.enableSpendingLimit !== undefined) {
@@ -160,7 +194,10 @@ export async function PATCH(request: Request) {
       updates.notificationEmails = data.notificationEmails;
     }
 
-    const settings = await billingSettingsService.updateSettings(organizationId, updates);
+    const settings = await billingSettingsService.updateSettings(
+      organizationId,
+      updates,
+    );
 
     // Audit log the billing settings change (non-blocking)
     auditBillingSettingsChange(
@@ -168,20 +205,28 @@ export async function PATCH(request: Request) {
       userId,
       previousSettings as unknown as Record<string, unknown>,
       settings as unknown as Record<string, unknown>,
-    ).catch((err) => console.error("[Audit] Failed to log billing settings change:", err));
+    ).catch((err) =>
+      console.error("[Audit] Failed to log billing settings change:", err),
+    );
 
     return NextResponse.json(settings);
   } catch (error) {
     if (isAuthError(error)) {
       return NextResponse.json(
-        { error: error instanceof Error ? error.message : "Authentication required" },
-        { status: 401 }
+        {
+          error:
+            error instanceof Error ? error.message : "Authentication required",
+        },
+        { status: 401 },
       );
+    }
+    if (error instanceof BillingSettingsValidationError) {
+      return NextResponse.json({ error: error.message }, { status: 400 });
     }
     console.error("Error updating billing settings:", error);
     return NextResponse.json(
       { error: "Failed to update billing settings" },
-      { status: 500 }
+      { status: 500 },
     );
   }
 }

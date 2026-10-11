@@ -197,7 +197,9 @@ fi
 # Ten warunek jest w skrypcie celowo. Gdyby ktoś kiedyś usunął odnośniki
 # do autorów, złamalibyśmy licencję, a bez tego sprawdzenia nikt by tego
 # nie zauważył aż do rozmowy z prawnikiem.
-if [ -f "LICENSE" ] && grep -q "Supercheck Community License" LICENSE; then
+# Upstream przeszedł z "Supercheck Community License" na AGPL-3.0 (PR #302).
+# Akceptujemy obie, bo skrypt bywa uruchamiany też na starszych wersjach.
+if [ -f "LICENSE" ] && grep -qE "Supercheck Community License|GNU AFFERO GENERAL PUBLIC LICENSE" LICENSE; then
   echo "  licencja: nietknięta"
 else
   echo "  licencja: BŁĄD, brak pliku LICENSE albo zmieniona treść"

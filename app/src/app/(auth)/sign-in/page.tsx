@@ -1,4 +1,7 @@
 "use client";
+
+import { clearProjectsCache } from "@/hooks/use-project-context";
+import { announceProjectChange, reloadProjectContext } from "@/lib/project-navigation";
 import { signIn } from "@/utils/auth-client";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useState, useEffect, useCallback, useMemo, Suspense } from "react";
@@ -118,22 +121,6 @@ function SignInPageContent() {
         return;
       }
 
-      // Step 1.5: For invite flow, verify the user's email before sign-in.
-      // The invitation itself proves email ownership, so we can safely mark
-      // the email as verified. This handles the case where the sign-up page's
-      // auto-verify failed (e.g., transaction rollback, timing issues).
-      if (inviteToken) {
-        try {
-          await fetch("/api/auth/verify-invited-user", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ token: inviteToken, email }),
-          });
-        } catch {
-          // Non-critical: continue with sign-in attempt
-        }
-      }
-
       // Step 2: Attempt sign-in via Better Auth
       // Include CAPTCHA token in request headers if available
       // Better Auth captcha plugin validates via x-captcha-response header
@@ -146,6 +133,10 @@ function SignInPageContent() {
       });
 
       if (error) {
+        if (inviteToken && error.message?.toLowerCase().includes("verif")) {
+          router.push(`/verify-email?email=${encodeURIComponent(email)}&invite=${encodeURIComponent(inviteToken)}`);
+          return;
+        }
         // Step 3a: Record failed attempt
         const failedResult = await fetch("/api/auth/sign-in/check", {
           method: "POST",
@@ -162,11 +153,10 @@ function SignInPageContent() {
           return;
         }
 
-        // Show lockout message if locked, otherwise show error with warning
+        // Keep pre-lockout errors generic. Exposing attempts remaining only for
+        // known accounts enables account enumeration.
         if (failedData.isLocked) {
           setError(failedData.message || "Too many failed attempts. Account temporarily locked.");
-        } else if (failedData.message) {
-          setError(`${error.message || "An error occurred"}. ${failedData.message}`);
         } else {
           setError(error.message || "An error occurred");
         }
@@ -187,7 +177,8 @@ function SignInPageContent() {
             const acceptResult = await acceptResponse.json();
             if (acceptResponse.ok && acceptResult.success) {
               console.log(`✅ Auto-accepted invitation to ${acceptResult.data?.organizationName}`);
-              router.push("/");
+              announceProjectChange();
+              reloadProjectContext(clearProjectsCache);
               return;
             }
           } catch (acceptError) {

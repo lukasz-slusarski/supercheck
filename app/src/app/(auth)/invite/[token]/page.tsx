@@ -20,10 +20,12 @@ import { FieldGroup, Field, FieldDescription } from "@/components/ui/field";
 import Link from "next/link";
 import { cn } from "@/lib/utils";
 import { useAppConfig } from "@/hooks/use-app-config";
+import { clearProjectsCache } from "@/hooks/use-project-context";
+import { announceProjectChange, reloadProjectContext } from "@/lib/project-navigation";
 
 interface InvitationData {
   organizationName: string;
-  email: string;
+  email?: string;
   role: string;
   expiresAt: string;
   inviterName?: string;
@@ -93,12 +95,18 @@ export default function InvitePage({
       const data = await response.json();
 
       if (data.success) {
+        announceProjectChange();
         setAccepted(data.data);
         // Redirect to dashboard after 3 seconds
         setTimeout(() => {
-          router.push("/");
+          reloadProjectContext(clearProjectsCache);
         }, 3000);
       } else {
+        if (data.code === "EMAIL_NOT_VERIFIED") {
+          const inviteQuery = encodeURIComponent(token);
+          router.push(`/verify-email?email=${encodeURIComponent(invitation?.email || "")}&invite=${inviteQuery}`);
+          return;
+        }
         const errorMessage = String(data.error ?? "").toLowerCase();
         if (
           response.status === 401 ||
@@ -225,7 +233,7 @@ export default function InvitePage({
           </div>
 
           <Field>
-            <Button onClick={() => router.push("/")} className="w-full">
+            <Button onClick={() => reloadProjectContext(clearProjectsCache)} className="w-full">
               Go to Dashboard
               <ArrowRight className="ml-2 h-4 w-4" />
             </Button>
@@ -292,7 +300,7 @@ export default function InvitePage({
             </div>
 
             {/* Email */}
-            <div className="flex items-center gap-3">
+            {invitation.email && <div className="flex items-center gap-3">
               <div className="flex size-10 items-center justify-center rounded-full bg-primary/10">
                 <Mail className="size-5 text-primary" />
               </div>
@@ -300,7 +308,7 @@ export default function InvitePage({
                 <p className="text-sm text-muted-foreground">Invited Email</p>
                 <p className="font-medium">{invitation.email}</p>
               </div>
-            </div>
+            </div>}
 
             {/* Inviter */}
             {invitation.inviterName && (

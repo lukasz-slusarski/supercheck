@@ -17,6 +17,26 @@ jest.mock("next/headers", () => ({
   headers: jest.fn(async () => new Headers()),
 }));
 
+jest.mock("@/lib/auth-context", () => ({
+  requireAuthContext: jest.fn(),
+}));
+
+jest.mock("@/lib/rbac/middleware", () => ({
+  checkPermissionWithContext: jest.fn(),
+}));
+
+jest.mock("@/utils/db", () => {
+  const limit = jest.fn();
+  const orderBy = jest.fn(() => ({ limit }));
+  const where = jest.fn(() => ({ orderBy }));
+  const from = jest.fn(() => ({ where }));
+
+  return {
+    db: { select: jest.fn(() => ({ from })) },
+    __mockLimit: limit,
+  };
+});
+
 jest.mock("@/lib/logger/pino-config", () => {
   const logger = {
     info: jest.fn(),
@@ -30,6 +50,17 @@ jest.mock("@/lib/logger/pino-config", () => {
 });
 
 import { POST } from "./route";
+
+const { requireAuthContext: mockRequireAuthContext } = jest.requireMock("@/lib/auth-context") as {
+  requireAuthContext: jest.Mock;
+};
+const { checkPermissionWithContext: mockCanCreateKey } = jest.requireMock("@/lib/rbac/middleware") as {
+  checkPermissionWithContext: jest.Mock;
+};
+
+const { __mockLimit: mockPersistedKeyLookup } = jest.requireMock("@/utils/db") as {
+  __mockLimit: jest.Mock;
+};
 
 const { auth: mockAuth } = jest.requireMock("@/utils/auth") as {
   auth: {
@@ -45,6 +76,23 @@ const { auth: mockAuth } = jest.requireMock("@/utils/auth") as {
 describe("Extension auth route", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockPersistedKeyLookup.mockResolvedValue([]);
+    mockRequireAuthContext.mockResolvedValue({
+      userId: "user-1", organizationId: "org-1", project: { id: "project-1", userRole: "project_editor" },
+    });
+    mockCanCreateKey.mockReturnValue(true);
+  });
+
+  it("forbids a viewer from creating a recorder API key", async () => {
+    mockAuth.api.getSession.mockResolvedValue({ user: { id: "viewer-1" } });
+    mockCanCreateKey.mockReturnValue(false);
+    const response = await POST(new NextRequest("http://localhost/api/extension/auth", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    }));
+    expect(response.status).toBe(403);
+    expect(mockAuth.api.createApiKey).not.toHaveBeenCalled();
   });
 
   it("returns success when the extension is already connected", async () => {
@@ -60,7 +108,7 @@ describe("Extension auth route", () => {
       apiKeys: [
         {
           id: "key-1",
-          name: "SuperCheck Recorder Extension",
+          name: "Supercheck Recorder Extension",
           prefix: "ext",
           enabled: true,
         },
@@ -74,7 +122,7 @@ describe("Extension auth route", () => {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        name: "SuperCheck Recorder Extension",
+        name: "Recorder: Supercheck Recorder Ex",
       }),
     });
 
@@ -121,7 +169,7 @@ describe("Extension auth route", () => {
     mockAuth.api.createApiKey.mockResolvedValue({
       id: "key-2",
       key: "extABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
-      name: "SuperCheck Recorder Extension",
+      name: "Supercheck Recorder Extension",
       prefix: "ext",
       enabled: true,
     });
@@ -130,7 +178,7 @@ describe("Extension auth route", () => {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        name: "SuperCheck Recorder Extension",
+        name: "Recorder: Supercheck Recorder Ex",
       }),
     });
 
@@ -162,7 +210,7 @@ describe("Extension auth route", () => {
     mockAuth.api.createApiKey.mockResolvedValue({
       id: "key-2",
       key: "extABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
-      name: "SuperCheck Recorder Extension",
+      name: "Supercheck Recorder Extension",
       prefix: "ext",
       enabled: true,
     });
@@ -171,7 +219,7 @@ describe("Extension auth route", () => {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        name: "SuperCheck Recorder Extension",
+        name: "Supercheck Recorder Extension",
       }),
     });
 
@@ -182,15 +230,97 @@ describe("Extension auth route", () => {
     expect(body.success).toBe(true);
     expect(body.data.apiKey).toBe("extABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789");
     expect(mockAuth.api.createApiKey).toHaveBeenCalledWith({
-      headers: expect.any(Headers),
       body: {
+        userId: "user-1",
         configId: "default",
-        name: "SuperCheck Recorder Extension",
+        name: "Recorder: Supercheck Recorder Ex",
         prefix: "ext",
         permissions: {
           recorder: ["save"],
         },
       },
     });
+  });
+
+  it("normalizes extension key names to Better Auth limits before creation", async () => {
+    mockAuth.api.getSession.mockResolvedValue({
+      user: {
+        id: "user-1",
+        email: "user@example.com",
+        name: "User One",
+      },
+    });
+
+    mockAuth.api.listApiKeys.mockResolvedValue({
+      apiKeys: [],
+      total: 0,
+      limit: undefined,
+      offset: undefined,
+    });
+
+    mockAuth.api.createApiKey.mockResolvedValue({
+      id: "key-2",
+      key: "extABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+      name: "Supercheck Recorder Extension",
+      prefix: "ext",
+      enabled: true,
+    });
+
+    const request = new NextRequest("http://localhost/api/extension/auth", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        name: "Supercheck Recorder Extension With Extra Debug Suffix",
+      }),
+    });
+
+    const response = await POST(request);
+
+    expect(response.status).toBe(200);
+    expect(mockAuth.api.createApiKey).toHaveBeenCalledWith({
+      body: expect.objectContaining({
+        userId: "user-1",
+        name: "Recorder: Supercheck Recorder Ex",
+      }),
+    });
+  });
+
+  it("returns Better Auth validation failures without converting them to 500s", async () => {
+    mockAuth.api.getSession.mockResolvedValue({
+      user: {
+        id: "user-1",
+        email: "user@example.com",
+        name: "User One",
+      },
+    });
+
+    mockAuth.api.listApiKeys.mockResolvedValue({
+      apiKeys: [],
+      total: 0,
+      limit: undefined,
+      offset: undefined,
+    });
+
+    const error = Object.assign(new Error("server-only property"), {
+      status: "BAD_REQUEST",
+      statusCode: 400,
+      body: { message: "Server-only property" },
+    });
+    mockAuth.api.createApiKey.mockRejectedValue(error);
+
+    const request = new NextRequest("http://localhost/api/extension/auth", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        name: "Supercheck Recorder Extension",
+      }),
+    });
+
+    const response = await POST(request);
+    const body = await response.json();
+
+    expect(response.status).toBe(400);
+    expect(body.success).toBe(false);
+    expect(body.error).toBe("Server-only property");
   });
 });

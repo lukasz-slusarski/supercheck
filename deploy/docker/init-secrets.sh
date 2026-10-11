@@ -12,7 +12,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${SCRIPT_DIR}/.env"
 
 # Colors for output
-RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
@@ -38,7 +37,9 @@ generate_secret() {
 
 echo -e "${GREEN}🔐 Generating secure secrets...${NC}"
 
-BETTER_AUTH_SECRET=$(generate_secret 16)
+# Better Auth recommends 32 random bytes. Hex encoding produces a 64-character
+# secret with enough entropy to avoid weak-secret warnings.
+BETTER_AUTH_SECRET=$(generate_secret 32)
 SECRET_ENCRYPTION_KEY=$(generate_secret 16)
 DB_PASSWORD=$(generate_secret 16)
 REDIS_PASSWORD=$(generate_secret 16)
@@ -81,13 +82,20 @@ GITHUB_CLIENT_SECRET=
 # ────────────────────────────────────────────────────────────
 # OPTIONAL: Domain Configuration (for HTTPS deployment)
 # ────────────────────────────────────────────────────────────
-# Uncomment and set these for production with domain
+# Uncomment and set these for production HTTPS with the main Compose file
+# COMPOSE_PROFILES=https
 # APP_DOMAIN=app.yourdomain.com
 # ACME_EMAIL=admin@yourdomain.com
 # STATUS_PAGE_DOMAIN=yourdomain.com        # Reserved namespace for default status page URLs ([uuid].STATUS_PAGE_DOMAIN)
 # STATUS_PAGE_HIDE_BRANDING=false    # Set to true to hide the public status page branding footer globally
 
 # ────────────────────────────────────────────────────────────
+# OPTIONAL: Colocated Private Agent (register it in Admin → Private Agents first)
+# Add private-agent to COMPOSE_PROFILES (for example: https,private-agent).
+# PRIVATE_AGENT_ID=
+# PRIVATE_AGENT_TOKEN=
+# SUPERCHECK_API_URL=http://app:3000  # Internal app origin; remote agents use HTTPS.
+
 # AUTO-GENERATED: Security Secrets (do not modify)
 # ────────────────────────────────────────────────────────────
 BETTER_AUTH_SECRET=${BETTER_AUTH_SECRET}
@@ -125,11 +133,16 @@ S3_ENDPOINT=http://minio:9000
 # SMTP_SECURE=false
 
 # ────────────────────────────────────────────────────────────
-# OPTIONAL: AI Features
+# OPTIONAL: AI Features & AI SRE
 # ────────────────────────────────────────────────────────────
+# AI SRE and automation are enabled by default with a configured AI provider.
+# Optional deployment-wide controls (shared by app and worker):
+# SRE_ENABLED=false           # Disable AI SRE requests and automation
+# SRE_AUTOMATION_ENABLED=false # Keep manual SRE, disable alert-triggered AI work
+
 # OpenAI (default provider)
 # AI_PROVIDER=openai
-# AI_MODEL=gpt-4o-mini
+# AI_MODEL=gpt-6-luna
 # OPENAI_API_KEY=sk-your-api-key
 
 # Anthropic
@@ -148,6 +161,11 @@ S3_ENDPOINT=http://minio:9000
 # AZURE_RESOURCE_NAME=your-resource
 # AZURE_API_KEY=your-key
 # AZURE_OPENAI_DEPLOYMENT=your-deployment
+
+# DeepSeek V4.1 Flash (optional; review data handling before enabling)
+# AI_PROVIDER=deepseek
+# AI_MODEL=deepseek-flash
+# DEEPSEEK_API_KEY=your-deepseek-api-key
 
 # OpenRouter (400+ models)
 # AI_PROVIDER=openrouter

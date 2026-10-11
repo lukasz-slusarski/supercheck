@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Supercheck Diagram</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+  <script>
+    (function () {
+      /* Theme: resolve before first paint. When this file is framed by the
+         docs page (same origin), follow the embedding page's theme class so
+         the diagram matches the site's light/dark toggle; otherwise fall back
+         to the OS preference. An explicit ?theme=light|dark wins for testing. */
+      function resolve() {
+        try {
+          var param = new URLSearchParams(window.location.search).get('theme');
+          if (param === 'light' || param === 'dark') return param;
+        } catch (_) {}
+        try {
+          if (window.parent && window.parent !== window) {
+            var cl = window.parent.document.documentElement.classList;
+            if (cl.contains('dark')) return 'dark';
+            if (cl.contains('light')) return 'light';
+          }
+        } catch (_) {}
+        try { return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'; } catch (_) {}
+        return 'light';
+      }
+      function apply() { document.documentElement.setAttribute('data-theme', resolve()); }
+      apply();
+      try {
+        if (window.parent && window.parent !== window) {
+          new MutationObserver(apply).observe(window.parent.document.documentElement, {
+            attributes: true, attributeFilter: ['class']
+          });
+        }
+        window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', apply);
+      } catch (_) {}
+
+      /* Hover flow ("intent trace"): hovering or focusing a component dims
+         unrelated elements, keeps its topology lit, glows the component, and
+         runs a short signal over each related edge once. Static meaning is
+         unchanged without JavaScript or with reduced motion. */
+      function initFlow() {
+        var svg = document.querySelector('svg');
+        if (!svg) return;
+        var flowLayer = document.getElementById('sa-flow-layer');
+        var reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+        var nodes = {};
+        var edges = Array.prototype.slice.call(svg.querySelectorAll('.eg'));
+        var active = null;
+
+        svg.querySelectorAll('.ng').forEach(function (g) { nodes[g.getAttribute('data-node')] = g; });
+
+        function clear() {
+          active = null;
+          svg.querySelectorAll('.dim').forEach(function (el) { el.classList.remove('dim'); });
+          svg.querySelectorAll('.hot').forEach(function (el) { el.classList.remove('hot'); });
+          flowLayer.textContent = '';
+        }
+
+        function focusNode(id) {
+          if (!nodes[id] || active === id) return;
+          clear();
+          active = id;
+          var connected = {};
+          connected[id] = true;
+          edges.forEach(function (g) {
+            var f = g.getAttribute('data-from'), t = g.getAttribute('data-to');
+            if (f === id || t === id) { connected[f] = true; connected[t] = true; }
+          });
+          Object.keys(nodes).forEach(function (nid) {
+            if (!connected[nid]) nodes[nid].classList.add('dim');
+          });
+          nodes[id].classList.add('hot');
+          edges.forEach(function (g) {
+            var f = g.getAttribute('data-from'), t = g.getAttribute('data-to');
+            if (f !== id && t !== id) { g.classList.add('dim'); return; }
+            if (reduceMotion.matches) return;
+            var geo = g.querySelector('.ep');
+            if (!geo) return;
+            var echo = geo.cloneNode(false);
+            echo.removeAttribute('marker-end');
+            echo.setAttribute('pathLength', '1');
+            echo.setAttribute('class', 'flow ' + (f === id ? 'out' : 'in'));
+            flowLayer.appendChild(echo);
+            echo.addEventListener('animationend', function () { echo.remove(); });
+          });
+        }
+
+        Object.keys(nodes).forEach(function (id) {
+          var g = nodes[id];
+          g.addEventListener('mouseenter', function () { focusNode(id); });
+          g.addEventListener('mouseleave', clear);
+          g.addEventListener('focus', function () { focusNode(id); });
+          g.addEventListener('blur', clear);
+        });
+      }
+      /* Self-sizing: report the rendered content height so the embedding docs
+         page can set the frame height exactly — no letterboxing, no inner
+         scrollbar. No-op when this file is opened directly. */
+      function initSizing() {
+        function reportHeight() {
+          if (window.parent === window) return;
+          var height = Math.ceil(document.body.getBoundingClientRect().height);
+          var target = window.location.protocol === 'file:' ? '*' : window.location.origin;
+          try {
+            window.parent.postMessage({ type: 'supercheck-diagram-height', height: height }, target);
+          } catch (_) {}
+        }
+        function scheduleReport() {
+          if (typeof window.requestAnimationFrame === 'function') {
+            window.requestAnimationFrame(reportHeight);
+          } else {
+            reportHeight();
+          }
+        }
+        window.addEventListener('load', scheduleReport);
+        window.addEventListener('resize', scheduleReport);
+        if (document.fonts && document.fonts.ready) { document.fonts.ready.then(scheduleReport); }
+        if ('ResizeObserver' in window) { new ResizeObserver(scheduleReport).observe(document.body); }
+        scheduleReport();
+      }
+
+      function boot() {
+        initFlow();
+        initSizing();
+      }
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', boot);
+      } else {
+        boot();
+      }
+    })();
+  </script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    :root {
+      --paper: #f5f5f5; --ink: #0a0a0a; --muted: #707070; --soft: #858585;
+      --accent: #16a34a; --link: #2a6df4; --glow: rgba(22,163,74,0.45);
+      --zone-fill: rgba(10,10,10,0.02); --zone-stroke: rgba(10,10,10,0.10); --zone-label: rgba(10,10,10,0.40);
+      --focal-fill: rgba(22,163,74,0.08); --focal-stroke: #16a34a; --focal-chip: rgba(22,163,74,0.50);
+      --backend-fill: #ffffff; --backend-stroke: #0a0a0a; --backend-chip: rgba(10,10,10,0.40);
+      --store-fill: rgba(10,10,10,0.05); --store-stroke: #707070; --store-chip: rgba(112,112,112,0.50);
+      --ext-fill: rgba(10,10,10,0.03); --ext-stroke: rgba(10,10,10,0.30); --ext-chip: rgba(10,10,10,0.22);
+      --input-fill: rgba(112,112,112,0.10); --input-stroke: #858585; --input-chip: rgba(133,133,133,0.40);
+      --sec-fill: rgba(22,163,74,0.05); --sec-stroke: rgba(22,163,74,0.50);
+      --font-name: 'Inter', ui-sans-serif, system-ui, sans-serif;
+      --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+    }
+    html[data-theme="dark"] {
+      --paper: #121212; --ink: #ebebeb; --muted: #b3b3b3; --soft: #9a9a9a;
+      --accent: #22c55e; --link: #5a8df7; --glow: rgba(34,197,94,0.45);
+      --zone-fill: rgba(235,235,235,0.03); --zone-stroke: rgba(235,235,235,0.10); --zone-label: rgba(235,235,235,0.35);
+      --focal-fill: rgba(34,197,94,0.08); --focal-stroke: #22c55e; --focal-chip: rgba(34,197,94,0.50);
+      --backend-fill: #1e1e1e; --backend-stroke: #ebebeb; --backend-chip: rgba(235,235,235,0.40);
+      --store-fill: rgba(235,235,235,0.05); --store-stroke: #b3b3b3; --store-chip: rgba(179,179,179,0.50);
+      --ext-fill: rgba(235,235,235,0.03); --ext-stroke: rgba(235,235,235,0.30); --ext-chip: rgba(235,235,235,0.22);
+      --input-fill: rgba(154,154,154,0.10); --input-stroke: #9a9a9a; --input-chip: rgba(154,154,154,0.40);
+      --sec-fill: rgba(34,197,94,0.05); --sec-stroke: rgba(34,197,94,0.50);
+    }
+    body {
+      font-family: var(--font-name);
+      background: var(--paper);
+      color: var(--ink);
+      padding: 1rem;
+    }
+    .frame { max-width: 1280px; width: 100%; margin: 0 auto; }
+    .diagram-container { width: 100%; overflow-x: auto; }
+    svg { width: 100%; min-width: 0; display: block; }
+
+    /* Diagram typography */
+    .tname { font-family: var(--font-name); font-size: 12px; font-weight: 600; fill: var(--ink); }
+    .tsub { font-family: var(--font-mono); font-size: 9px; fill: var(--muted); }
+    .tchip { font-family: var(--font-mono); font-size: 7px; letter-spacing: 0.08em; }
+    .tzone { font-family: var(--font-mono); font-size: 7px; letter-spacing: 0.14em; fill: var(--zone-label); }
+    .tlabel { font-family: var(--font-mono); font-size: 8px; letter-spacing: 0.06em; }
+    .lbl-muted { fill: var(--muted); }
+    .lbl-accent { fill: var(--accent); }
+    .lbl-link { fill: var(--link); }
+    .tlegend { font-family: var(--font-name); font-size: 8.5px; fill: var(--muted); }
+    .tlegend-mono { font-family: var(--font-mono); font-size: 8px; letter-spacing: 0.18em; fill: var(--muted); }
+
+    /* Themeable primitives */
+    .mask { fill: var(--paper); }
+    .bg { fill: var(--paper); }
+    .ruleline { stroke: var(--zone-stroke); stroke-width: 0.8; }
+    .zone { fill: var(--zone-fill); stroke: var(--zone-stroke); stroke-width: 0.8; }
+    .nd { stroke-width: 1; }
+    .nd-focal { fill: var(--focal-fill); stroke: var(--focal-stroke); }
+    .nd-backend { fill: var(--backend-fill); stroke: var(--backend-stroke); }
+    .nd-store { fill: var(--store-fill); stroke: var(--store-stroke); }
+    .nd-external { fill: var(--ext-fill); stroke: var(--ext-stroke); }
+    .nd-input { fill: var(--input-fill); stroke: var(--input-stroke); }
+    .nd-security { fill: var(--sec-fill); stroke: var(--sec-stroke); stroke-dasharray: 4 4; }
+    .chip { fill: transparent; stroke-width: 0.8; }
+    .chip-focal, .chip-security { stroke: var(--focal-chip); }
+    .chip-backend { stroke: var(--backend-chip); }
+    .chip-store { stroke: var(--store-chip); }
+    .chip-external { stroke: var(--ext-chip); }
+    .chip-input { stroke: var(--input-chip); }
+    .tag-focal, .tag-security { fill: var(--accent); }
+    .tag-backend { fill: var(--ink); }
+    .tag-store { fill: var(--muted); }
+    .tag-external, .tag-input { fill: var(--soft); }
+    .edge { fill: none; stroke-width: 1.2; }
+    .e-muted { stroke: var(--muted); }
+    .e-accent { stroke: var(--accent); stroke-width: 1.4; }
+    .e-link { stroke: var(--link); }
+    .e-dash { stroke-width: 1; stroke-dasharray: 4 3; }
+    #sa-arrow polygon { fill: var(--muted); }
+    #sa-arrow-accent polygon { fill: var(--accent); }
+    #sa-arrow-link polygon { fill: var(--link); }
+
+    /* Hover flow ("intent trace"): unrelated elements dim, related topology
+       stays lit, the hovered node glows, and a short signal runs over each
+       related edge once. Mirrors the interactive viewer behaviour. */
+    .ng, .eg { transition: opacity 140ms ease; }
+    .ng { outline: none; }
+    .dim { opacity: 0.2; }
+    .ng.hot { filter: drop-shadow(0 0 10px var(--glow)); }
+    .flow-layer { pointer-events: none; }
+    .flow {
+      fill: none; stroke-width: 3.1; stroke-linecap: round;
+      stroke-dasharray: 0.1 0.9; stroke-dashoffset: 0;
+      vector-effect: non-scaling-stroke; opacity: 0.94;
+      animation: sa-flow 1.15s linear 1 both;
+    }
+    .flow.out { stroke: var(--accent); filter: drop-shadow(0 0 4px var(--glow)); }
+    .flow.in { stroke: var(--link); filter: drop-shadow(0 0 4px var(--glow)); }
+    @keyframes sa-flow {
+      0% { opacity: 0.28; stroke-dashoffset: 0; }
+      12%, 78% { opacity: 0.94; }
+      100% { opacity: 0; stroke-dashoffset: -1; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .ng, .eg { transition: none; }
+      .ng.hot { filter: none; }
+      .flow { display: none; }
+    }
+    .sr-only {
+      position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+      overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+    }
+  </style>
+</head>
+<body>
+<div class="sr-only"><h1>Supercheck</h1></div>
+<div class="frame">
+  <div class="diagram-container">
+    <svg viewBox="0 0 1280 780" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="archify-diagram-title sc-arch-desc">
+      <title id="archify-diagram-title">Supercheck architecture</title>
+      <desc id="sc-arch-desc">Architecture diagram of the Supercheck platform: users and CLI enter through auth into the app, runs flow via Redis and BullMQ to NestJS workers and sandboxed Kubernetes jobs, with Postgres, object storage, AI SRE, and alerting around them. Hover or focus a component to trace its connections.</desc>
+      <defs>
+        <marker id="sa-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6"/></marker>
+        <marker id="sa-arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6"/></marker>
+        <marker id="sa-arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6"/></marker>
+      </defs>
+
+      <rect class="bg" width="100%" height="100%"/>
+
+      <!-- Zones (drawn before edges and nodes) -->
+      <g class="zonel">
+        <rect class="zone" x="224" y="96" width="752" height="436" rx="8"/>
+        <rect class="mask" x="544" y="100" width="112" height="12" rx="2"/>
+        <text class="tzone" x="600" y="109" text-anchor="middle">SUPERCHECK PLATFORM</text>
+      </g>
+      <g class="zonel">
+        <rect class="zone" x="1044" y="240" width="192" height="116" rx="8"/>
+        <rect class="mask" x="1086" y="244" width="108" height="12" rx="2"/>
+        <text class="tzone" x="1140" y="253" text-anchor="middle">SANDBOXED EXECUTION</text>
+      </g>
+
+      <!-- Edges (behind nodes). Each group carries its label so both highlight together. -->
+      <g class="eg" data-from="users" data-to="app">
+        <line class="ep edge e-link" x1="176" y1="293" x2="248" y2="293" marker-end="url(#sa-arrow-link)"/>
+        <rect class="mask" x="188" y="273" width="36" height="12" rx="2"/>
+        <text class="tlabel lbl-link" x="206" y="283" text-anchor="middle">HTTPS</text>
+      </g>
+      <g class="eg" data-from="cli" data-to="app">
+        <path class="ep edge e-muted e-dash" d="M 110,184 V 244 Q 110,252 118,252 H 292 Q 300,252 300,260 V 272" marker-end="url(#sa-arrow)"/>
+        <rect class="mask" x="169" y="232" width="52" height="12" rx="2"/>
+        <text class="tlabel lbl-muted" x="195" y="242" text-anchor="middle">REST API</text>
+      </g>
+      <g class="eg" data-from="auth" data-to="app">
+        <line class="ep edge e-accent e-dash" x1="360" y1="184" x2="360" y2="272" marker-end="url(#sa-arrow-accent)"/>
+        <rect class="mask" x="366" y="214" width="52" height="12" rx="2"/>
+        <text class="tlabel lbl-accent" x="392" y="224" text-anchor="middle">SESSIONS</text>
+      </g>
+      <g class="eg" data-from="scheduler" data-to="queue">
+        <line class="ep edge e-muted" x1="635" y1="184" x2="635" y2="272" marker-end="url(#sa-arrow)"/>
+        <rect class="mask" x="641" y="214" width="32" height="12" rx="2"/>
+        <text class="tlabel lbl-muted" x="657" y="224" text-anchor="middle">CRON</text>
+      </g>
+      <g class="eg" data-from="app" data-to="queue">
+        <line class="ep edge e-accent" x1="408" y1="296" x2="560" y2="296" marker-end="url(#sa-arrow-accent)"/>
+        <rect class="mask" x="446" y="276" width="76" height="12" rx="2"/>
+        <text class="tlabel lbl-accent" x="484" y="286" text-anchor="middle">ENQUEUE RUNS</text>
+      </g>
+      <g class="eg" data-from="queue" data-to="worker">
+        <line class="ep edge e-muted" x1="710" y1="293" x2="800" y2="293" marker-end="url(#sa-arrow)"/>
+      </g>
+      <g class="eg" data-from="queue" data-to="app">
+        <line class="ep edge e-muted e-dash" x1="560" y1="320" x2="408" y2="320" marker-end="url(#sa-arrow)"/>
+        <rect class="mask" x="452" y="328" width="64" height="12" rx="2"/>
+        <text class="tlabel lbl-muted" x="484" y="338" text-anchor="middle">SSE EVENTS</text>
+      </g>
+      <g class="eg" data-from="worker" data-to="k8s">
+        <line class="ep edge e-muted" x1="960" y1="304" x2="1060" y2="304" marker-end="url(#sa-arrow)"/>
+        <rect class="mask" x="986" y="284" width="48" height="12" rx="2"/>
+        <text class="tlabel lbl-muted" x="1010" y="294" text-anchor="middle">RUN JOB</text>
+      </g>
+      <g class="eg" data-from="app" data-to="postgres">
+        <line class="ep edge e-muted" x1="328" y1="336" x2="328" y2="456" marker-end="url(#sa-arrow)"/>
+        <rect class="mask" x="336" y="384" width="72" height="12" rx="2"/>
+        <text class="tlabel lbl-muted" x="372" y="394" text-anchor="middle">DRIZZLE ORM</text>
+      </g>
+      <g class="eg" data-from="worker" data-to="postgres">
+        <path class="ep edge e-muted" d="M 800,314 H 748 Q 740,314 740,322 V 552 Q 740,560 732,560 H 368 Q 360,560 360,552 V 512" marker-end="url(#sa-arrow)"/>
+        <rect class="mask" x="510" y="540" width="88" height="12" rx="2"/>
+        <text class="tlabel lbl-muted" x="554" y="550" text-anchor="middle">STATUS / RESULTS</text>
+      </g>
+      <g class="eg" data-from="worker" data-to="storage">
+        <line class="ep edge e-muted" x1="853" y1="336" x2="853" y2="456" marker-end="url(#sa-arrow)"/>
+        <rect class="mask" x="859" y="384" width="60" height="12" rx="2"/>
+        <text class="tlabel lbl-muted" x="889" y="394" text-anchor="middle">ARTIFACTS</text>
+      </g>
+      <g class="eg" data-from="app" data-to="ai">
+        <path class="ep edge e-muted e-dash" d="M 288,336 V 372 Q 288,380 280,380 H 148 Q 140,380 140,388 V 456" marker-end="url(#sa-arrow)"/>
+        <rect class="mask" x="148" y="404" width="72" height="12" rx="2"/>
+        <text class="tlabel lbl-muted" x="184" y="414" text-anchor="middle">AI FEATURES</text>
+      </g>
+      <g class="eg" data-from="worker" data-to="notify">
+        <path class="ep edge e-muted e-dash" d="M 907,336 V 372 Q 907,380 915,380 H 1132 Q 1140,380 1140,388 V 456" marker-end="url(#sa-arrow)"/>
+        <rect class="mask" x="1001" y="362" width="44" height="12" rx="2"/>
+        <text class="tlabel lbl-muted" x="1023" y="372" text-anchor="middle">ALERTS</text>
+      </g>
+      <g class="eg" data-from="queue" data-to="sre">
+        <line class="ep edge e-muted e-dash" x1="635" y1="336" x2="635" y2="456" marker-end="url(#sa-arrow)"/>
+        <rect class="mask" x="643" y="384" width="76" height="12" rx="2"/>
+        <text class="tlabel lbl-muted" x="681" y="394" text-anchor="middle">ALERT TRIAGE</text>
+      </g>
+      <g class="eg" data-from="sre" data-to="tools">
+        <line class="ep edge e-muted e-dash" x1="635" y1="512" x2="635" y2="600" marker-end="url(#sa-arrow)"/>
+        <rect class="mask" x="643" y="540" width="64" height="12" rx="2"/>
+        <text class="tlabel lbl-muted" x="675" y="550" text-anchor="middle">CONNECTORS</text>
+      </g>
+      <g class="eg" data-from="app" data-to="status">
+        <path class="ep edge e-muted" d="M 368,336 V 396 Q 368,404 360,404 H 336 a 8,8 0 0,0 -16,0 H 218 Q 210,404 210,412 V 572 Q 210,580 202,580 H 148 Q 140,580 140,588 V 600" marker-end="url(#sa-arrow)"/>
+        <rect class="mask" x="226" y="412" width="88" height="12" rx="2"/>
+        <text class="tlabel lbl-muted" x="270" y="422" text-anchor="middle">PUBLISH STATUS</text>
+      </g>
+
+      <!-- Nodes -->
+      <g class="ng" data-node="cli" tabindex="0" aria-label="CLI + CI: Monitoring-as-code">
+        <rect class="mask" x="40" y="128" width="140" height="56" rx="6"/>
+        <rect class="nd nd-external" x="40" y="128" width="140" height="56" rx="6"/>
+        <rect class="chip chip-external" x="48" y="136" width="28" height="12" rx="2"/>
+        <text class="tchip tag-external" x="62" y="145" text-anchor="middle">EXT</text>
+        <text class="tname" x="110" y="160" text-anchor="middle">CLI + CI</text>
+        <text class="tsub" x="110" y="176" text-anchor="middle">Monitoring-as-code</text>
+      </g>
+      <g class="ng" data-node="auth" tabindex="0" aria-label="Auth + RBAC: Better Auth with six-tier RBAC">
+        <rect class="mask" x="280" y="128" width="160" height="56" rx="6"/>
+        <rect class="nd nd-security" x="280" y="128" width="160" height="56" rx="6"/>
+        <rect class="chip chip-security" x="288" y="136" width="32" height="12" rx="2"/>
+        <text class="tchip tag-security" x="304" y="145" text-anchor="middle">RBAC</text>
+        <text class="tname" x="360" y="160" text-anchor="middle">Auth + RBAC</text>
+        <text class="tsub" x="360" y="176" text-anchor="middle">Better Auth · RBAC</text>
+      </g>
+      <g class="ng" data-node="scheduler" tabindex="0" aria-label="Schedulers: cron jobs and monitors">
+        <rect class="mask" x="560" y="128" width="150" height="56" rx="6"/>
+        <rect class="nd nd-backend" x="560" y="128" width="150" height="56" rx="6"/>
+        <rect class="chip chip-backend" x="568" y="136" width="32" height="12" rx="2"/>
+        <text class="tchip tag-backend" x="584" y="145" text-anchor="middle">CRON</text>
+        <text class="tname" x="635" y="160" text-anchor="middle">Schedulers</text>
+        <text class="tsub" x="635" y="176" text-anchor="middle">cron + monitors</text>
+      </g>
+      <g class="ng" data-node="users" tabindex="0" aria-label="Users: dashboard and recorder">
+        <rect class="mask" x="48" y="272" width="128" height="64" rx="6"/>
+        <rect class="nd nd-input" x="48" y="272" width="128" height="64" rx="6"/>
+        <rect class="chip chip-input" x="56" y="280" width="28" height="12" rx="2"/>
+        <text class="tchip tag-input" x="70" y="289" text-anchor="middle">USER</text>
+        <text class="tname" x="112" y="308" text-anchor="middle">Users</text>
+        <text class="tsub" x="112" y="324" text-anchor="middle">UI + recorder</text>
+      </g>
+      <g class="ng" data-node="app" tabindex="0" aria-label="Supercheck App: UI, API, and server actions">
+        <rect class="mask" x="248" y="272" width="160" height="64" rx="6"/>
+        <rect class="nd nd-focal" x="248" y="272" width="160" height="64" rx="6"/>
+        <rect class="chip chip-focal" x="256" y="280" width="28" height="12" rx="2"/>
+        <text class="tchip tag-focal" x="270" y="289" text-anchor="middle">API</text>
+        <text class="tname" x="328" y="308" text-anchor="middle">Supercheck App</text>
+        <text class="tsub" x="328" y="324" text-anchor="middle">UI · API · actions</text>
+      </g>
+      <g class="ng" data-node="queue" tabindex="0" aria-label="Redis + BullMQ: queue and capacity">
+        <rect class="mask" x="560" y="272" width="150" height="64" rx="6"/>
+        <rect class="nd nd-store" x="560" y="272" width="150" height="64" rx="6"/>
+        <rect class="chip chip-store" x="568" y="280" width="36" height="12" rx="2"/>
+        <text class="tchip tag-store" x="586" y="289" text-anchor="middle">QUEUE</text>
+        <text class="tname" x="635" y="308" text-anchor="middle">Redis + BullMQ</text>
+        <text class="tsub" x="635" y="324" text-anchor="middle">queue · capacity</text>
+      </g>
+      <g class="ng" data-node="worker" tabindex="0" aria-label="NestJS Worker: runs, k6, and monitors">
+        <rect class="mask" x="800" y="272" width="160" height="64" rx="6"/>
+        <rect class="nd nd-backend" x="800" y="272" width="160" height="64" rx="6"/>
+        <rect class="chip chip-backend" x="808" y="280" width="40" height="12" rx="2"/>
+        <text class="tchip tag-backend" x="828" y="289" text-anchor="middle">RUNNER</text>
+        <text class="tname" x="880" y="308" text-anchor="middle">NestJS Worker</text>
+        <text class="tsub" x="880" y="324" text-anchor="middle">runs · k6 · monitors</text>
+      </g>
+      <g class="ng" data-node="k8s" tabindex="0" aria-label="Kubernetes Jobs: gVisor sandboxed Playwright and k6 runs">
+        <rect class="mask" x="1060" y="272" width="160" height="64" rx="6"/>
+        <rect class="nd nd-external" x="1060" y="272" width="160" height="64" rx="6"/>
+        <rect class="chip chip-external" x="1068" y="280" width="28" height="12" rx="2"/>
+        <text class="tchip tag-external" x="1082" y="289" text-anchor="middle">K8S</text>
+        <text class="tname" x="1140" y="308" text-anchor="middle">Kubernetes Jobs</text>
+        <text class="tsub" x="1140" y="324" text-anchor="middle">gVisor · Playwright</text>
+      </g>
+      <g class="ng" data-node="ai" tabindex="0" aria-label="AI Providers: multi-provider AI">
+        <rect class="mask" x="40" y="456" width="140" height="56" rx="6"/>
+        <rect class="nd nd-external" x="40" y="456" width="140" height="56" rx="6"/>
+        <rect class="chip chip-external" x="48" y="464" width="28" height="12" rx="2"/>
+        <text class="tchip tag-external" x="62" y="473" text-anchor="middle">EXT</text>
+        <text class="tname" x="110" y="488" text-anchor="middle">AI Providers</text>
+        <text class="tsub" x="110" y="504" text-anchor="middle">multi-provider</text>
+      </g>
+      <g class="ng" data-node="postgres" tabindex="0" aria-label="PostgreSQL: Drizzle ORM">
+        <rect class="mask" x="248" y="456" width="150" height="56" rx="6"/>
+        <rect class="nd nd-store" x="248" y="456" width="150" height="56" rx="6"/>
+        <rect class="chip chip-store" x="256" y="464" width="28" height="12" rx="2"/>
+        <text class="tchip tag-store" x="270" y="473" text-anchor="middle">DB</text>
+        <text class="tname" x="323" y="488" text-anchor="middle">PostgreSQL</text>
+        <text class="tsub" x="323" y="504" text-anchor="middle">Drizzle ORM</text>
+      </g>
+      <g class="ng" data-node="sre" tabindex="0" aria-label="AI SRE: investigations and triage">
+        <rect class="mask" x="560" y="456" width="150" height="56" rx="6"/>
+        <rect class="nd nd-backend" x="560" y="456" width="150" height="56" rx="6"/>
+        <rect class="chip chip-backend" x="568" y="464" width="28" height="12" rx="2"/>
+        <text class="tchip tag-backend" x="582" y="473" text-anchor="middle">AI</text>
+        <text class="tname" x="635" y="488" text-anchor="middle">AI SRE</text>
+        <text class="tsub" x="635" y="504" text-anchor="middle">Investigations · triage</text>
+      </g>
+      <g class="ng" data-node="storage" tabindex="0" aria-label="Object Storage: S3-compatible">
+        <rect class="mask" x="800" y="456" width="150" height="56" rx="6"/>
+        <rect class="nd nd-store" x="800" y="456" width="150" height="56" rx="6"/>
+        <rect class="chip chip-store" x="808" y="464" width="28" height="12" rx="2"/>
+        <text class="tchip tag-store" x="822" y="473" text-anchor="middle">S3</text>
+        <text class="tname" x="875" y="488" text-anchor="middle">Object Storage</text>
+        <text class="tsub" x="875" y="504" text-anchor="middle">S3-compatible</text>
+      </g>
+      <g class="ng" data-node="notify" tabindex="0" aria-label="Alert Channels: alert delivery">
+        <rect class="mask" x="1060" y="456" width="140" height="56" rx="6"/>
+        <rect class="nd nd-external" x="1060" y="456" width="140" height="56" rx="6"/>
+        <rect class="chip chip-external" x="1068" y="464" width="36" height="12" rx="2"/>
+        <text class="tchip tag-external" x="1086" y="473" text-anchor="middle">ALERT</text>
+        <text class="tname" x="1130" y="488" text-anchor="middle">Alert Channels</text>
+        <text class="tsub" x="1130" y="504" text-anchor="middle">alert delivery</text>
+      </g>
+      <g class="ng" data-node="status" tabindex="0" aria-label="Status Pages: incidents and subscribers">
+        <rect class="mask" x="40" y="600" width="150" height="56" rx="6"/>
+        <rect class="nd nd-external" x="40" y="600" width="150" height="56" rx="6"/>
+        <rect class="chip chip-external" x="48" y="608" width="40" height="12" rx="2"/>
+        <text class="tchip tag-external" x="68" y="617" text-anchor="middle">PUBLIC</text>
+        <text class="tname" x="115" y="632" text-anchor="middle">Status Pages</text>
+        <text class="tsub" x="115" y="648" text-anchor="middle">incidents · subscribers</text>
+      </g>
+      <g class="ng" data-node="tools" tabindex="0" aria-label="Observability + DevOps: Kubernetes, Prometheus, Grafana">
+        <rect class="mask" x="544" y="600" width="180" height="56" rx="6"/>
+        <rect class="nd nd-external" x="544" y="600" width="180" height="56" rx="6"/>
+        <rect class="chip chip-external" x="552" y="608" width="28" height="12" rx="2"/>
+        <text class="tchip tag-external" x="566" y="617" text-anchor="middle">OBS</text>
+        <text class="tname" x="634" y="632" text-anchor="middle">Observability + DevOps</text>
+        <text class="tsub" x="634" y="648" text-anchor="middle">K8s · Prometheus · Grafana</text>
+      </g>
+
+      <!-- Legend -->
+      <g class="legend">
+        <line class="ruleline" x1="40" y1="700" x2="1240" y2="700"/>
+        <text class="tlegend-mono" x="40" y="716">LEGEND</text>
+
+        <rect class="nd nd-focal" x="40" y="724" width="14" height="10" rx="2"/>
+        <text class="tlegend" x="60" y="732">Focal</text>
+
+        <rect class="nd nd-backend" x="210" y="724" width="14" height="10" rx="2"/>
+        <text class="tlegend" x="230" y="732">Backend</text>
+
+        <rect class="nd nd-store" x="380" y="724" width="14" height="10" rx="2"/>
+        <text class="tlegend" x="400" y="732">Store</text>
+
+        <rect class="nd nd-external" x="550" y="724" width="14" height="10" rx="2"/>
+        <text class="tlegend" x="570" y="732">External / cloud</text>
+
+        <rect class="nd nd-security" x="720" y="724" width="14" height="10" rx="2"/>
+        <text class="tlegend" x="740" y="732">Security</text>
+
+        <rect class="nd nd-input" x="890" y="724" width="14" height="10" rx="2"/>
+        <text class="tlegend" x="910" y="732">Input / user</text>
+
+        <line class="edge e-link" x1="40" y1="756" x2="68" y2="756" marker-end="url(#sa-arrow-link)"/>
+        <text class="tlegend" x="76" y="759">HTTP / API</text>
+
+        <line class="edge e-accent" x1="240" y1="756" x2="268" y2="756" marker-end="url(#sa-arrow-accent)"/>
+        <text class="tlegend" x="276" y="759">Primary flow</text>
+
+        <line class="edge e-muted" x1="440" y1="756" x2="468" y2="756" marker-end="url(#sa-arrow)"/>
+        <text class="tlegend" x="476" y="759">Internal</text>
+
+        <line class="edge e-muted e-dash" x1="640" y1="756" x2="668" y2="756" marker-end="url(#sa-arrow)"/>
+        <text class="tlegend" x="676" y="759">Async / trace</text>
+      </g>
+
+      <!-- Hover flow overlay (temporary clones only) -->
+      <g class="flow-layer" id="sa-flow-layer"></g>
+    </svg>
+  </div>
+</div>
+</body>
+</html>

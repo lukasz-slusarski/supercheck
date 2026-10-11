@@ -4,45 +4,55 @@ description: Role-based access control for organizations and projects
 icon: ShieldCheck
 ---
 
-Supercheck uses a **6-role RBAC system** with granular permissions across organizations and projects. This page provides a complete reference of what each role can do.
+Choose a role based on the tasks a teammate needs. Use the tables below to check permissions.
 
 ## Role Overview
 
 <Callout type="info">
-**Access Scope**: Organization-level roles (Super Admin, Org Owner, Org Admin) have access to **all projects** in the organization. Project-level roles (Project Admin, Project Editor) are limited to **assigned projects only**. Project Viewer has read-only access to all projects.
+Members can view all active projects in their organization. **Project Admin** and **Project Editor** gain additional permissions only in assigned projects; their access to other projects remains read-only. Organization administrators manage all projects in their organization.
 </Callout>
 
 | Role | Level | Description |
 |------|-------|-------------|
 | **Super Admin** | System | Platform-wide control, user management, and impersonation |
-| **Org Owner** | Organization | Full organization control including deletion and billing |
+| **Org Owner** | Organization | Full organization control including deletion |
 | **Org Admin** | Organization | Organization management without deletion rights |
 | **Project Admin** | Project | Full control of assigned projects |
 | **Project Editor** | Project | Create and edit resources in assigned projects |
 | **Project Viewer** | Organization | Read-only access to all projects |
 
-## Role Hierarchy
+## Role Overview Diagram
+
+<p className="text-sm md:hidden">Scroll horizontally to view the full diagram.</p>
+
+<div className="overflow-x-auto" role="region" aria-label="Roles and permissions overview diagram" tabIndex={0}>
+<div className="min-w-[52rem]">
 
 ```mermaid
-graph TD
-    SA["🔴 Super Admin<br/>System-wide Control"]
-    OO["🟠 Org Owner<br/>Organization Control"]
-    OA["🟡 Org Admin<br/>Organization Management"]
-    PA["🟣 Project Admin<br/>Assigned Projects"]
-    PE["🔵 Project Editor<br/>Assigned Projects"]
-    PV["⚪ Project Viewer<br/>Read-Only All Projects"]
-
-    SA --> OO
-    SA --> OA
-    OO --> PA
+flowchart LR
+    SA["<b>Super Admin</b><br/>System-wide"] --> OO["<b>Org Owner</b><br/>Organization"]
+    SA --> OA["<b>Org Admin</b><br/>Organization"]
+    OO --> PA["<b>Project Admin</b><br/>Project"]
     OA --> PA
-    PA --> PE
-    PE --> PV
+    PA --> PE["<b>Project Editor</b><br/>Project"]
+    PE --> PV["<b>Project Viewer</b><br/>Read-only"]
+
+    style SA fill:#ef4444,stroke:#b91c1c,color:#fff
+    style OO fill:#f59e0b,stroke:#b45309,color:#fff
+    style OA fill:#d97706,stroke:#92400e,color:#fff
+    style PA fill:#8b5cf6,stroke:#6d28d9,color:#fff
+    style PE fill:#3b82f6,stroke:#1e40af,color:#fff
+    style PV fill:#64748b,stroke:#475569,color:#fff
 ```
+
+</div>
+</div>
+
+Use the matrix below for each role's exact permissions and project scope.
 
 ## Permission Matrix
 
-<Tabs items={['Organization', 'Project', 'Tests & Jobs', 'Monitors & Status Pages', 'Test Runs', 'API Keys', 'Notifications', 'Tags']}>
+<Tabs items={['Organization', 'Project', 'Tests & Jobs', 'Monitors & Status Pages', 'Test Runs', 'CLI Tokens', 'Notifications', 'Tags', 'AI SRE']}>
 <Tab value="Organization">
 
 | Resource | Super Admin | Org Owner | Org Admin | Project Admin | Project Editor | Project Viewer |
@@ -66,7 +76,7 @@ graph TD
 | **Manage project members** | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
 
 <Callout type="info">
-*\* Project Admin and Project Editor permissions apply only to their assigned projects.*
+*\* Additional permissions apply only to assigned projects. Other active projects remain readable.*
 </Callout>
 
 </Tab>
@@ -101,7 +111,7 @@ graph TD
 | **Delete** | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
 
 </Tab>
-<Tab value="API Keys">
+<Tab value="CLI Tokens">
 
 | Action | Super Admin | Org Owner | Org Admin | Project Admin* | Project Editor* | Project Viewer |
 |--------|:-----------:|:---------:|:---------:|:--------------:|:---------------:|:--------------:|
@@ -131,6 +141,24 @@ graph TD
 | **Delete** | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
 
 </Tab>
+<Tab value="AI SRE">
+
+| Action | Super Admin | Org Owner | Org Admin | Project Admin* | Project Editor* | Project Viewer |
+|--------|:-----------:|:---------:|:---------:|:--------------:|:---------------:|:--------------:|
+| **View services & incidents** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Create & update services** | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| **Delete services** | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+| **Create & update incidents** | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| **Delete incidents** | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+| **Investigate stored evidence** | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| **Configure & investigate live connectors** | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+| **Approve topology suggestions** | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+
+<Callout type="info">
+*\* Project Admin and Project Editor permissions apply only to their assigned projects. Project Editors can investigate stored evidence and manage incidents, but cannot query or configure live external connectors (`sre_connector:investigate`).*
+</Callout>
+
+</Tab>
 </Tabs>
 
 ## Variables & Secrets
@@ -146,7 +174,7 @@ Variables and secrets have special permission rules to balance usability with se
 | **View secret values** | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 
 <Callout type="warn">
-**Project Editors** can create/edit variables and view secret values (needed to use secrets in tests), but **cannot delete** variables. This prevents accidental data loss while allowing productive work.
+**Project Editors** can create and edit variables and reveal secret values in assigned projects. They cannot delete variables. Keep revealed values out of chat, logs, and shared documents.
 </Callout>
 
 ## System Administration
@@ -172,9 +200,9 @@ The following roles can access **all projects** in their organization without ex
 - **Org Admin** — All projects in administered organizations
 - **Project Viewer** — Read-only access to all projects (intentional for monitoring roles)
 
-### Project-Limited Access
+### Assigned Project Permissions
 
-These roles only have access to **explicitly assigned projects**:
+These roles have additional permissions in **assigned projects** and read-only access to other active projects:
 
 - **Project Admin** — Full control, but only for assigned projects
 - **Project Editor** — Create/edit permissions, but only for assigned projects

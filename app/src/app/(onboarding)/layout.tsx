@@ -5,6 +5,10 @@ import { QueryProvider } from "@/lib/query-provider";
 import { CheckIcon } from "@/components/logo/supercheck-logo";
 import { SignOutButton } from "@/components/sign-out-button";
 import type { Metadata } from "next";
+import { getCurrentUser, getSelectableProjects } from "@/lib/session";
+import { getCurrentProjectContext } from "@/lib/project-context";
+import { ProjectContextProvider } from "@/hooks/use-project-context";
+import { OnboardingProjectSelector } from "@/components/onboarding-project-selector";
 
 export const metadata: Metadata = {
   title: "Subscription | Uptime important.is",
@@ -28,8 +32,18 @@ export default async function OnboardingLayout({
     redirect("/sign-in");
   }
 
+  const user = await getCurrentUser();
+  if (!user) redirect("/sign-in");
+  const [projects, currentProject] = await Promise.all([
+    getSelectableProjects(user.id), getCurrentProjectContext(),
+  ]);
+  const initialProjects = projects.map(project => ({
+    ...project, userRole: project.role || "project_viewer",
+  }));
+
   return (
     <QueryProvider>
+      <ProjectContextProvider initialProjects={initialProjects} initialCurrentProject={currentProject}>
       <div className="min-h-screen bg-gradient-to-b from-background via-background to-muted/30 relative overflow-hidden">
         {/* Decorative background elements */}
         <div className="pointer-events-none absolute inset-0" aria-hidden="true">
@@ -38,14 +52,15 @@ export default async function OnboardingLayout({
         </div>
         {/* Header */}
         <header className="border-b bg-background/80 backdrop-blur-sm sticky top-0 z-50">
-          <div className="container mx-auto px-4 py-4 flex items-center justify-between">
+          <div className="container mx-auto px-4 py-4 flex flex-wrap gap-3 items-center justify-between">
             <div className="flex items-center gap-2">
               <CheckIcon className="h-7 w-7" />
               <span className="font-semibold text-lg">Uptime important.is</span>
             </div>
-            <div className="flex items-center gap-4">
+            <div className="flex min-w-0 max-w-full flex-wrap items-center gap-4">
+              <OnboardingProjectSelector />
               <span className="text-sm text-muted-foreground">
-                {session.user.email}
+                {user.email}
               </span>
               <SignOutButton variant="outline" size="sm" />
             </div>
@@ -64,6 +79,7 @@ export default async function OnboardingLayout({
           </div>
         </footer>
       </div>
+      </ProjectContextProvider>
     </QueryProvider>
   );
 }

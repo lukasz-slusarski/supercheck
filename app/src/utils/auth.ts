@@ -1,8 +1,19 @@
 import { betterAuth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
+import { v7 as uuidv7 } from "uuid";
 import { db } from "@/utils/db";
-import { authSchema } from "@/db/schema";
-import { organization, admin, lastLoginMethod, captcha } from "better-auth/plugins";
+import {
+  authSchema,
+  invitation,
+  member,
+  organization as organizationTable,
+} from "@/db/schema";
+import {
+  organization as organizationPlugin,
+  admin,
+  lastLoginMethod,
+  captcha,
+} from "better-auth/plugins";
 import { apiKey } from "@better-auth/api-key";
 import { ac, roles, Role } from "@/lib/rbac/permissions";
 import { EmailService } from "@/lib/email-service";
@@ -16,10 +27,10 @@ import {
   renderEmailVerificationEmail,
 } from "@/lib/email-renderer";
 import { nextCookies } from "better-auth/next-js";
+import { createPolarClient } from "@/lib/billing/polar-client";
 import {
   isPolarEnabled,
   getPolarConfig,
-  getPolarProducts,
   isCloudHosted,
   isCaptchaEnabled,
 } from "@/lib/feature-flags";
@@ -34,21 +45,11 @@ function getPolarPlugin() {
   }
 
   try {
-     
-    const {
-      polar,
-      checkout,
-      portal,
-      usage,
-      webhooks,
-    } = require("@polar-sh/better-auth");
-    const { Polar } = require("@polar-sh/sdk");
-     
+    const { polar, webhooks } = require("@polar-sh/better-auth");
 
     const config = getPolarConfig()!;
-    const products = getPolarProducts();
 
-    const polarClient = new Polar({
+    const polarClient = createPolarClient({
       accessToken: config.accessToken,
       server: config.server,
     });
@@ -65,55 +66,14 @@ function getPolarPlugin() {
       //    which has proper error handling (ensurePolarCustomerAndLink function)
       // 3. This ensures signup always succeeds, and Polar customer is created gracefully
       createCustomerOnSignUp: false,
-      // Note: getCustomerCreateParams is kept for reference but won't be called
-      // since createCustomerOnSignUp is false
-      getCustomerCreateParams: async ({
-        user,
-      }: {
-        user: { id?: string; email?: string; name?: string };
-      }) => {
-        console.log("[Polar] Creating customer for user:", {
-          id: user.id,
-          email: user.email,
-          name: user.name,
-        });
-
-        // Only return metadata - the plugin handles email/name from user object
-        // Social auth users get their data synced via syncPolarCustomerData() in setup-defaults
-        return {
-          metadata: {
-            ...(user.id ? { userId: String(user.id) } : {}),
-            source: "supercheck-signup",
-          },
-        };
-      },
       use: [
-        checkout({
-          products: products
-            ? [
-                {
-                  productId: products.plusProductId,
-                  slug: "plus",
-                },
-                {
-                  productId: products.proProductId,
-                  slug: "pro",
-                },
-              ]
-            : [],
-          // Use absolute URL to ensure correct redirect after checkout
-          successUrl: `${process.env.NEXT_PUBLIC_APP_URL || process.env.BETTER_AUTH_URL || "http://localhost:3000"}/billing/success?checkout_id={CHECKOUT_ID}`,
-          authenticatedUsersOnly: true,
-        }),
-        portal({
-          returnUrl:
-            process.env.NEXT_PUBLIC_APP_URL || process.env.BETTER_AUTH_URL,
-        }),
-        usage(),
+        // Checkout and portal are intentionally exposed through Supercheck's
+        // own billing routes. Those routes enforce active-organization
+        // ownership and fixed products/redirects before calling Polar.
         webhooks({
           secret: config.webhookSecret!,
           // Customer lifecycle handlers - critical for linking customer to organization
-           
+
           onCustomerCreated: async (payload: any) => {
             console.log("[Polar] Webhook: customer.created");
             const { handleCustomerCreated } = await import(
@@ -122,7 +82,7 @@ function getPolarPlugin() {
             await handleCustomerCreated(payload);
           },
           // Subscription lifecycle handlers
-           
+
           onSubscriptionActive: async (payload: any) => {
             console.log("[Polar] Webhook: subscription.active");
             const { handleSubscriptionActive } = await import(
@@ -130,7 +90,7 @@ function getPolarPlugin() {
             );
             await handleSubscriptionActive(payload);
           },
-           
+
           onSubscriptionCreated: async (payload: any) => {
             console.log("[Polar] Webhook: subscription.created");
             const { handleSubscriptionCreated } = await import(
@@ -138,7 +98,7 @@ function getPolarPlugin() {
             );
             await handleSubscriptionCreated(payload);
           },
-           
+
           onSubscriptionUpdated: async (payload: any) => {
             console.log("[Polar] Webhook: subscription.updated");
             const { handleSubscriptionUpdated } = await import(
@@ -146,7 +106,7 @@ function getPolarPlugin() {
             );
             await handleSubscriptionUpdated(payload);
           },
-           
+
           onSubscriptionCanceled: async (payload: any) => {
             console.log("[Polar] Webhook: subscription.canceled");
             const { handleSubscriptionCanceled } = await import(
@@ -155,7 +115,7 @@ function getPolarPlugin() {
             await handleSubscriptionCanceled(payload);
           },
           // Handle subscription uncancellation - user reverses cancellation during grace period
-           
+
           onSubscriptionUncanceled: async (payload: any) => {
             console.log("[Polar] Webhook: subscription.uncanceled");
             const { handleSubscriptionUncanceled } = await import(
@@ -164,7 +124,7 @@ function getPolarPlugin() {
             await handleSubscriptionUncanceled(payload);
           },
           // CRITICAL: Handle subscription revocation - immediate access termination
-           
+
           onSubscriptionRevoked: async (payload: any) => {
             console.log("[Polar] Webhook: subscription.revoked");
             const { handleSubscriptionRevoked } = await import(
@@ -174,8 +134,8 @@ function getPolarPlugin() {
           },
           // Order creation handler
           // Do NOT activate subscription on order.created.
-          // Subscription activation must happen on subscription.active/order.paid.
-           
+          // Subscription activation must happen on subscription.active.
+
           onOrderCreated: async (payload: any) => {
             console.log("[Polar] Webhook: order.created");
             const { handleOrderCreated } = await import(
@@ -184,7 +144,7 @@ function getPolarPlugin() {
             await handleOrderCreated(payload);
           },
           // Payment confirmation handler
-           
+
           onOrderPaid: async (payload: any) => {
             console.log("[Polar] Webhook: order.paid");
             const { handleOrderPaid } = await import(
@@ -201,7 +161,7 @@ function getPolarPlugin() {
             await handleCustomerStateChanged();
           },
           // CRITICAL: Handle customer deletion - revoke access immediately
-           
+
           onCustomerDeleted: async (payload: any) => {
             console.log("[Polar] Webhook: customer.deleted");
             const { handleCustomerDeleted } = await import(
@@ -210,7 +170,7 @@ function getPolarPlugin() {
             await handleCustomerDeleted(payload);
           },
           // Catch-all for logging and handling any other events
-           
+
           onPayload: async (payload: any) => {
             // Log all events for debugging/monitoring
             console.log("[Polar] Webhook received:", payload.type);
@@ -226,7 +186,9 @@ function getPolarPlugin() {
     });
   } catch (error) {
     console.error("[Better Auth] Failed to initialize Polar plugin:", error);
-    return null;
+    // A configured cloud deployment must not accept payments while its
+    // signature-verified webhook endpoint is unavailable.
+    throw error;
   }
 }
 
@@ -251,7 +213,9 @@ function getCaptchaPlugin() {
     return null;
   }
 
-  console.log("[Better Auth] CAPTCHA protection enabled (Cloudflare Turnstile)");
+  console.log(
+    "[Better Auth] CAPTCHA protection enabled (Cloudflare Turnstile)",
+  );
 
   return captcha({
     provider: "cloudflare-turnstile",
@@ -271,21 +235,23 @@ export const auth = betterAuth({
     process.env.NODE_ENV === "production"
       ? (() => {
           const origins: string[] = [];
-          
+
           // Always include the app URL
           if (process.env.NEXT_PUBLIC_APP_URL) {
             origins.push(process.env.NEXT_PUBLIC_APP_URL);
           } else if (process.env.BETTER_AUTH_URL) {
             origins.push(process.env.BETTER_AUTH_URL);
           }
-          
+
           // Add status page domain if configured
           const statusDomain = process.env.STATUS_PAGE_DOMAIN;
           if (statusDomain) {
             // Support wildcard subdomains for status pages
-            origins.push(`https://*.${statusDomain.replace(/^https?:\/\//, "")}`);
+            origins.push(
+              `https://*.${statusDomain.replace(/^https?:\/\//, "")}`,
+            );
           }
-          
+
           // Add any additional trusted origins from env (comma-separated)
           const additionalOrigins = process.env.TRUSTED_ORIGINS;
           if (additionalOrigins) {
@@ -295,7 +261,7 @@ export const auth = betterAuth({
               .filter(Boolean)
               .forEach((o) => origins.push(o));
           }
-          
+
           return origins.length > 0 ? origins : undefined;
         })()
       : undefined,
@@ -318,32 +284,22 @@ export const auth = betterAuth({
       prompt: "select_account consent",
     },
   },
-  // Email verification - only required in cloud mode
-  emailVerification: isCloudHosted()
-    ? {
+  // Invitation acceptance requires a verified mailbox in every hosting mode.
+  emailVerification: {
         sendVerificationEmail: async ({ user, url }, request) => {
-          // CRITICAL: Skip verification email for invited users.
-          // Better Auth wraps sign-up in a transaction. If this callback throws
-          // (rate limit, email failure), the ENTIRE user creation is rolled back.
-          // Invited users don't need email verification — the invitation itself
-          // proves email ownership. The sign-up page sends x-invite-token header.
-          const inviteToken = request?.headers?.get?.("x-invite-token");
-          if (inviteToken) {
-            console.log(`Skipping verification email for invited user: ${user.email} (invite: ${inviteToken})`);
-            return;
-          }
-
           // Rate limit by email address to prevent abuse
-          const emailRateLimit = await checkEmailVerificationRateLimit(user.email);
+          const emailRateLimit = await checkEmailVerificationRateLimit(
+            user.email,
+          );
           if (!emailRateLimit.allowed) {
             const resetTime = emailRateLimit.resetTime
               ? new Date(emailRateLimit.resetTime)
               : new Date();
             const remainingTime = Math.ceil(
-              (resetTime.getTime() - Date.now()) / 1000 / 60
+              (resetTime.getTime() - Date.now()) / 1000 / 60,
             );
             throw new Error(
-              `Too many verification email requests. Please try again in ${remainingTime} minutes.`
+              `Too many verification email requests. Please try again in ${remainingTime} minutes.`,
             );
           }
 
@@ -355,21 +311,26 @@ export const auth = betterAuth({
               ? new Date(ipRateLimit.resetTime)
               : new Date();
             const remainingTime = Math.ceil(
-              (resetTime.getTime() - Date.now()) / 1000 / 60
+              (resetTime.getTime() - Date.now()) / 1000 / 60,
             );
             throw new Error(
-              `Too many verification email requests from this location. Please try again in ${remainingTime} minutes.`
+              `Too many verification email requests from this location. Please try again in ${remainingTime} minutes.`,
             );
           }
 
           const emailService = EmailService.getInstance();
 
-          // Modify the verification URL to redirect to sign-in with verified flag
+          // Keep the invite context only for an internal sign-in callback.
           const verificationUrl = new URL(url);
-          // The callback URL after verification should be sign-in with verified flag
+          const callbackUrl = new URL(
+            verificationUrl.searchParams.get("callbackURL") || "/sign-in?verified=true",
+            verificationUrl.origin,
+          );
           verificationUrl.searchParams.set(
             "callbackURL",
-            "/sign-in?verified=true"
+            callbackUrl.origin === verificationUrl.origin && callbackUrl.pathname === "/sign-in"
+              ? `${callbackUrl.pathname}${callbackUrl.search}`
+              : "/sign-in?verified=true",
           );
           const modifiedUrl = verificationUrl.toString();
 
@@ -401,8 +362,7 @@ export const auth = betterAuth({
         },
         // Don't auto sign in - redirect to sign-in page with verified flag
         autoSignInAfterVerification: false,
-      }
-    : undefined,
+      },
   emailAndPassword: {
     enabled: true,
     // Only require email verification in cloud mode
@@ -420,10 +380,10 @@ export const auth = betterAuth({
           ? new Date(emailRateLimit.resetTime)
           : new Date();
         const remainingTime = Math.ceil(
-          (resetTime.getTime() - Date.now()) / 1000 / 60
+          (resetTime.getTime() - Date.now()) / 1000 / 60,
         );
         throw new Error(
-          `Too many password reset attempts. Please try again in ${remainingTime} minutes.`
+          `Too many password reset attempts. Please try again in ${remainingTime} minutes.`,
         );
       }
 
@@ -434,10 +394,10 @@ export const auth = betterAuth({
           ? new Date(ipRateLimit.resetTime)
           : new Date();
         const remainingTime = Math.ceil(
-          (resetTime.getTime() - Date.now()) / 1000 / 60
+          (resetTime.getTime() - Date.now()) / 1000 / 60,
         );
         throw new Error(
-          `Too many password reset attempts from this location. Please try again in ${remainingTime} minutes.`
+          `Too many password reset attempts from this location. Please try again in ${remainingTime} minutes.`,
         );
       }
 
@@ -470,27 +430,34 @@ export const auth = betterAuth({
   },
   database: drizzleAdapter(db, {
     provider: "pg", // PostgreSQL
-    schema: authSchema,
+    schema: {
+      ...authSchema,
+      organization: organizationTable,
+      member,
+      invitation,
+    },
   }),
   plugins: [
     // openAPI(),
     admin({
       // Use database-backed roles instead of hardcoded user IDs
       adminRoles: ["super_admin"],
+      defaultRole: Role.PROJECT_VIEWER,
       ac,
       roles: {
+        project_viewer: roles[Role.PROJECT_VIEWER],
         org_admin: roles[Role.ORG_ADMIN],
         super_admin: roles[Role.SUPER_ADMIN],
       },
       // Enable secure impersonation with audit trail
       impersonationSessionDuration: 60 * 60 * 24, // 1 day
     }),
-    organization({
+    organizationPlugin({
       // Disable automatic organization creation - we handle this manually
+      // Signup setup performs the only owner/project/session bootstrap.
+      // Keep the generic plugin creation route disabled.
       allowUserToCreateOrganization: false,
-      organizationLimit: parseInt(
-        process.env.MAX_ORGANIZATIONS_PER_USER || "5"
-      ),
+      organizationLimit: 1,
       creatorRole: "org_owner",
       membershipLimit: 100,
       // Disable team features (we use projects instead)
@@ -518,7 +485,6 @@ export const auth = betterAuth({
       // provides a more complete implementation with additional features.
     }),
     apiKey(),
-    nextCookies(),
     // Track last login method for better UX (shows "Last used" badge)
     lastLoginMethod(),
     // Conditionally add Polar plugin if enabled
@@ -531,10 +497,11 @@ export const auth = betterAuth({
       const captchaPlugin = getCaptchaPlugin();
       return captchaPlugin ? [captchaPlugin] : [];
     })(),
+    nextCookies(),
   ],
   advanced: {
     database: {
-      generateId: false,
+      generateId: () => uuidv7(),
     },
   },
   session: {

@@ -4,15 +4,16 @@ import { DbService } from '../execution/services/db.service';
 import { RedisService } from '../execution/services/redis.service';
 import { ErrorHandler } from '../common/utils/error-handler';
 import { HeartbeatService } from '../common/heartbeat/heartbeat.service';
+import { getServiceVersion } from '../common/version';
 import { user } from '../db/schema';
 import { PLAYWRIGHT_QUEUE } from '../execution/constants';
-import {
-  K6_QUEUE,
-  k6QueueName,
-} from '../k6/k6.constants';
-import {
-  monitorQueueName,
-} from '../monitor/monitor.constants';
+import { K6_QUEUE, k6QueueName } from '../k6/k6.constants';
+import { monitorQueueName } from '../monitor/monitor.constants';
+
+// Keep the readiness response below Kubernetes' five-second probe deadline.
+// A dependency can remain slow or unavailable, but it must not hold the HTTP
+// request open until Kubernetes reports a misleading probe timeout.
+const DEPENDENCY_CHECK_TIMEOUT_MS = 3_000;
 
 export interface HealthStatus {
   status: 'healthy' | 'unhealthy' | 'degraded';
@@ -66,7 +67,7 @@ export class HealthService {
     return {
       status: overallStatus,
       timestamp: new Date().toISOString(),
-      version: process.env.npm_package_version || '1.0.0',
+      version: getServiceVersion(),
       uptime: process.uptime(),
       checks: {
         database,
@@ -98,7 +99,10 @@ export class HealthService {
     const startTime = Date.now();
 
     try {
-      await this.dbService.db.select().from(user).limit(1);
+      await this.withTimeout(
+        this.dbService.db.select().from(user).limit(1),
+        'Database health check',
+      );
 
       return {
         status: 'healthy',
@@ -120,7 +124,7 @@ export class HealthService {
     const startTime = Date.now();
 
     try {
-      await this.redisService.ping();
+      await this.withTimeout(this.redisService.ping(), 'Redis health check');
 
       return {
         status: 'healthy',
@@ -146,7 +150,10 @@ export class HealthService {
       const results = await Promise.all(
         queueNames.map(async (name) => ({
           name,
-          ok: await this.redisService.getQueueHealth(name),
+          ok: await this.withTimeout(
+            this.redisService.getQueueHealth(name),
+            `Queue health check for ${name}`,
+          ),
         })),
       );
 
@@ -202,6 +209,29 @@ export class HealthService {
     }
 
     return Array.from(queueNames).sort();
+  }
+
+  private async withTimeout<T>(
+    operation: Promise<T>,
+    checkName: string,
+  ): Promise<T> {
+    let timeout: NodeJS.Timeout | undefined;
+
+    try {
+      return await Promise.race([
+        operation,
+        new Promise<T>((_resolve, reject) => {
+          timeout = setTimeout(
+            () => reject(new Error(`${checkName} timed out`)),
+            DEPENDENCY_CHECK_TIMEOUT_MS,
+          );
+        }),
+      ]);
+    } finally {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+    }
   }
 
   private determineOverallStatus(

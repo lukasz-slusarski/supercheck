@@ -12,10 +12,10 @@
  */
 
 import { subscriptionService } from "./subscription-service";
-import { isPolarEnabled } from "@/lib/feature-flags";
+import { isCloudHosted, isPolarEnabled } from "@/lib/feature-flags";
 import { db } from "@/utils/db";
 import { organization } from "@/db/schema";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, gt, isNotNull, or, sql } from "drizzle-orm";
 
 export class UsageTracker {
   /**
@@ -30,16 +30,19 @@ export class UsageTracker {
   async consumeAICredit(
     organizationId: string,
     actionType: "ai_fix" | "ai_create" | "ai_analyze"
-  ): Promise<{ allowed: boolean; reason?: string; used?: number; limit?: number }> {
+  ): Promise<{ allowed: boolean; reason?: string; used?: number; limit?: number; status?: 429 | 503 }> {
     // Validate input
     if (!organizationId || typeof organizationId !== "string") {
       console.error("[UsageTracker] Invalid organizationId for consumeAICredit");
-      return { allowed: true }; // Fail open for invalid input
+      return { allowed: false, reason: "A valid organization is required", status: 503 };
     }
 
     // Self-hosted mode - unlimited AI credits, no tracking needed
-    if (!isPolarEnabled()) {
+    if (!isCloudHosted()) {
       return { allowed: true };
+    }
+    if (!isPolarEnabled()) {
+      return { allowed: false, reason: "Cloud billing is not configured", status: 503 };
     }
 
     try {
@@ -58,6 +61,16 @@ export class UsageTracker {
         .where(
           and(
             eq(organization.id, organizationId),
+            // Recheck the validated subscription in the same statement as the
+            // credit write; a downgrade or revocation may have won the race.
+            eq(organization.subscriptionPlan, plan.plan),
+            isNotNull(organization.polarCustomerId),
+            or(
+              eq(organization.subscriptionStatus, "active"),
+              eq(organization.subscriptionStatus, "past_due"),
+              and(eq(organization.subscriptionStatus, "canceled"),
+                gt(organization.subscriptionEndsAt, new Date())),
+            ),
             sql`COALESCE(${organization.aiCreditsUsed}, 0) < ${limit}`
           )
         )
@@ -71,27 +84,31 @@ export class UsageTracker {
       // No rows updated — either org not found or limit reached.
       // Query current usage to distinguish and provide accurate feedback.
       const current = await db
-        .select({ aiCreditsUsed: organization.aiCreditsUsed })
+        .select({ aiCreditsUsed: organization.aiCreditsUsed, subscriptionPlan: organization.subscriptionPlan })
         .from(organization)
         .where(eq(organization.id, organizationId))
         .limit(1);
 
       if (!current.length) {
         console.error(`[UsageTracker] Organization not found: ${organizationId.slice(0, 8)}...`);
-        return { allowed: true }; // Fail open if org not found
+        return { allowed: false, reason: "Unable to verify AI credits. Please retry.", status: 503 };
       }
 
       const used = current[0].aiCreditsUsed ?? 0;
+      if (current[0].subscriptionPlan !== plan.plan || used < limit) {
+        return { allowed: false, reason: "Subscription changed while checking AI credits. Please retry.", status: 503 };
+      }
       return {
         allowed: false,
         reason: `You've used all ${limit} AI credits included in your ${plan.plan} plan this month. Credits reset at the start of your next billing cycle.`,
         used,
         limit,
+        status: 429,
       };
     } catch (error) {
-      // Fail open - allow AI usage if we can't check the limit
+      // A failed quota read/write must never grant unmetered cloud AI usage.
       console.error("[UsageTracker] Failed to consume AI credit:", error);
-      return { allowed: true };
+      return { allowed: false, reason: "Unable to verify AI credits. Please retry.", status: 503 };
     }
   }
 }

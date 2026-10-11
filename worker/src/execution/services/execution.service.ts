@@ -13,6 +13,9 @@ import { ContainerExecutorService } from '../../common/security/container-execut
 import { CancellationService } from '../../common/services/cancellation.service';
 import { RequirementCoverageService } from './requirement-coverage.service';
 import { filterFileVariablesToUsedKeys } from '../../common/utils/script-analysis';
+import { createSecretStream } from '../../common/utils/secret-stream';
+import { decodeStoredTestScript } from '../../common/utils/test-script';
+import { VariableResolverService } from '../../common/services/variable-resolver.service';
 import {
   TestResult,
   TestExecutionResult,
@@ -169,6 +172,7 @@ export class ExecutionService implements OnModuleDestroy {
     private containerExecutorService: ContainerExecutorService,
     private cancellationService: CancellationService,
     private requirementCoverageService: RequirementCoverageService,
+    private variableResolverService: VariableResolverService,
   ) {
     // Set timeouts: configurable via env vars with sensible defaults
     // Note: Environment variables are always strings, so we must parse them as numbers
@@ -288,7 +292,9 @@ export class ExecutionService implements OnModuleDestroy {
    */
   private monitorActiveExecutions(): void {
     const now = Date.now();
-    const staleTimeout = 30 * 60 * 1000; // 30 minutes
+    const staleTimeout =
+      Math.max(this.testExecutionTimeoutMs, this.jobExecutionTimeoutMs) +
+      10 * 60 * 1000;
 
     // Only process if we have executions to monitor
     if (this.activeExecutions.size === 0) {
@@ -356,6 +362,18 @@ export class ExecutionService implements OnModuleDestroy {
     bypassConcurrencyCheck = false,
     isMonitorExecution = false,
   ): Promise<TestResult> {
+    if (task.projectId) {
+      const resolved =
+        await this.variableResolverService.resolveProjectVariables(
+          task.projectId,
+        );
+      task = {
+        ...task,
+        variables: resolved.variables,
+        secrets: resolved.secrets,
+        files: resolved.files,
+      };
+    }
     const { testId, code } = task;
     const runtimeVariables = task.variables ?? {};
     const runtimeSecrets = task.secrets ?? {};
@@ -691,6 +709,15 @@ export class ExecutionService implements OnModuleDestroy {
    * Uses the native Playwright test runner and HTML reporter.
    */
   async runJob(task: JobExecutionTask): Promise<TestExecutionResult> {
+    const resolved = await this.variableResolverService.resolveProjectVariables(
+      task.projectId,
+    );
+    task = {
+      ...task,
+      variables: resolved.variables,
+      secrets: resolved.secrets,
+      files: resolved.files,
+    };
     const { runId, testScripts } = task;
 
     if (task.jobType === 'k6') {
@@ -782,37 +809,19 @@ export class ExecutionService implements OnModuleDestroy {
         );
 
         try {
-          // Check if the script is Base64 encoded and decode it
           let decodedScript = originalScript;
           try {
-            // Check if it looks like Base64 (typical characteristics)
-            if (
-              originalScript &&
-              typeof originalScript === 'string' &&
-              originalScript.length > 100 &&
-              /^[A-Za-z0-9+/]+=*$/.test(originalScript)
-            ) {
-              const decoded = Buffer.from(originalScript, 'base64').toString(
-                'utf8',
+            decodedScript = decodeStoredTestScript(originalScript);
+            if (decodedScript !== originalScript) {
+              this.logger.debug(
+                `[Playwright Job] Decoded stored script for test ${testName}`,
               );
-              // Verify it's actually JavaScript by checking for common patterns
-              if (
-                decoded.includes('import') ||
-                decoded.includes('test(') ||
-                decoded.includes('describe(')
-              ) {
-                decodedScript = decoded;
-                this.logger.debug(
-                  `[Playwright Job] Decoded Base64 script for test ${testName}`,
-                );
-              }
             }
           } catch (decodeError) {
             this.logger.warn(
-              `[Playwright Job] Failed to decode potential Base64 script for test ${testName}:`,
+              `[Playwright Job] Failed to decode stored script for test ${testName}:`,
               decodeError,
             );
-            // Continue with original script if decoding fails
           }
 
           // Track raw decoded script for file variable analysis
@@ -1009,15 +1018,8 @@ export class ExecutionService implements OnModuleDestroy {
         s3Url: s3Url ?? undefined,
       });
 
-      // Update the run record in the database with the final status and formatted duration
-      try {
-        await this.dbService.updateRunStatus(runId, finalStatus, durationStr);
-      } catch (updateError) {
-        this.logger.error(
-          `[${runId}] Error updating run status/duration: ${(updateError as Error).message}`,
-          (updateError as Error).stack,
-        );
-      }
+      // The processor commits the terminal run status and durable usage receipt
+      // together once this result returns. Reports can be uploaded beforehand.
       this.logger.log(
         `[Playwright Job] ${runId} ${finalStatus} (${durationMs}ms, ${testScripts.length} tests)`,
       );
@@ -1070,14 +1072,7 @@ export class ExecutionService implements OnModuleDestroy {
           ),
         );
 
-      // Store final run result with error - use error status for cancellation
-      await this.dbService
-        .updateRunStatus(runId, finalStatus, '0ms', errorDetails)
-        .catch((updateErr) =>
-          this.logger.error(
-            `[${runId}] Failed to update run status on error: ${(updateErr as Error).message}`,
-          ),
-        );
+      // The processor persists the returned error/cancellation result with usage.
 
       // Set finalResult for error case
       finalResult = {
@@ -1704,6 +1699,19 @@ export class ExecutionService implements OnModuleDestroy {
       `[Container] Executing in container: ${command} ${args.join(' ')}`,
     );
 
+    const consoleStream = createSecretStream(runtimeSecrets, async (text) => {
+      if (!options.runId) return;
+      try {
+        await this.redisService
+          .getClient()
+          .publish(`k6:run:${options.runId}:console`, text);
+      } catch (error) {
+        this.logger.warn(
+          `Failed to publish run console: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    });
+
     // Execute in container - this is the only execution path
     const containerResult =
       await this.containerExecutorService.executeInContainer(
@@ -1725,8 +1733,13 @@ export class ExecutionService implements OnModuleDestroy {
           inlineScriptFileName: options.inlineScriptFileName,
           additionalFiles: options.additionalFiles, // Additional test files for job execution
           ensureDirectories: options.ensureDirectories,
+          onStdoutChunk: options.runId
+            ? (chunk) => consoleStream.write(chunk)
+            : undefined,
         },
       );
+
+    await consoleStream.flush();
 
     // Return the container execution result with proper error context
     const redactedStdout = this.redactSecretsFromText(
@@ -2035,7 +2048,10 @@ export class ExecutionService implements OnModuleDestroy {
   ): { scriptContent: string; fileName: string } {
     try {
       // Ensure proper trace configuration to avoid path issues
-      const enhancedScript = ensureProperTraceConfiguration(testScript, testId);
+      const enhancedScript = ensureProperTraceConfiguration(
+        decodeStoredTestScript(testScript),
+        testId,
+      );
 
       // Return script content for inline container execution
       return {

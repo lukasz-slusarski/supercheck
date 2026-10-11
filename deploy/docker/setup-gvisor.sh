@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SuperCheck gVisor Setup Script for Docker
+# Supercheck gVisor Setup Script for Docker
 #
 # Installs gVisor (runsc) as an optional Docker runtime for local
 # verification and legacy troubleshooting.
@@ -78,7 +78,7 @@ fi
 
 info "Architecture: $ARCH"
 info "Docker: $(docker --version)"
-info "Starting SuperCheck gVisor setup for Docker..."
+info "Starting Supercheck gVisor setup for Docker..."
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -95,12 +95,26 @@ if command -v runsc &>/dev/null; then
 else
   log "Installing gVisor (runsc) release ${GVISOR_RELEASE}..."
 
-  GVISOR_URL="https://storage.googleapis.com/gvisor/releases/release/${GVISOR_RELEASE}/${GVISOR_ARCH}"
+  # gVisor retired the standalone assets from storage.googleapis.com (404s
+  # since the distribution format change). The shim/binaries now ship inside
+  # gvisor-<arch>.tar.bz2 on the GitHub release, checksummed by SHA512SUMS.
+  # GVISOR_RELEASE normalization: strip an optional "release-" prefix so both
+  # the legacy "20240101.0" and the GitHub tag form "release-20240101.0" work.
+  GVISOR_TAG="${GVISOR_RELEASE#release-}"
+  if [ "${GVISOR_TAG}" = "latest" ]; then
+    GVISOR_BASE="https://github.com/google/gvisor/releases/latest/download"
+  else
+    GVISOR_BASE="https://github.com/google/gvisor/releases/download/release-${GVISOR_TAG}"
+  fi
 
-  curl -fsSL "${GVISOR_URL}/runsc" -o "${TMP_DIR}/runsc"
-  curl -fsSL "${GVISOR_URL}/runsc.sha512" -o "${TMP_DIR}/runsc.sha512"
+  curl -fsSL "${GVISOR_BASE}/gvisor-${GVISOR_ARCH}.tar.bz2" -o "${TMP_DIR}/gvisor-${GVISOR_ARCH}.tar.bz2"
+  curl -fsSL "${GVISOR_BASE}/SHA512SUMS" -o "${TMP_DIR}/SHA512SUMS"
 
-  (cd "$TMP_DIR" && sha512sum -c runsc.sha512)
+  (
+    cd "$TMP_DIR"
+    grep "gvisor-${GVISOR_ARCH}.tar.bz2" SHA512SUMS | sha512sum -c -
+    tar -xjf "gvisor-${GVISOR_ARCH}.tar.bz2"
+  )
 
   install -m 0755 "${TMP_DIR}/runsc" /usr/local/bin/runsc
 
@@ -129,7 +143,7 @@ systemctl restart docker
 
 # Wait for Docker to be ready
 info "Waiting for Docker to be ready..."
-for i in $(seq 1 30); do
+for _ in $(seq 1 30); do
   if docker info &>/dev/null; then
     break
   fi
@@ -174,7 +188,7 @@ fi
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-log "SuperCheck gVisor setup for Docker complete!"
+log "Supercheck gVisor setup for Docker complete!"
 echo ""
 info "Docker:  $(docker --version)"
 info "gVisor:  $(runsc --version 2>&1 | head -1)"
@@ -185,5 +199,5 @@ info "Untrusted code runs exclusively in gVisor-sandboxed K8s execution Jobs."
 echo ""
 info "Next steps:"
 info "  1. Run setup-k3s.sh to configure K3s with gVisor for execution Jobs"
-info "  2. Start SuperCheck with: docker compose -f docker-compose.yml up -d"
+info "  2. Start Supercheck with: docker compose -f docker-compose.yml up -d"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

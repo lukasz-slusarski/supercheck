@@ -123,7 +123,7 @@ describe("Jobs route regressions", () => {
     });
   });
 
-  it("POST /api/jobs rejects unauthorized notification provider IDs before DB transaction", async () => {
+  it.each([true, false])("POST /api/jobs rejects unauthorized providers when alerts enabled=%s", async (enabled) => {
     mockValidateNotificationProviderOwnership.mockRejectedValueOnce(
       new Error("Invalid or unauthorized notification provider IDs"),
     );
@@ -137,7 +137,7 @@ describe("Jobs route regressions", () => {
         cronSchedule: "0 * * * *",
         tests: [{ id: "test-1" }],
         alertConfig: {
-          enabled: true,
+          enabled,
           notificationProviders: ["provider-unauthorized"],
           alertOnFailure: true,
           alertOnSuccess: false,
@@ -219,6 +219,35 @@ describe("Jobs route regressions", () => {
 
     expect(response.status).toBe(400);
     expect(body.error).toContain("Job type cannot be changed");
+    expect(mockDb.transaction).not.toHaveBeenCalled();
+  });
+
+  it("PUT /api/jobs rejects a provider outside the current project", async () => {
+    mockDb.select.mockReturnValueOnce({
+      from: jest.fn().mockReturnValue({
+        where: jest.fn().mockReturnValue({
+          limit: jest.fn().mockResolvedValue([{
+            id: "job-1", projectId: "project-1", organizationId: "org-1", jobType: "playwright",
+          }]),
+        }),
+      }),
+    });
+    mockValidateNotificationProviderOwnership.mockRejectedValueOnce(new Error("Unauthorized provider"));
+
+    const response = await PUT(new Request("http://localhost/api/jobs", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        id: "job-1", name: "Nightly Job", description: "Nightly",
+        cronSchedule: "0 * * * *", tests: [{ id: "test-1" }],
+        alertConfig: { enabled: true, notificationProviders: ["foreign-provider"] },
+      }),
+    }));
+
+    expect(response.status).toBe(400);
+    expect(mockValidateNotificationProviderOwnership).toHaveBeenCalledWith({
+      providerIds: ["foreign-provider"], organizationId: "org-1", projectId: "project-1",
+    });
     expect(mockDb.transaction).not.toHaveBeenCalled();
   });
 });

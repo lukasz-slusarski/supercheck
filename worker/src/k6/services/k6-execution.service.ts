@@ -1,3 +1,4 @@
+import { createSecretStream } from '../../common/utils/secret-stream';
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { execa } from 'execa';
@@ -15,6 +16,7 @@ import {
   pathExists,
 } from '../../common/utils/file-search';
 import { filterFileVariablesToUsedKeys } from '../../common/utils/script-analysis';
+import { VariableResolverService } from '../../common/services/variable-resolver.service';
 
 // Utility function to safely get error message
 function getErrorMessage(error: unknown): string {
@@ -98,6 +100,7 @@ export class K6ExecutionService {
     private dbService: DbService,
     private redisService: RedisService,
     private containerExecutorService: ContainerExecutorService,
+    private variableResolverService: VariableResolverService,
   ) {
     // Check for k6 binary in multiple common locations
     const configuredPath = this.configService.get<string>('K6_BIN_PATH', '');
@@ -245,6 +248,15 @@ export class K6ExecutionService {
    * Execute a k6 performance test
    */
   async runK6Test(task: K6ExecutionTask): Promise<K6ExecutionResult> {
+    const resolved = await this.variableResolverService.resolveProjectVariables(
+      task.projectId,
+    );
+    task = {
+      ...task,
+      variables: resolved.variables,
+      secrets: resolved.secrets,
+      files: resolved.files,
+    };
     const { runId, testId: _testId, script, location } = task;
     const runtimeVariables = task.variables ?? {};
     const runtimeSecrets = task.secrets ?? {};
@@ -342,6 +354,7 @@ export class K6ExecutionService {
 
         const k6EnvOverrides: Record<string, string> = {
           K6_WEB_DASHBOARD: 'true',
+          K6_WEB_DASHBOARD_PERIOD: '1s', // Collect samples for short runs too.
           K6_WEB_DASHBOARD_EXPORT: htmlExportPathContainer, // Export HTML into specific file under /tmp/report
           K6_WEB_DASHBOARD_PORT: dashboardPort.toString(), // Use unique port
           K6_WEB_DASHBOARD_ADDR: this.dashboardBindAddress,
@@ -494,9 +507,8 @@ export class K6ExecutionService {
             `${message} (execution already failed with code ${exitCode})`,
           );
         } else {
-          this.logger.error(message);
-          throw new Error(
-            `K6 failed to generate HTML report. Ensure K6_WEB_DASHBOARD_EXPORT environment variable is set correctly.`,
+          this.logger.warn(
+            `${message} (summary and console artifacts remain available)`,
           );
         }
       }
@@ -812,6 +824,17 @@ export class K6ExecutionService {
 
       // Execute in container with inline script
       const runtimeSecrets = this.decodeSecretsFromRuntimeEnv(overrideEnv);
+      const consoleStream = createSecretStream(runtimeSecrets, async (text) => {
+        try {
+          await this.redisService
+            .getClient()
+            .publish(`k6:run:${runId}:console`, text);
+        } catch (error) {
+          this.logger.warn(
+            `[${runId}] Failed to publish streaming chunk: ${getErrorMessage(error)}`,
+          );
+        }
+      });
       const containerResult =
         await this.containerExecutorService.executeInContainer(
           null, // No host script path - using inline content
@@ -839,23 +862,11 @@ export class K6ExecutionService {
             networkMode: 'bridge', // k6 needs network access
             autoRemove: false, // Don't auto-remove - we need to extract files first
             image: this.k6DockerImage, // Use K6-specific Docker image
-            onStdoutChunk: async (chunk: string) => {
-              try {
-                const redactedChunk = this.redactSecretsFromText(
-                  chunk,
-                  runtimeSecrets,
-                );
-                await this.redisService
-                  .getClient()
-                  .publish(`k6:run:${runId}:console`, redactedChunk);
-              } catch (err) {
-                this.logger.warn(
-                  `[${runId}] Failed to publish streaming chunk: ${getErrorMessage(err)}`,
-                );
-              }
-            },
+            onStdoutChunk: (chunk) => consoleStream.write(chunk),
           },
         );
+
+      await consoleStream.flush();
 
       // Clean up active runs tracking
       this.activeK6Runs.delete(uniqueRunId);

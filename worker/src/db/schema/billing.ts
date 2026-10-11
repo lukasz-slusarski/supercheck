@@ -15,10 +15,47 @@ import {
   index,
   uniqueIndex,
   jsonb,
+  check,
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 import { createInsertSchema, createSelectSchema } from 'drizzle-zod';
 import { organization } from './organization';
+/** Durable completion receipts survive worker loss before usage settlement. */
+export const executionUsageReceipts = pgTable(
+  'execution_usage_receipts',
+  {
+    id: uuid('id').primaryKey(),
+    organizationId: uuid('organization_id')
+      .notNull()
+      .references(() => organization.id, { onDelete: 'cascade' }),
+    runId: text('run_id').notNull(),
+    eventType: text('event_type')
+      .$type<'playwright_execution' | 'k6_execution'>()
+      .notNull(),
+    units: numeric('units', { precision: 10, scale: 4 }).notNull(),
+    metadata: jsonb('metadata').$type<Record<string, unknown>>(),
+    billingPeriodStart: timestamp('billing_period_start').notNull(),
+    billingPeriodEnd: timestamp('billing_period_end').notNull(),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    settledAt: timestamp('settled_at'),
+    nextAttemptAt: timestamp('next_attempt_at').defaultNow(),
+    lastError: text('last_error'),
+  },
+  (table) => ({
+    validUsage: check(
+      'execution_usage_receipts_valid_usage',
+      sql`${table.eventType} IN ('playwright_execution', 'k6_execution') AND ${table.units} >= 0 AND ${table.units} <> 'NaN'::numeric`,
+    ),
+    runKey: uniqueIndex('execution_usage_receipts_run_key').on(
+      table.organizationId,
+      table.eventType,
+      table.runId,
+    ),
+    pendingIdx: index('execution_usage_receipts_pending_idx')
+      .on(table.nextAttemptAt)
+      .where(sql`${table.settledAt} IS NULL`),
+  }),
+);
 
 /**
  * Webhook idempotency tracking
@@ -128,6 +165,7 @@ export const usageEvents = pgTable(
         | 'k6_execution'
         | 'monitor_execution'
         | 'ai_usage'
+        | 'sre_investigation'
       >()
       .notNull(),
     eventName: text('event_name').notNull(), // e.g., "playwright_minutes", "k6_vu_minutes", "ai_credits"
@@ -158,6 +196,21 @@ export const usageEvents = pgTable(
       table.organizationId,
     ),
     eventTypeIdx: index('usage_events_event_type_idx').on(table.eventType),
+    // Durable billing retries look up a run within its organization and meter.
+    executionRunIdx: index('usage_events_execution_run_idx')
+      .on(
+        table.organizationId,
+        table.eventType,
+        sql`(${table.metadata}->>'runId')`,
+      )
+      .where(sql`(${table.metadata}->>'runId') IS NOT NULL`),
+    investigationRunIdx: index('usage_events_investigation_run_idx')
+      .on(
+        table.organizationId,
+        table.eventType,
+        sql`(${table.metadata}->>'investigationRunId')`,
+      )
+      .where(sql`(${table.metadata}->>'investigationRunId') IS NOT NULL`),
     syncedToPolarIdx: index('usage_events_synced_idx').on(table.syncedToPolar),
     billingPeriodIdx: index('usage_events_billing_period_idx').on(
       table.billingPeriodStart,
@@ -257,7 +310,16 @@ export const overagePricing = pgTable('overage_pricing', {
     'playwright_minute_price_cents',
   ).notNull(), // e.g., 10 = $0.10
   k6VuMinutePriceCents: integer('k6_vu_minute_price_cents').notNull(), // e.g., 1 = $0.01 per VU minute
+  // Nullable fractional-cent rate; legacy integer rate remains the fallback.
+  k6VuMinutePriceCentsOverride: numeric('k6_vu_minute_price_cents_override', {
+    precision: 14,
+    scale: 4,
+    mode: 'number',
+  }),
   aiCreditPriceCents: integer('ai_credit_price_cents').notNull().default(5), // e.g., 5 = $0.05 per AI credit
+  sreInvestigationUnitPriceCents: integer('sre_investigation_unit_price_cents')
+    .notNull()
+    .default(50), // e.g., 50 = $0.50 per full investigation unit
 
   // Metadata
   createdAt: timestamp('created_at').defaultNow().notNull(),
@@ -265,6 +327,12 @@ export const overagePricing = pgTable('overage_pricing', {
 });
 
 // Zod schemas for validation
+export const executionUsageReceiptsInsertSchema = createInsertSchema(
+  executionUsageReceipts,
+);
+export const executionUsageReceiptsSelectSchema = createSelectSchema(
+  executionUsageReceipts,
+);
 export const webhookIdempotencyInsertSchema =
   createInsertSchema(webhookIdempotency);
 export const webhookIdempotencySelectSchema =

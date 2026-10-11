@@ -1,7 +1,8 @@
 import { db } from "@/utils/db";
 import { session, user, member, projects, projectMembers, organization } from "@/db/schema";
-import { eq, and } from "drizzle-orm";
+import { eq, and, asc } from "drizzle-orm";
 import { normalizeRole } from "./role-normalizer";
+import { Role } from "./permissions-client";
 
 type UnifiedAuthContext = {
   // Session / User
@@ -59,6 +60,7 @@ export async function getUnifiedAuthContext(
         activeOrgId: session.activeOrganizationId,
         impersonatedBy: session.impersonatedBy,
         email: user.email,
+        role: user.role,
         banned: user.banned,
       })
       .from(session)
@@ -145,20 +147,38 @@ export async function getUnifiedAuthContext(
                 eq(member.userId, s.userId)
             )
          )
-         .where(eq(projects.id, targetProjectId))
+         .where(and(
+           eq(projects.id, targetProjectId),
+           eq(projects.status, "active"),
+           // Explicit project overrides retain their membership-checked scope.
+           !requestedProjectId && s.activeOrgId ? eq(projects.organizationId, s.activeOrgId) : undefined,
+         ))
          .limit(1);
 
-       const ctx = contextResult[0];
+       const candidate = contextResult[0];
+       // Membership roles are single-valued in app RBAC. Do not turn a legacy
+       // comma-joined role into viewer access and bypass owner exclusion.
+       if (candidate?.orgRole?.includes(",")) {
+         throw new Error("Unsupported organization membership role");
+       }
+       let ctx: typeof candidate | undefined = candidate;
+       if (!requestedProjectId && candidate?.orgRole === "org_owner") {
+         const [assignedOrganization] = await db.select({ id: organization.id }).from(organization)
+           .innerJoin(member, eq(member.organizationId, organization.id))
+           .where(and(eq(member.userId, s.userId), eq(member.role, "org_owner")))
+           .orderBy(asc(organization.createdAt), asc(organization.id)).limit(1);
+         if (candidate.projectOrgId !== assignedOrganization?.id) ctx = undefined;
+       }
        
        if (ctx) {
            // SECURITY: Verify user has organization membership for the project's org.
            // Without this check, a user could pass an x-project-id header for a project
            // in a different organization and get a valid context with null roles,
            // enabling cross-tenant context confusion.
+           // Super admins bypass organization membership and retain their
+           // system-level role in project-scoped permission contexts.
+           const isSA = s.role === Role.SUPER_ADMIN;
            if (!ctx.orgRole) {
-             // Check if the user is a super admin (they bypass org membership)
-             const { isSuperAdmin } = await import("./super-admin");
-             const isSA = await isSuperAdmin(s.userId);
              if (!isSA) {
                return {
                  isValid: false,
@@ -187,11 +207,19 @@ export async function getUnifiedAuthContext(
                projectId: ctx.projectId,
                projectName: ctx.projectName,
                isDefaultProject: ctx.projectIsDefault,
-               projectRole: normalizeRole(ctx.projectRole),
+               projectRole: isSA
+                 ? Role.SUPER_ADMIN
+                 : ctx.projectRole
+                   ? normalizeRole(ctx.projectRole)
+                   : null,
                
                organizationId: ctx.projectOrgId,
                organizationSlug: ctx.orgSlug,
-               organizationRole: normalizeRole(ctx.orgRole),
+               organizationRole: isSA
+                 ? Role.SUPER_ADMIN
+                 : ctx.orgRole
+                   ? normalizeRole(ctx.orgRole)
+                   : null,
                
                subscriptionStatus: ctx.subStatus,
                polarCustomerId: ctx.polarId
@@ -209,7 +237,7 @@ export async function getUnifiedAuthContext(
         projectName: null,
         projectRole: null,
         isDefaultProject: null,
-        organizationId: s.activeOrgId,
+        organizationId: null, // No project resolved, so tenant membership is unverified.
         organizationSlug: null, // Would need another query, but rare case for API routes requiring project
         organizationRole: null,
         subscriptionStatus: null,

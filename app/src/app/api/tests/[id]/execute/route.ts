@@ -14,9 +14,17 @@ import {
 import { validateK6Script } from "@/lib/k6-validator";
 import { resolveProjectVariables } from "@/lib/variable-resolver";
 import { randomUUID } from "crypto";
-import { SubscriptionService } from "@/lib/services/subscription-service";
+import { SubscriptionService, SubscriptionAccessDeniedError } from "@/lib/services/subscription-service";
 import { polarUsageService } from "@/lib/services/polar-usage.service";
 import { buildBillingBlockedResponse } from "@/lib/billing-errors";
+import { checkExecutionRateLimit } from "@/lib/execution-rate-limiter";
+import { decodeStoredTestScript } from "@/lib/test-script";
+import {
+  buildExecutionQueueErrorResponse,
+  buildExecutionRateLimitResponse,
+  getSafeExecutionQueueErrorDetails,
+} from "@/lib/execution-api-responses";
+import { requireSameOriginRequest } from "@/lib/security/same-origin";
 declare const Buffer: {
   from(data: string, encoding: string): { toString(encoding: string): string };
 };
@@ -30,9 +38,16 @@ type ExecuteContext = {
 };
 
 export async function POST(request: NextRequest, context: ExecuteContext) {
+  let createdRunId: string | null = null;
+
   try {
     const authCtx = await requireAuthContext();
-    const { project, organizationId } = authCtx;
+    if (!authCtx.isCliAuth) {
+      const originError = requireSameOriginRequest(request);
+      if (originError) return originError;
+    }
+
+    const { userId, project, organizationId } = authCtx;
     const params = await context.params;
     const testId = params.id;
 
@@ -46,6 +61,11 @@ export async function POST(request: NextRequest, context: ExecuteContext) {
       );
     }
 
+    const rateLimitResponse = buildExecutionRateLimitResponse(
+      await checkExecutionRateLimit(userId, organizationId),
+    );
+    if (rateLimitResponse) return rateLimitResponse;
+
     // Check subscription plan limits
     const subscriptionService = new SubscriptionService();
     try {
@@ -56,12 +76,16 @@ export async function POST(request: NextRequest, context: ExecuteContext) {
       // Finally get the plan to check limits
       await subscriptionService.getOrganizationPlan(organizationId);
     } catch (error) {
+      if (!(error instanceof SubscriptionAccessDeniedError)) {
+        console.error("[Test Execute API] Subscription validation failed:", error);
+      }
       return NextResponse.json(
         {
-          error:
-            error instanceof Error ? error.message : "Subscription required",
+          error: error instanceof SubscriptionAccessDeniedError
+            ? error.message
+            : "Subscription validation failed. Please try again later.",
         },
-        { status: 402 }
+        { status: error instanceof SubscriptionAccessDeniedError ? 402 : 500 }
       );
     }
 
@@ -119,9 +143,7 @@ export async function POST(request: NextRequest, context: ExecuteContext) {
         );
       }
       try {
-        const decodedScript = Buffer.from(test.script, "base64").toString(
-          "utf-8"
-        );
+        const decodedScript = decodeStoredTestScript(test.script);
         const validation = validateK6Script(decodedScript);
 
         if (!validation.valid) {
@@ -162,9 +184,10 @@ export async function POST(request: NextRequest, context: ExecuteContext) {
         startedAt: new Date(),
       })
       .returning();
+    createdRunId = run.id;
 
     // Decode script
-    const decodedScript = Buffer.from(test.script, "base64").toString("utf-8");
+    const decodedScript = decodeStoredTestScript(test.script);
 
     // Resolve project variables and secrets for runtime helper injection in worker
     const variableResolution = await resolveProjectVariables(project.id);
@@ -214,9 +237,17 @@ export async function POST(request: NextRequest, context: ExecuteContext) {
     }
 
     // Update run status based on actual queue result
-    await db.update(runs)
-      .set({ status: queueStatus })
-      .where(eq(runs.id, run.id));
+    try {
+      await db
+        .update(runs)
+        .set({ status: queueStatus })
+        .where(eq(runs.id, run.id));
+    } catch (statusError) {
+      console.error(
+        `[Test Execute API] Failed to persist admitted run status for ${run.id}:`,
+        statusError,
+      );
+    }
 
     return NextResponse.json({
       runId: run.id,
@@ -232,6 +263,28 @@ export async function POST(request: NextRequest, context: ExecuteContext) {
         { status: 401 }
       );
     }
+
+    if (createdRunId) {
+      try {
+        await db
+          .update(runs)
+          .set({
+            status: "failed",
+            completedAt: new Date(),
+            errorDetails: getSafeExecutionQueueErrorDetails(error),
+          })
+          .where(eq(runs.id, createdRunId));
+      } catch (statusError) {
+        console.error(
+          `[Test Execute API] Failed to finalize rejected run ${createdRunId}:`,
+          statusError,
+        );
+      }
+    }
+
+    const queueErrorResponse = buildExecutionQueueErrorResponse(error);
+    if (queueErrorResponse) return queueErrorResponse;
+
     console.error("Error executing test:", error);
     return NextResponse.json(
       { error: "Failed to execute test" },

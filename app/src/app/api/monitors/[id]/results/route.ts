@@ -14,10 +14,9 @@ const logger = createLogger({ module: "monitor-results-api" }) as {
 import { checkPermissionWithContext } from '@/lib/rbac/middleware';
 import { isMonitoringLocation } from "@/lib/location-service";
 import type { MonitoringLocation } from "@/lib/location-service";
-import {
-  buildMonitorResultsDateRange,
-  MAX_TIMEZONE_OFFSET_MINUTES,
-} from "./date-range";
+import { buildMonitorResultsDateRange } from "./date-range";
+
+const MAX_TIMEZONE_OFFSET_MINUTES = 14 * 60;
 
 function parsePositiveInteger(value: string | null, fallback: number): number {
   if (value === null) {

@@ -31,8 +31,8 @@ jest.mock("@/lib/logger/index", () => ({
   }),
 }));
 
-import { GET } from "./route";
 import { buildMonitorResultsDateRange } from "./date-range";
+import { GET } from "./route";
 
 const { db: mockDb } = jest.requireMock("@/utils/db") as {
   db: {

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SuperCheck K3s + gVisor Setup Script
+# Supercheck K3s + gVisor Setup Script
 #
 # Installs K3s with containerd and gVisor (runsc) runtime for secure
 # sandboxed test execution. Replaces Docker-socket-based execution.
@@ -79,7 +79,7 @@ fi
 
 info "Architecture: $ARCH"
 info "Host IP: $HOST_IP"
-info "Starting SuperCheck K3s + gVisor setup..."
+info "Starting Supercheck K3s + gVisor setup..."
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -104,7 +104,7 @@ else
 
   # Wait for K3s to be ready
   info "Waiting for K3s to be ready..."
-  for i in $(seq 1 60); do
+  for _ in $(seq 1 60); do
     if k3s kubectl get nodes &>/dev/null; then
       break
     fi
@@ -128,18 +128,26 @@ if command -v runsc &>/dev/null; then
 else
   log "Installing gVisor (runsc) release ${GVISOR_RELEASE}..."
 
-  # Install from gVisor release repository
-  GVISOR_URL="https://storage.googleapis.com/gvisor/releases/release/${GVISOR_RELEASE}/${GVISOR_ARCH}"
+  # gVisor retired the standalone runsc / containerd-shim-runsc-v1 assets
+  # from storage.googleapis.com (curl 404s since the distribution format
+  # change — verified live 2026-09-16). The shim now ships inside
+  # gvisor-<arch>.tar.bz2 on the GitHub release, checksummed by SHA512SUMS.
+  # GVISOR_RELEASE normalization: strip an optional "release-" prefix so both
+  # the legacy "20240101.0" and the GitHub tag form "release-20240101.0" work.
+  GVISOR_TAG="${GVISOR_RELEASE#release-}"
+  if [ "${GVISOR_TAG}" = "latest" ]; then
+    GVISOR_BASE="https://github.com/google/gvisor/releases/latest/download"
+  else
+    GVISOR_BASE="https://github.com/google/gvisor/releases/download/release-${GVISOR_TAG}"
+  fi
 
-  curl -fsSL "${GVISOR_URL}/runsc" -o "${TMP_DIR}/runsc"
-  curl -fsSL "${GVISOR_URL}/runsc.sha512" -o "${TMP_DIR}/runsc.sha512"
-  curl -fsSL "${GVISOR_URL}/containerd-shim-runsc-v1" -o "${TMP_DIR}/containerd-shim-runsc-v1"
-  curl -fsSL "${GVISOR_URL}/containerd-shim-runsc-v1.sha512" -o "${TMP_DIR}/containerd-shim-runsc-v1.sha512"
+  curl -fsSL "${GVISOR_BASE}/gvisor-${GVISOR_ARCH}.tar.bz2" -o "${TMP_DIR}/gvisor-${GVISOR_ARCH}.tar.bz2"
+  curl -fsSL "${GVISOR_BASE}/SHA512SUMS" -o "${TMP_DIR}/SHA512SUMS"
 
   (
     cd "$TMP_DIR"
-    sha512sum -c runsc.sha512
-    sha512sum -c containerd-shim-runsc-v1.sha512
+    grep "gvisor-${GVISOR_ARCH}.tar.bz2" SHA512SUMS | sha512sum -c -
+    tar -xjf "gvisor-${GVISOR_ARCH}.tar.bz2"
   )
 
   install -m 0755 "${TMP_DIR}/runsc" /usr/local/bin/runsc
@@ -189,7 +197,7 @@ systemctl restart k3s
 
 # Wait for K3s to be ready after restart
 info "Waiting for K3s to be ready after restart..."
-for i in $(seq 1 60); do
+for _ in $(seq 1 60); do
   if k3s kubectl get nodes 2>/dev/null | grep -q " Ready"; then
     break
   fi
@@ -238,6 +246,17 @@ metadata:
     pod-security.kubernetes.io/enforce: restricted
     pod-security.kubernetes.io/audit: restricted
     pod-security.kubernetes.io/warn: restricted
+---
+# Zero-permission ServiceAccount mounted by execution Jobs. The worker creates
+# the per-run payload Secrets; this SA only runs the Job pod itself.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: execution-runner
+  namespace: supercheck-execution
+  labels:
+    app.kubernetes.io/part-of: supercheck
+automountServiceAccountToken: false
 ---
 apiVersion: v1
 kind: ResourceQuota
@@ -354,6 +373,11 @@ rules:
   - apiGroups: [""]
     resources: ["pods/exec"]
     verbs: ["get", "create"]
+  # Ephemeral, Job-owned payload/runtime Secrets. The execution pod only mounts
+  # these objects; the zero-permission execution-runner SA cannot read them.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -389,7 +413,7 @@ CA_DATA=$(k3s kubectl config view --raw -o jsonpath='{.clusters[0].cluster.certi
 TOKEN=""
 
 info "Waiting for worker service-account token..."
-for i in $(seq 1 30); do
+for _ in $(seq 1 30); do
   TOKEN=$(k3s kubectl get secret supercheck-worker-token -n supercheck-workers -o jsonpath='{.data.token}' 2>/dev/null | base64 -d || true)
   if [[ -n "$TOKEN" ]]; then
     break
@@ -423,15 +447,13 @@ users:
       token: ${TOKEN}
 EOF
 
-chmod 0640 "$WORKER_KUBECONFIG"
-# The worker container runs as UID 1000 (pwuser). The kubeconfig is bind-mounted
-# read-only, so the file must be group- or world-readable. Mode 0640 lets the
-# host admin restrict access to a specific group while still allowing the
-# non-root container to read the file.
-# If the deployer adds UID 1000 to the owning group, 0640 is sufficient.
-# For simpler setups (Coolify/Dokploy), 0644 also works.
-chown root:1000 "$WORKER_KUBECONFIG" 2>/dev/null || chmod 0644 "$WORKER_KUBECONFIG"
-log "Restricted worker kubeconfig written to $WORKER_KUBECONFIG (readable by UID 1000)"
+# The worker container runs as pwuser (UID/GID 1001 per the Playwright image;
+# compose runs it as "pwuser:pwuser" with NO supplemental groups, and docker
+# --user does not apply the host's group database). The kubeconfig is
+# bind-mounted read-only, so the file must be group-readable by gid 1001.
+chgrp 1001 "$WORKER_KUBECONFIG"
+chmod 0440 "$WORKER_KUBECONFIG"
+log "Restricted worker kubeconfig written to $WORKER_KUBECONFIG (group-readable by GID 1001 / pwuser)"
 
 # ─── Step 8: Label the node for gVisor scheduling ────────────────────────────
 
@@ -471,7 +493,7 @@ YAML
 
 # Wait for test pod to complete
 info "Waiting for test pod to complete..."
-for i in $(seq 1 60); do
+for _ in $(seq 1 60); do
   STATUS=$(k3s kubectl get pod gvisor-test -n supercheck-execution -o jsonpath='{.status.phase}' 2>/dev/null || echo "Pending")
   if [[ "$STATUS" == "Succeeded" ]] || [[ "$STATUS" == "Failed" ]]; then
     break
@@ -496,7 +518,7 @@ k3s kubectl delete pod gvisor-test -n supercheck-execution --ignore-not-found 2>
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-log "SuperCheck K3s + gVisor setup complete!"
+log "Supercheck K3s + gVisor setup complete!"
 echo ""
 info "K3s:       $(k3s --version 2>&1 | head -1)"
 info "gVisor:    $(runsc --version 2>&1 | head -1)"
@@ -506,7 +528,8 @@ echo ""
 info "Next steps:"
 info "  1. Follow the deployment guide: https://supercheck.io/docs/app/deployment/self-hosted"
 info "  2. Or run Docker Compose with K3s-backed execution using:"
-info "     KUBECONFIG_FILE=${WORKER_KUBECONFIG} docker compose -f docker-compose-secure.yml up -d"
+info "     Set COMPOSE_PROFILES=https, APP_DOMAIN and ACME_EMAIL in .env for HTTPS."
+info "     KUBECONFIG_FILE=${WORKER_KUBECONFIG} docker compose up -d"
 info ""
 info "Admin kubeconfig:   export KUBECONFIG=/etc/rancher/k3s/k3s.yaml"
 info "Worker kubeconfig:  ${WORKER_KUBECONFIG}"

@@ -5,6 +5,8 @@
  * by blocking requests to private/internal networks.
  */
 
+import { isPrivateOrReservedAddress } from "./outbound-address-policy";
+
 // Private IP ranges that should not be accessible via webhooks
 const PRIVATE_IP_PATTERNS = [
   // Loopback
@@ -23,6 +25,9 @@ const PRIVATE_IP_PATTERNS = [
   /^fc00:/i,
   /^fd00:/i,
   /^fe80:/i,
+  /^2001:(?:0|0000):/i, // Teredo
+  /^2002:/i, // 6to4
+  /^64:ff9b:/i, // NAT64 well-known prefix
   // AWS/Cloud metadata endpoints
   /^169\.254\.169\.254$/,
   /^metadata\.google\.internal$/i,
@@ -42,14 +47,19 @@ const BLOCKED_HOSTNAMES = [
  * Check if a hostname resolves to a private/internal IP address
  */
 export function isPrivateHost(hostname: string): boolean {
+  const normalized = hostname.trim().toLowerCase().replace(/\.$/, "").replace(/^\[|\]$/g, "");
+  if (isPrivateOrReservedAddress(normalized)) {
+    return true;
+  }
+
   // Check against blocked hostnames
-  if (BLOCKED_HOSTNAMES.includes(hostname.toLowerCase())) {
+  if (BLOCKED_HOSTNAMES.includes(normalized)) {
     return true;
   }
 
   // Check against private IP patterns
   for (const pattern of PRIVATE_IP_PATTERNS) {
-    if (pattern.test(hostname)) {
+    if (pattern.test(normalized)) {
       return true;
     }
   }
@@ -64,15 +74,9 @@ export function isPrivateHost(hostname: string): boolean {
  * @returns true if the URL is safe, false otherwise
  */
 export function isValidWebhookUrl(url: URL): { valid: boolean; error?: string } {
-  // Require HTTPS for webhooks (except in development)
-  const isDevelopment = process.env.NODE_ENV === 'development';
-  if (!isDevelopment && url.protocol !== 'https:') {
+  // Public webhooks use the pinned TLS transport in every environment.
+  if (url.protocol !== 'https:') {
     return { valid: false, error: 'Webhook URL must use HTTPS' };
-  }
-
-  // Allow http only in development
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    return { valid: false, error: 'Invalid protocol - only HTTP(S) allowed' };
   }
 
   // Check for private/internal hosts

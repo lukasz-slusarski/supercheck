@@ -12,6 +12,7 @@ import {
   ClipboardListIcon,
   FileIcon,
   Code,
+  SquareLibrary,
   BookOpenText,
   Plus,
   Chrome,
@@ -28,6 +29,9 @@ import {
   type LucideIcon,
   ClipboardList,
   Target,
+  Siren,
+  Bot,
+  Boxes,
 } from "lucide-react";
 import { PlaywrightLogo } from "@/components/logo/playwright-logo";
 import { K6Logo } from "@/components/logo/k6-logo";
@@ -48,6 +52,11 @@ import {
   SidebarRail,
 } from "@/components/ui/sidebar";
 import { useAdminStatus } from "@/hooks/use-admin-status";
+import { getReleaseVersionBadge } from "@/lib/release-metadata";
+
+const releaseVersionBadge = getReleaseVersionBadge(
+  process.env.NEXT_PUBLIC_SUPERCHECK_VERSION,
+);
 
 // Sidebar navigation data
 const data = {
@@ -69,6 +78,24 @@ const data = {
       title: "Status Pages",
       url: "/status-pages",
       icon: Tally4,
+    },
+  ],
+
+  Investigate: [
+    {
+      title: "Incidents",
+      url: "/incidents",
+      icon: Siren,
+    },
+    {
+      title: "Copilot",
+      url: "/copilot",
+      icon: Bot,
+    },
+    {
+      title: "Services",
+      url: "/services",
+      icon: Boxes,
     },
   ],
 
@@ -217,7 +244,7 @@ const data = {
       title: "Docs",
       url: "https://supercheck.io/docs/app/welcome",
       icon: BookOpenText,
-      badge: "v1.3.6-canary.1",
+      badge: releaseVersionBadge,
     },
   ],
   documents: [
@@ -244,13 +271,17 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
   // with synchronous localStorage restoration.
   // Server will return false, Client will return true after mounting.
   const isMounted = useSyncExternalStore(
-    () => () => { },
+    () => () => {},
     () => true,
-    () => false
+    () => false,
   );
 
   // Use cached admin status hook (React Query cached for 5 minutes)
-  const { isAdmin, isOrgAdmin, isLoading: isAdminStatusLoading } = useAdminStatus();
+  const {
+    isAdmin,
+    isOrgAdmin,
+    isLoading: isAdminStatusLoading,
+  } = useAdminStatus();
 
   // Status is loaded when mounted AND not loading
   // On server/initial render: isMounted=false, so isAdminStatusLoaded=false
@@ -318,6 +349,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
         <NavMain groupLabel="Communicate" items={data.Communicate} />
         <NavMain groupLabel="Automate" items={data.Automate} />
         <NavMain groupLabel="Monitor" items={data.Monitor} />
+        <NavMain groupLabel="Investigate" items={data.Investigate} />
         {adminItems.length > 0 && (
           <NavMain groupLabel="Settings" items={adminItems} />
         )}

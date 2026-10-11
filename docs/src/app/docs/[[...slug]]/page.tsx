@@ -1,7 +1,8 @@
 import type { Metadata } from 'next';
 import { source } from '../../../lib/source';
 import { getMDXComponents } from '../../../mdx-components';
-import { notFound, redirect } from 'next/navigation';
+import { notFound } from 'next/navigation';
+import { DocsRedirect } from '../../../components/docs-redirect';
 import { createRelativeLink } from 'fumadocs-ui/mdx';
 import {
   DocsBody,
@@ -14,26 +15,23 @@ import Link from 'next/link';
 
 export const revalidate = false;
 
+function isDocsEntry(slug: string[] | undefined) {
+  const path = slug?.join('/') ?? '';
+  return path === '' || path === 'app' || path === 'app/quickstart';
+}
+
 export default async function Page(props: PageProps<'/docs/[[...slug]]'>) {
   const params = await props.params;
-  if (!params.slug || params.slug.length === 0) {
-    redirect('/docs/app/welcome');
-  }
-  if (params.slug.length === 1 && params.slug[0] === 'app') {
-    redirect('/docs/app/welcome');
-  }
-  if (params.slug.length === 2 && params.slug[0] === 'app' && params.slug[1] === 'quickstart') {
-    redirect('/docs/app/welcome');
+  if (isDocsEntry(params.slug)) {
+    return <DocsRedirect />;
   }
   const page = source.getPage(params.slug);
   if (!page) notFound();
 
-  // Get the file path from slugs - the path corresponds to the slug structure with .mdx extension
-  // For index pages (like deployment/index.mdx), slugs is ['deployment'], so we append index.mdx
-  // For standalone pages (like monitors.mdx), slugs is ['monitors'], so we append .mdx
-  const filePath = page.slugs.length === 0
-    ? 'index.mdx'
-    : `${page.slugs.join('/')}.mdx`;
+  // Fumadocs keeps the canonical source path, including folder index files.
+  // URL slugs are not sufficient here because `app/deployment/index.mdx` and
+  // `app/deployment.mdx` would both resolve to `/docs/app/deployment`.
+  const filePath = page.path;
 
   const MDX = page.data.body;
   const isFullWidth = page.data.full === true;
@@ -86,14 +84,24 @@ export default async function Page(props: PageProps<'/docs/[[...slug]]'>) {
 }
 
 export async function generateStaticParams() {
-  return source.generateParams();
+  const params = await source.generateParams();
+  // Redirect-only routes (`/docs`, `/docs/app`, `/docs/app/quickstart`) have no
+  // content page, but `output: 'export'` still needs their params to emit the
+  // navigation fallback. If a real page is added at one of these slugs, remove the
+  // matching entry here.
+  return [
+    { slug: [] },
+    { slug: ['app'] },
+    { slug: ['app', 'quickstart'] },
+    ...params,
+  ];
 }
 
 export async function generateMetadata(
   props: PageProps<'/docs/[[...slug]]'>,
 ): Promise<Metadata> {
   const params = await props.params;
-  if (!params.slug || params.slug.length === 0) {
+  if (isDocsEntry(params.slug)) {
     return {
       title: 'Supercheck Documentation',
       description: 'Open Source AI-Powered Test Automation & Monitoring Platform',

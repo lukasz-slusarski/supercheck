@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { hasPermissionForUser } from '@/lib/rbac/middleware';
 import { requireUserAuthContext, isAuthError } from '@/lib/auth-context';
 import { db } from '@/utils/db';
-import { projects, projectMembers, user } from '@/db/schema';
+import { member, projects, projectMembers, user } from '@/db/schema';
 import { eq, and } from 'drizzle-orm';
 
 /**
@@ -138,7 +138,7 @@ export async function POST(
     }
     
     // Validate role
-    const validRoles = ['org_owner', 'project_admin', 'project_editor', 'project_viewer'];
+    const validRoles = ['project_admin', 'project_editor', 'project_viewer'];
     if (!validRoles.includes(role)) {
       return NextResponse.json(
         { error: 'Invalid role specified' },
@@ -157,6 +157,21 @@ export async function POST(
       return NextResponse.json(
         { error: 'User not found' },
         { status: 404 }
+      );
+    }
+
+    const targetOrganizationMember = await db
+      .select({ id: member.id })
+      .from(member)
+      .where(and(
+        eq(member.userId, targetUserId),
+        eq(member.organizationId, organizationId)
+      ))
+      .limit(1);
+    if (targetOrganizationMember.length === 0) {
+      return NextResponse.json(
+        { error: 'User is not a member of this organization' },
+        { status: 400 }
       );
     }
     
@@ -263,7 +278,7 @@ export async function PUT(
     }
     
     // Validate role
-    const validRoles = ['org_owner', 'project_admin', 'project_editor', 'project_viewer'];
+    const validRoles = ['project_admin', 'project_editor', 'project_viewer'];
     if (!validRoles.includes(role)) {
       return NextResponse.json(
         { error: 'Invalid role specified' },

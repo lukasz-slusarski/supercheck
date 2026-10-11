@@ -11,10 +11,11 @@ import {
   projectMembers,
   session as sessionTable,
 } from "@/db/schema";
-import { eq, and } from "drizzle-orm";
+import { eq, and, isNull } from "drizzle-orm";
 import {
   getActiveOrganization,
   getUserProjects,
+  getSelectableProjects,
   getCurrentUser,
 } from "./session";
 import { getUserOrgRole } from "./rbac/middleware";
@@ -22,6 +23,12 @@ import { Role } from "./rbac/permissions";
 import { roleToString } from "./rbac/role-normalizer";
 import { getCachedAuthSession } from "./session-cache";
 import { getUnifiedAuthContext } from "./rbac/unified-auth";
+import { createLogger } from "./logger/index";
+
+const logger = createLogger({ module: "project-context" }) as {
+  info: (data: unknown, message?: string) => void;
+  error: (data: unknown, message?: string) => void;
+};
 
 // getCachedAuthSession imported from session-cache.ts (DRY principle)
 
@@ -32,6 +39,12 @@ export interface ProjectContext {
   organizationId: string;
   isDefault: boolean;
   userRole: string;
+}
+
+export interface ProjectAuthContext {
+  userId: string;
+  project: ProjectContext;
+  organizationId: string;
 }
 
 /**
@@ -50,6 +63,7 @@ export async function getCurrentProjectContext(): Promise<ProjectContext | null>
     const sessionRecord = await db
       .select({
         activeProjectId: sessionTable.activeProjectId,
+        activeOrganizationId: sessionTable.activeOrganizationId,
         userId: sessionTable.userId,
         impersonatedBy: sessionTable.impersonatedBy,
       })
@@ -72,7 +86,7 @@ export async function getCurrentProjectContext(): Promise<ProjectContext | null>
 
     if (!activeProjectId) {
       // No active project in session, try to set a default
-      return await setDefaultProjectInSession();
+      return await setDefaultProjectInSession(session);
     }
 
     const projectData = await db
@@ -90,17 +104,21 @@ export async function getCurrentProjectContext(): Promise<ProjectContext | null>
       .limit(1);
 
     if (projectData.length === 0) {
-      return await setDefaultProjectInSession();
+      return await setDefaultProjectInSession(session);
     }
 
     const project = projectData[0];
+    const activeOrganization = await getActiveOrganization();
+    if (!activeOrganization || project.organizationId !== activeOrganization.id) {
+      return await setDefaultProjectInSession(session);
+    }
 
     // Get user's role using consistent role resolution
     // 1. First check organization role (primary source of truth)
     const orgRole = await getUserOrgRole(currentUserId, project.organizationId);
 
     if (!orgRole) {
-      return await setDefaultProjectInSession();
+      return await setDefaultProjectInSession(session);
     }
 
     // 2. For PROJECT_ADMIN and PROJECT_EDITOR, check project-specific access
@@ -138,7 +156,7 @@ export async function getCurrentProjectContext(): Promise<ProjectContext | null>
       userRole: roleString,
     };
   } catch (error) {
-    console.error("Error getting project context:", error);
+    logger.error({ error }, "Failed to get project context");
     return null;
   }
 }
@@ -146,7 +164,10 @@ export async function getCurrentProjectContext(): Promise<ProjectContext | null>
 /**
  * Set a default project in session when no active project exists
  */
-async function setDefaultProjectInSession(): Promise<ProjectContext | null> {
+async function setDefaultProjectInSession(expectedSession: {
+  activeOrganizationId: string | null;
+  activeProjectId: string | null;
+}): Promise<ProjectContext | null> {
   try {
     // Use cached session to avoid duplicate DB round-trips in Docker
     const sessionData = await getCachedAuthSession();
@@ -165,6 +186,23 @@ async function setDefaultProjectInSession(): Promise<ProjectContext | null> {
     if (!activeOrg) {
       return null;
     }
+
+    // An older request must not undo a newer organization/project selection.
+    const selectDefaultProject = async (projectId: string) => {
+      const updated = await db.update(sessionTable)
+        .set({ activeOrganizationId: activeOrg.id, activeProjectId: projectId })
+        .where(and(
+          eq(sessionTable.token, sessionData.session.token),
+          eq(sessionTable.userId, currentUser.id),
+          expectedSession.activeOrganizationId === null
+            ? isNull(sessionTable.activeOrganizationId)
+            : eq(sessionTable.activeOrganizationId, expectedSession.activeOrganizationId),
+          expectedSession.activeProjectId === null
+            ? isNull(sessionTable.activeProjectId)
+            : eq(sessionTable.activeProjectId, expectedSession.activeProjectId),
+        )).returning({ id: sessionTable.id });
+      return updated.length > 0;
+    };
 
     const userProjects = await getUserProjects(currentUser.id, activeOrg.id);
     if (userProjects.length === 0) {
@@ -205,8 +243,9 @@ async function setDefaultProjectInSession(): Promise<ProjectContext | null> {
         // If user already has project access, they might have been added via invitation
         // Don't auto-assign - wait for proper project context to be established
         if (existingAccess.length > 0) {
-          console.log(
-            `ℹ️ User ${currentUser.email} already has project access in organization "${activeOrg.name}" - skipping auto-assignment`
+          logger.info(
+            { userId: currentUser.id, organizationId: activeOrg.id },
+            "User already has project access; skipping auto-assignment",
           );
           return null;
         }
@@ -222,15 +261,17 @@ async function setDefaultProjectInSession(): Promise<ProjectContext | null> {
             createdAt: new Date(),
           });
 
-          console.log(
-            `✅ Auto-assigned user ${currentUser.email} to project "${projectToAssign.name}" in organization "${activeOrg.name}"`
+          logger.info(
+            {
+              userId: currentUser.id,
+              projectId: projectToAssign.id,
+              organizationId: activeOrg.id,
+            },
+            "Auto-assigned user to project",
           );
 
           // Update session with this project
-          await db
-            .update(sessionTable)
-            .set({ activeProjectId: projectToAssign.id })
-            .where(eq(sessionTable.token, sessionData.session.token));
+          if (!await selectDefaultProject(projectToAssign.id)) return null;
 
           return {
             id: projectToAssign.id,
@@ -252,15 +293,13 @@ async function setDefaultProjectInSession(): Promise<ProjectContext | null> {
             dbError?.code === "23505" ||
             dbError?.message?.includes("duplicate key")
           ) {
-            console.log(
-              `ℹ️ User ${currentUser.email} was already assigned to project "${projectToAssign.name}" (likely via invitation)`
+            logger.info(
+              { userId: currentUser.id, projectId: projectToAssign.id },
+              "User was already assigned to project",
             );
 
             // Update session anyway since they do have access
-            await db
-              .update(sessionTable)
-              .set({ activeProjectId: projectToAssign.id })
-              .where(eq(sessionTable.token, sessionData.session.token));
+            if (!await selectDefaultProject(projectToAssign.id)) return null;
 
             return {
               id: projectToAssign.id,
@@ -272,7 +311,10 @@ async function setDefaultProjectInSession(): Promise<ProjectContext | null> {
             };
           }
 
-          console.error("Error auto-assigning user to project:", error);
+          logger.error(
+            { error, userId: currentUser.id, projectId: projectToAssign.id },
+            "Failed to auto-assign user to project",
+          );
           return null;
         }
       }
@@ -285,10 +327,7 @@ async function setDefaultProjectInSession(): Promise<ProjectContext | null> {
       userProjects.find((p) => p.isDefault) || userProjects[0];
 
     // Update session with this project
-    await db
-      .update(sessionTable)
-      .set({ activeProjectId: defaultProject.id })
-      .where(eq(sessionTable.token, sessionData.session.token));
+    if (!await selectDefaultProject(defaultProject.id)) return null;
 
     return {
       id: defaultProject.id,
@@ -299,7 +338,7 @@ async function setDefaultProjectInSession(): Promise<ProjectContext | null> {
       userRole: defaultProject.role || "project_viewer",
     };
   } catch (error) {
-    console.error("Error setting default project:", error);
+    logger.error({ error }, "Failed to set default project");
     return null;
   }
 }
@@ -324,48 +363,41 @@ export async function switchProject(
       return { success: false, message: "Not authenticated" };
     }
 
-    const activeOrg = await getActiveOrganization();
-    if (!activeOrg) {
-      return { success: false, message: "No active organization" };
-    }
+    const [expectedSession] = await db.select({
+      activeOrganizationId: sessionTable.activeOrganizationId,
+      activeProjectId: sessionTable.activeProjectId,
+    }).from(sessionTable).where(and(
+      eq(sessionTable.token, sessionData.session.token), eq(sessionTable.userId, currentUser.id),
+    )).limit(1);
+    if (!expectedSession) return { success: false, message: "Not authenticated" };
 
-    // Verify user has access to this project
-    const userProjects = await getUserProjects(currentUser.id, activeOrg.id);
+    // Project membership, rather than the current tenant, determines whether a
+    // project can be selected. This includes teams joined by invitation.
+    const userProjects = await getSelectableProjects(currentUser.id);
     const targetProject = userProjects.find((p) => p.id === projectId);
 
     if (!targetProject) {
       return { success: false, message: "Project not found or access denied" };
     }
 
-    // Update session
+    // Select both scopes together so authorization and billing follow the host.
     const updateResult = await db
       .update(sessionTable)
-      .set({ activeProjectId: projectId })
-      .where(eq(sessionTable.token, sessionData.session.token))
+      .set({ activeOrganizationId: targetProject.organizationId, activeProjectId: projectId })
+      .where(and(
+        eq(sessionTable.token, sessionData.session.token),
+        eq(sessionTable.userId, currentUser.id),
+        expectedSession.activeOrganizationId === null ? isNull(sessionTable.activeOrganizationId)
+          : eq(sessionTable.activeOrganizationId, expectedSession.activeOrganizationId),
+        expectedSession.activeProjectId === null ? isNull(sessionTable.activeProjectId)
+          : eq(sessionTable.activeProjectId, expectedSession.activeProjectId),
+      ))
       .returning({ activeProjectId: sessionTable.activeProjectId });
 
+    // RETURNING confirms this write. A later read could observe another tab's
+    // successful selection and incorrectly report that our update failed.
     if (updateResult.length === 0) {
-      return {
-        success: false,
-        message: "Failed to update session - please try logging in again",
-      };
-    }
-
-    // Verify the update worked by reading it back
-    const verifySession = await db
-      .select({ activeProjectId: sessionTable.activeProjectId })
-      .from(sessionTable)
-      .where(eq(sessionTable.token, sessionData.session.token))
-      .limit(1);
-
-    if (
-      verifySession.length === 0 ||
-      verifySession[0].activeProjectId !== projectId
-    ) {
-      return {
-        success: false,
-        message: "Session update failed - please try again",
-      };
+      return { success: false, message: "Project selection changed. Refresh and try again." };
     }
 
     const projectContext: ProjectContext = {
@@ -383,7 +415,7 @@ export async function switchProject(
       project: projectContext,
     };
   } catch (error) {
-    console.error("Error switching project:", error);
+    logger.error({ error, projectId }, "Failed to switch project");
     return { success: false, message: "Failed to switch project" };
   }
 }
@@ -391,11 +423,7 @@ export async function switchProject(
 /**
  * Require project context middleware for API routes
  */
-export async function requireProjectContext(): Promise<{
-  userId: string;
-  project: ProjectContext;
-  organizationId: string;
-}> {
+export async function requireProjectContext(): Promise<ProjectAuthContext> {
   // Use cached session to avoid duplicate DB round-trips
   const sessionData = await getCachedAuthSession();
   
@@ -443,14 +471,16 @@ export async function requireProjectContext(): Promise<{
   }
 
   // SECURITY: Resolve effective role with project-assignment awareness.
-  // Org-wide roles (owner/admin) can access all projects in org.
+  // Org-wide roles (org_owner/org_admin) can access all projects in org.
   // Project-limited roles (project_admin/project_editor) require explicit project membership;
-  // without membership, degrade to viewer (consistent with legacy behavior).
+  // without membership, degrade to viewer.
   const isOrgWideRole =
     ctx.organizationRole === "org_owner" || ctx.organizationRole === "org_admin";
 
   let effectiveRole: string | null = null;
-  if (isOrgWideRole) {
+  if (ctx.organizationRole === "super_admin") {
+    effectiveRole = ctx.organizationRole;
+  } else if (isOrgWideRole) {
     effectiveRole = ctx.organizationRole;
   } else if (ctx.projectRole) {
     effectiveRole = ctx.projectRole;

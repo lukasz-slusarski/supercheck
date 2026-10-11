@@ -8,6 +8,29 @@ Monitors continuously check your services and alert you when issues occur. Run c
 
 ![Monitors List](/screenshots/monitors-list.png)
 
+## Setup Workflow
+
+<p className="text-sm">Scroll horizontally on smaller screens to view all steps.</p>
+
+<div className="overflow-x-auto" role="region" aria-label="Monitor setup workflow" tabIndex={0}>
+<div className="min-w-[72rem]">
+
+```mermaid
+%%{init: {"flowchart":{"nodeSpacing":20,"rankSpacing":24,"padding":12,"wrappingWidth":140}}}%%
+flowchart LR
+    Create[Create a monitor] --> Target[Set endpoint or select a saved test]
+    Target --> Schedule[Choose interval and available regions]
+    Schedule --> Alerts[Select channel and alert thresholds]
+    Alerts --> Save[Save and review the first result]
+    Save --> Review[Compare results and investigate failures]
+
+    classDef action fill:#1d4ed8,stroke:#60a5fa,color:#fff
+    class Create,Target,Schedule,Alerts,Save,Review action
+```
+
+</div>
+</div>
+
 ## Monitor Types
 
 Supercheck offers five monitor types, each designed for specific use cases:
@@ -22,7 +45,7 @@ Simple website availability checks with SSL certificate expiration tracking
 </Card>
 
 <Card icon={<ChevronsLeftRightEllipsis className="text-cyan-600" />} title="Ping Monitor">
-Network-level ICMP ping checks for server availability and latency measurement
+TCP reachability checks on ports 443/80 for server availability
 </Card>
 
 <Card icon={<EthernetPort className="text-blue-600" />} title="Port Monitor">
@@ -43,8 +66,7 @@ The most versatile monitor type for APIs and web services.
 - Response status codes (2xx, 3xx, 4xx, 5xx)
 - Response time and latency
 - Response body content (keyword validation)
-- JSON response structure (JSON path validation)
-- SSL certificate validity and expiration
+- HTTPS connectivity
 
 **Configuration options:**
 - **HTTP Method** — GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS
@@ -65,7 +87,7 @@ Use HTTP monitors for APIs, health check endpoints, and any service that respond
 Simplified monitoring for web pages with built-in SSL tracking.
 
 **What it checks:**
-- Page loads successfully (HTTP 200)
+- Page returns an expected status code (2xx by default)
 - SSL certificate is valid
 - SSL certificate expiration date
 - Optional keyword presence on page
@@ -80,12 +102,11 @@ Simplified monitoring for web pages with built-in SSL tracking.
 
 ## Ping Monitor
 
-Network-level monitoring using ICMP ping.
+TCP reachability monitoring for hosts that do not expose an HTTP endpoint.
 
 **What it checks:**
-- Host is reachable on the network
-- Round-trip latency (response time)
-- Packet loss percentage
+- Host is reachable over TCP on port 443 or 80
+- Connection latency (response time)
 
 **Best for:**
 - Server availability
@@ -96,7 +117,7 @@ Network-level monitoring using ICMP ping.
 ![Create Ping Monitor](/screenshots/create-ping-monitor.png)
 
 <Callout type="warn">
-Some cloud providers and firewalls block ICMP traffic. If ping monitors fail unexpectedly, verify that ICMP is allowed on your target host.
+Ping monitors use TCP connectivity on ports 443 and 80 rather than ICMP. If the target host does not accept TCP connections on either port, the check fails.
 </Callout>
 
 ## Port Monitor
@@ -116,6 +137,8 @@ Verify that specific services are listening on expected ports.
 
 ![Create Port Monitor](/screenshots/create-port-monitor.png)
 
+UDP checks send a packet; a passing result does not confirm that the application replied. Use TCP or an application-level check when you need response verification.
+
 ## Synthetic Monitor
 
 Run full Playwright browser tests on a schedule to validate complete user flows.
@@ -132,11 +155,11 @@ Run full Playwright browser tests on a schedule to validate complete user flows.
 - Complex workflows requiring browser interaction
 - End-to-end validation of user experience
 
-**How it works:**
+**Set up a synthetic monitor:**
 1. Create a Playwright test in the [Playground](/docs/app/automate/playground)
 2. Save the test to your project
 3. Create a Synthetic Monitor and select your test
-4. Set the check interval (minimum 5 minutes recommended)
+4. Set the check interval (minimum 5 minutes)
 5. Monitor runs your test and reports pass/fail status
 
 ![Create Synthetic Monitor](/screenshots/create-synthetic-monitor.png)
@@ -161,34 +184,19 @@ Run checks from multiple geographic locations to detect regional outages and mea
 |--------|----------|-------|
 | **Local** | Your server location | Default for self-hosted deployments |
 
-Cloud deployments may include additional regions such as US East (Ashburn), EU Central (Nuremberg), and Asia Pacific (Singapore). Check your Super Admin panel for available locations.
+Cloud deployments may include additional regions such as US East (Ashburn), EU Central (Nuremberg), and Asia Pacific (Singapore). Use the monitor's location picker to see which regions your project can use.
 
-### How Multi-Location Works
+### Choose Monitoring Locations
 
-When multiple locations are configured, checks run independently from each location and results are aggregated to determine overall status.
+Select the regions you want to monitor, then use the location filter on the monitor detail page to compare results.
+
+![Multi-Location Selector](/screenshots/create-monitor-multilocation-selector.png)
 
 <Callout type="info">
 **Single Location**: When only one location is available, the multi-location configuration UI is automatically hidden. Location settings appear dynamically when additional locations are added via the Super Admin panel. If some configured locations are temporarily offline, Supercheck runs the check from the live subset and aggregates only the locations that actually executed.
 </Callout>
 
-```mermaid
-sequenceDiagram
-    participant App
-    participant L1 as Location 1
-    participant L2 as Location 2
-    participant L3 as Location 3
-    participant DB as Database
-
-    App->>L1: Queue check
-    App->>L2: Queue check
-    App->>L3: Queue check
-    L1->>DB: Save result
-    L2->>DB: Save result
-    L3->>DB: Save result
-    DB->>App: Aggregate status
-```
-
-**Status calculation:** Once all locations report, the system calculates overall status. A monitor is "Up" if the majority of locations report success.
+The overall status reflects the majority of locations that completed the check. Review per-location results to find a regional outage even when the overall status is **Up**.
 
 <Callout type="info">
 **Self-Hosted Deployments**: By default, self-hosted instances have a single `local` location. All checks execute from your worker. For true geographic distribution, deploy additional workers in different regions and add the corresponding locations via the Super Admin panel.
@@ -215,8 +223,8 @@ Configure when and how you receive notifications about monitor status changes.
 
 Thresholds prevent alert fatigue from transient issues:
 
-<Tabs items={['How It Works', 'Example']}>
-<Tab value="How It Works">
+<Tabs items={['Threshold Settings', 'Example']}>
+<Tab value="Threshold Settings">
 
 **Failure Threshold**
 
@@ -273,11 +281,11 @@ Click **AI Analyze** in the header to generate an AI-powered analysis report for
 **What AI Analyze Provides:**
 - **Health Assessment** — Clear status summary based on actual metrics
 - **Performance Analysis** — Response time trends using your monitor's exact data
-- **Issue Diagnosis** — Root cause analysis with specific error messages and timestamps
+- **Issue Diagnosis** — Suggested causes with available error messages and timestamps
 - **Recommendations** — Actionable next steps based on observed issues (only when problems exist)
 
 <Callout type="info">
-AI Analyze requires a configured AI provider. See [Deployment](/docs/app/deployment/self-hosted#ai-configuration) for setup.
+For self-hosted deployments, an administrator must [configure an AI provider](/docs/app/deployment/self-hosted#optional-configuration) to enable AI Analyze.
 </Callout>
 
 ### Key Metrics Bar
@@ -291,7 +299,7 @@ Nine key metrics are displayed prominently below the header:
 | **Resp Time** | Latest response time from the most recent check |
 | **Uptime (24h)** | Percentage of successful checks in the last 24 hours |
 | **Avg Resp (24h)** | Average response time over the last 24 hours |
-| **P95 Resp (24h)** | 95th percentile response time (24h) — shows worst-case latency |
+| **P95 Resp (24h)** | 95th percentile response time over the last 24 hours |
 | **Uptime (30d)** | Percentage of successful checks in the last 30 days |
 | **Avg Resp (30d)** | Average response time over the last 30 days |
 | **P95 Resp (30d)** | 95th percentile response time (30d) — long-term performance indicator |
@@ -315,7 +323,7 @@ This visualization helps you quickly identify patterns like intermittent failure
 An interactive line chart displaying response times over time:
 
 - **100 Data Points** — Shows the most recent 100 check results
-- **Multi-Location Lines** — Different colored lines for each monitoring region
+- **Multi-Location Data** — Region is shown in the hover details
 - **Hover Details** — View exact response time and timestamp on hover
 - **Visual Patterns** — Identify latency spikes, trends, and anomalies
 
@@ -362,7 +370,7 @@ Use **Copy Prompt** to copy error details for AI-assisted debugging.
 | Status | Meaning | Action |
 |--------|---------|--------|
 | **Up** | All checks passing | No action needed |
-| **Down** | Failure threshold exceeded | Alerts sent, investigate immediately |
+| **Down** | Latest aggregated check failed | Review results; notifications follow your alert thresholds |
 | **Paused** | Monitoring disabled | Re-enable when ready |
 | **Pending** | Initial check in progress | Wait for first result |
 | **Maintenance** | Under maintenance | Monitor temporarily disabled |
@@ -380,13 +388,3 @@ Use **Copy Prompt** to copy error details for AI-assisted debugging.
 <Callout type="info">
 **Synthetic Monitors**: Minimum interval is 5 minutes to prevent overlapping Playwright executions. Set intervals longer than your test execution time—for a 2-minute test, use 5+ minute intervals.
 </Callout>
-
-## Tags
-
-Organize monitors with color-coded tags for easy filtering and categorization.
-
-- **Create tags** — Add custom tags with any of 8 available colors
-- **Filter by tags** — Quickly find monitors by tag in the list view
-- **Bulk operations** — Apply or remove tags from multiple monitors
-
-Tags are project-scoped, so each project can have its own tagging system.

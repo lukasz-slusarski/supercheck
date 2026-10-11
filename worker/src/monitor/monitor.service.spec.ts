@@ -6,7 +6,7 @@
  * Test Categories:
  * - HTTP Request Monitoring (GET, POST, status validation)
  * - Website Monitoring (SSL checks, content validation)
- * - Ping Monitoring (ICMP echo)
+ * - Ping Monitoring (TCP reachability on ports 443 and 80)
  * - Port Monitoring (TCP connection)
  * - Custom Playwright Monitoring
  * - Alert Handling (status changes, notifications)
@@ -27,6 +27,16 @@ jest.mock('../execution/services/execution.service', () => ({
   ExecutionService: jest.fn().mockImplementation(() => ({
     execute: jest.fn().mockResolvedValue({ success: true }),
   })),
+}));
+
+jest.mock('../common/utils/pinned-monitor-request', () => ({
+  requestPinnedMonitorTarget: jest.fn(
+    async (
+      config: unknown,
+      _options: unknown,
+      execute: (requestConfig: unknown) => Promise<unknown>,
+    ) => execute(config),
+  ),
 }));
 
 import { MonitorService } from './monitor.service';
@@ -56,6 +66,7 @@ describe('MonitorService', () => {
   };
 
   const mockDbService = {
+    getTestById: jest.fn(),
     db: {
       query: {
         monitors: {
@@ -91,9 +102,13 @@ describe('MonitorService', () => {
 
   const mockExecutionService = {
     execute: jest.fn().mockResolvedValue({ success: true }),
+    runSingleTest: jest.fn(),
   };
 
   const mockUsageTrackerService = {
+    shouldBlockExecution: jest.fn().mockResolvedValue({ blocked: false }),
+    completeRunWithUsage: jest.fn(),
+    trackPlaywrightExecution: jest.fn(),
     trackUsage: jest.fn().mockResolvedValue(undefined),
     getUsage: jest.fn().mockResolvedValue({ count: 0 }),
   };
@@ -125,14 +140,10 @@ describe('MonitorService', () => {
   };
 
   const mockLocationService = {
-    getCurrentLocation: jest
-      .fn()
-      .mockReturnValue('eu-central'),
+    getCurrentLocation: jest.fn().mockReturnValue('eu-central'),
     getLocationName: jest.fn().mockReturnValue('EU Central'),
     getLocationDisplayName: jest.fn().mockReturnValue('EU Central'),
-    getEffectiveLocations: jest
-      .fn()
-      .mockReturnValue(['eu-central']),
+    getEffectiveLocations: jest.fn().mockReturnValue(['eu-central']),
     calculateAggregatedStatus: jest.fn().mockReturnValue('up'),
   };
 
@@ -435,15 +446,34 @@ describe('MonitorService', () => {
       expect(result?.error).toContain('not found');
     });
 
-    it('should continue execution if status check fails', async () => {
+    it('does not execute or report downtime if authorization cannot be checked', async () => {
       mockDbService.db.query.monitors.findFirst.mockRejectedValue(
         new Error('DB error'),
       );
 
       const result = await service.executeMonitor(mockJobData);
 
-      // Should return a result, not throw
-      expect(result).toBeDefined();
+      expect(result).toBeNull();
+      expect(mockHttpService.request).not.toHaveBeenCalled();
+    });
+
+    it('skips a synthetic monitor at the spending cap without a failure result', async () => {
+      mockUsageTrackerService.shouldBlockExecution.mockResolvedValueOnce({
+        blocked: true,
+      });
+      const result = await service.executeMonitor({
+        ...mockJobData,
+        type: 'synthetic_test',
+      });
+      expect(result).toBeNull();
+      expect(mockUsageTrackerService.shouldBlockExecution).toHaveBeenCalledWith(
+        mockMonitor.organizationId,
+        { checkSpendingLimit: true },
+      );
+      expect(mockExecutionService.runSingleTest).not.toHaveBeenCalled();
+      expect(
+        mockUsageTrackerService.completeRunWithUsage,
+      ).not.toHaveBeenCalled();
     });
 
     it('should execute http_request type monitors', async () => {
@@ -882,6 +912,60 @@ describe('MonitorService', () => {
   // ==========================================================================
 
   describe('Synthetic Test Monitoring', () => {
+    it.each([false, true])(
+      'preserves the check result when receipt failure is %s',
+      async (failReceipt) => {
+        mockDbService.getTestById.mockResolvedValue({
+          id: 'test-1',
+          title: 'Health',
+          script: 'test("health", async () => {});',
+        });
+        mockDbService.db.query.monitors.findFirst.mockResolvedValue({
+          organizationId: 'org-1',
+        });
+        mockExecutionService.runSingleTest.mockResolvedValue({
+          success: true,
+          executionTimeMs: 1234,
+          testId: 'test-1-execution-unique',
+          reportUrl: 'https://example.com/report',
+        });
+        mockUsageTrackerService.completeRunWithUsage.mockImplementation(
+          async () => {
+            if (failReceipt) throw new Error('receipt unavailable');
+          },
+        );
+        mockUsageTrackerService.trackPlaywrightExecution.mockResolvedValue({
+          blocked: false,
+        });
+        const result = await (
+          service as unknown as {
+            executeSyntheticTest: (
+              id: string,
+              config: { testId: string },
+            ) => Promise<{ isUp: boolean }>;
+          }
+        ).executeSyntheticTest('monitor-1', { testId: 'test-1' });
+        expect(result.isUp).toBe(true);
+        expect(
+          mockUsageTrackerService.completeRunWithUsage,
+        ).toHaveBeenCalledWith(
+          expect.objectContaining({
+            runId: 'test-1-execution-unique',
+            durationMs: 1234,
+            organizationId: 'org-1',
+          }),
+          expect.any(Function),
+        );
+        expect(
+          mockUsageTrackerService.trackPlaywrightExecution,
+        ).toHaveBeenCalledWith(
+          'org-1',
+          1234,
+          expect.objectContaining({ runId: 'test-1-execution-unique' }),
+        );
+      },
+    );
+
     it('should recognize synthetic_test monitor type', () => {
       const syntheticMonitor = { ...mockMonitor, type: 'synthetic_test' };
       expect(syntheticMonitor.type).toBe('synthetic_test');

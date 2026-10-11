@@ -16,7 +16,7 @@ npx @supercheck/cli health
 ```
 
 <Callout type="info">
-  Requires **Node.js 18** or later.
+  Requires **Node.js 20** or later.
 </Callout>
 
 ## Verify Installation
@@ -28,13 +28,12 @@ supercheck health
 
 ## Docker
 
-Run the CLI in a container using the official Node.js image:
+Set `SUPERCHECK_JOB_ID` and both tokens in your environment, then run the CLI using the official Node.js image:
 
 ```bash
 docker run --rm \
-  -e SUPERCHECK_TRIGGER_KEY=$SUPERCHECK_TRIGGER_KEY \
-  -e SUPERCHECK_TOKEN=$SUPERCHECK_TOKEN \
-  node:20-slim sh -c "npm install -g @supercheck/cli && supercheck job trigger <job-id> --wait"
+  -e SUPERCHECK_TRIGGER_KEY -e SUPERCHECK_TOKEN -e SUPERCHECK_JOB_ID \
+  node:20-slim sh -c 'npm install -g @supercheck/cli && supercheck job trigger "$SUPERCHECK_JOB_ID" --wait'
 ```
 
 See [CI/CD Integration](./ci-cd) for Docker-based pipeline examples.
@@ -43,18 +42,18 @@ See [CI/CD Integration](./ci-cd) for Docker-based pipeline examples.
 
 The CLI requires a **CLI token** for API access. Create one in the dashboard:
 
-1. Go to **Project Settings → CLI Tokens**
+1. Go to **Organization Admin → CLI Tokens**
 2. Click **Create Token**
 3. Copy the token (shown only once)
 
 Then authenticate:
 
 ```bash
-# Option 1: Environment variable (recommended for CI/CD)
+# CI/CD: set the token as an environment variable — the CLI reads
+# SUPERCHECK_TOKEN at runtime, so no login step is needed.
 export SUPERCHECK_TOKEN="sck_live_..."
-supercheck login --token $SUPERCHECK_TOKEN
 
-# Option 2: Direct login
+# Local machine: persist credentials via login
 supercheck login --token sck_live_a1b2c3d4...
 ```
 
@@ -74,7 +73,7 @@ supercheck login --token $SUPERCHECK_TOKEN --url $SUPERCHECK_URL
 supercheck health
 ```
 
-Standard Supercheck self-hosted deployments use Traefik + Let's Encrypt for automatic TLS — no certificate configuration required.
+Use your instance's HTTPS URL. See the [production deployment guide](/docs/app/deployment/self-hosted) if your administrator still needs to configure HTTPS.
 
 ## Proxy Configuration
 

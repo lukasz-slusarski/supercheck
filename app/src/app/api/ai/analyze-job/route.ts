@@ -10,6 +10,7 @@ import { db } from "@/utils/db";
 import { runs, jobs, reports } from "@/db/schema";
 import { eq, and, sql, inArray } from "drizzle-orm";
 import { getS3FileContentFromUrl, getS3FileContent } from "@/lib/s3-proxy";
+import { requireAuthContext } from "@/lib/auth-context";
 
 
 interface AnalyzeJobRequest {
@@ -58,6 +59,7 @@ export async function POST(request: NextRequest) {
 
     // Step 2: Authentication and authorization
     const session = await AuthService.validateUserAccess(request, runId);
+    const authContext = await requireAuthContext();
 
     // Step 3: Rate limiting check
     const headersList = await headers();
@@ -75,6 +77,18 @@ export async function POST(request: NextRequest) {
 
     // Step 4: Check subscription and AI credits in cloud mode
     const activeOrg = await getActiveOrganization();
+    if (!activeOrg) {
+      return NextResponse.json(
+        { success: false, reason: "organization_required", message: "Select an organization before using AI features." },
+        { status: 400 },
+      );
+    }
+    if (activeOrg.id !== authContext.organizationId) {
+      return NextResponse.json(
+        { success: false, reason: "organization_mismatch", message: "Organization changed. Refresh and try again." },
+        { status: 403 },
+      );
+    }
     if (activeOrg) {
       const { subscriptionService } = await import("@/lib/services/subscription-service");
       
@@ -96,29 +110,14 @@ export async function POST(request: NextRequest) {
         );
       }
 
-      // Atomically consume AI credit
-      const creditResult = await usageTracker.consumeAICredit(activeOrg.id, "ai_analyze");
-      if (!creditResult.allowed) {
-        return NextResponse.json(
-          {
-            success: false,
-            reason: "ai_credits_exhausted",
-            message: creditResult.reason,
-            guidance: "Upgrade your plan for more AI credits or wait until your next billing cycle.",
-            usage: {
-              used: creditResult.used,
-              limit: creditResult.limit,
-            },
-          },
-          { status: 429 }
-        );
-      }
+
     }
 
     // Step 5: Fetch run data with report
     const runResult = await db
       .select({
         id: runs.id,
+        projectId: runs.projectId,
         jobId: runs.jobId,
         status: runs.status,
         durationMs: runs.durationMs,
@@ -137,12 +136,12 @@ export async function POST(request: NextRequest) {
           inArray(reports.entityType, ["job", "k6_job"])
         )
       )
-      .where(eq(runs.id, runId))
+      .where(and(eq(runs.id, runId), eq(runs.projectId, authContext.project.id)))
       .limit(1);
 
     const run = runResult[0];
 
-    if (!run) {
+    if (!run || run.projectId !== authContext.project.id) {
       return NextResponse.json(
         { success: false, message: "Run not found" },
         { status: 404 }
@@ -160,12 +159,32 @@ export async function POST(request: NextRequest) {
         .then((rows) => rows[0]);
 
       // Verify job belongs to user's organization
-      if (activeOrg && jobData && jobData.organizationId !== activeOrg.id) {
+      if (!jobData || jobData.organizationId !== authContext.organizationId) {
         return NextResponse.json(
           { success: false, message: "Run not found" },
           { status: 404 }
         );
       }
+    }
+
+    // Atomically consume AI credit
+    const creditResult = await usageTracker.consumeAICredit(activeOrg.id, "ai_analyze");
+    if (!creditResult.allowed) {
+      return NextResponse.json(
+        {
+          success: false,
+          reason: creditResult.status === 503 ? "billing_unavailable" : "ai_credits_exhausted",
+          message: creditResult.reason,
+          guidance: creditResult.status === 503
+              ? "Billing is temporarily unavailable. Please try again shortly."
+              : "Upgrade your plan for more AI credits or wait until your next billing cycle.",
+          usage: {
+            used: creditResult.used,
+            limit: creditResult.limit,
+          },
+        },
+        { status: creditResult.status ?? 429 }
+      );
     }
 
     // Step 7: For Playwright jobs, fetch HTML report if available

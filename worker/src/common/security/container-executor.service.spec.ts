@@ -7,6 +7,8 @@ import {
   ContainerExecutorService,
 } from './container-executor.service';
 import { CancellationService } from '../services/cancellation.service';
+import { EventEmitter } from 'events';
+import { PassThrough, Writable } from 'stream';
 
 const defaultOptions: ContainerExecutionOptions = {
   inlineScriptContent: 'console.log("hello")',
@@ -62,9 +64,64 @@ describe('ContainerExecutorService', () => {
 
   describe('backend configuration', () => {
     it('initializes kubernetes clients on startup', async () => {
-      const ensureClients = jest.spyOn(service as any, 'ensureKubernetesClients');
+      const ensureClients = jest.spyOn(
+        service as any,
+        'ensureKubernetesClients',
+      );
       await service.onModuleInit();
       expect(ensureClients).toHaveBeenCalled();
+    });
+
+    it('bounds execution pod ephemeral storage and tmp volume size', () => {
+      const manifest = (service as any).buildExecutionJob({
+        jobName: 'sc-exec-test',
+        workspace: '/tmp/supercheck/run-test',
+        shellScript: 'node test.js',
+        workingDir: '/tmp',
+        limits: {
+          timeoutMs: 30000,
+          memoryLimitMb: 512,
+          cpuLimit: 0.5,
+        },
+        options: {
+          ...defaultOptions,
+          runId: '018f0000-0000-7000-8000-000000000001',
+        },
+      });
+
+      const container = manifest.spec.template.spec.containers[0];
+      expect(container.resources.requests['ephemeral-storage']).toBe('1Gi');
+      expect(container.resources.limits['ephemeral-storage']).toBe('8Gi');
+      expect(manifest.spec.template.spec.volumes).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            name: 'tmp',
+            emptyDir: { sizeLimit: '8Gi' },
+          }),
+        ]),
+      );
+    });
+
+    it('fails startup when ephemeral storage exceeds the admission ceiling', () => {
+      expect(
+        () =>
+          new ContainerExecutorService(
+            {
+              get: jest.fn((key: string, defaultValue?: string) => {
+                const config: Record<string, string> = {
+                  WORKER_IMAGE: 'ghcr.io/supercheck-io/worker:test',
+                  EXECUTION_EPHEMERAL_STORAGE_LIMIT: '11Gi',
+                  EXECUTION_MAX_EPHEMERAL_STORAGE_LIMIT: '10Gi',
+                };
+                return config[key] ?? defaultValue;
+              }),
+            } as any,
+            {
+              isCancelled: jest.fn().mockResolvedValue(false),
+              clearCancellationSignal: jest.fn().mockResolvedValue(undefined),
+            } as any,
+          ),
+      ).toThrow('EXECUTION_EPHEMERAL_STORAGE_LIMIT (11Gi) exceeds');
     });
   });
 
@@ -117,7 +174,9 @@ describe('ContainerExecutorService', () => {
       });
 
       expect(result.success).toBe(false);
-      expect(result.error).toContain('must stay within the execution workspace');
+      expect(result.error).toContain(
+        'must stay within the execution workspace',
+      );
     });
 
     it('rejects extractFromContainer without extractToHost', async () => {
@@ -165,6 +224,23 @@ describe('ContainerExecutorService', () => {
       expect(result.stderr).toContain('exceeds maximum');
     });
 
+    it('rejects resources above the shipped execution LimitRange', () => {
+      expect(
+        service.validateResourceLimits({
+          memoryLimitMb: 3435,
+          cpuLimit: 1,
+          timeoutMs: 30_000,
+        }),
+      ).toMatchObject({ valid: false });
+      expect(
+        service.validateResourceLimits({
+          memoryLimitMb: 512,
+          cpuLimit: 2.1,
+          timeoutMs: 30_000,
+        }),
+      ).toMatchObject({ valid: false });
+    });
+
     it('rejects non-finite resource limits', async () => {
       const result = await service.executeInContainer(null, ['node'], {
         ...defaultOptions,
@@ -176,7 +252,116 @@ describe('ContainerExecutorService', () => {
     });
   });
 
+  describe('Kubernetes exec socket lifecycle', () => {
+    it('resolves immediately when the socket closed before listeners attached', async () => {
+      const socket = Object.assign(new EventEmitter(), {
+        readyState: 3,
+        close: jest.fn(),
+      });
+
+      await expect(
+        (service as any).waitForExecSocket(socket, 'short exec'),
+      ).resolves.toBeUndefined();
+    });
+
+    it('waits for a close event from an open socket', async () => {
+      const socket = Object.assign(new EventEmitter(), {
+        readyState: 1,
+        close: jest.fn(),
+      });
+      const completion = (service as any).waitForExecSocket(
+        socket,
+        'streaming exec',
+      );
+
+      socket.readyState = 3;
+      socket.emit('close');
+
+      await expect(completion).resolves.toBeUndefined();
+    });
+
+    it('uses the configured artifact socket timeout for tar capture', async () => {
+      const configuredService = new ContainerExecutorService(
+        {
+          get: jest.fn((key: string, defaultValue?: string) => {
+            const config: Record<string, string> = {
+              WORKER_IMAGE: 'ghcr.io/supercheck-io/worker:test',
+              EXECUTION_ARTIFACT_SOCKET_TIMEOUT_MS: '123456',
+            };
+            return config[key] ?? defaultValue;
+          }),
+        } as any,
+        {
+          isCancelled: jest.fn().mockResolvedValue(false),
+          clearCancellationSignal: jest.fn().mockResolvedValue(undefined),
+        } as any,
+      );
+      const socket = Object.assign(new EventEmitter(), {
+        readyState: 3,
+        close: jest.fn(),
+      });
+      (configuredService as any).execClient = {
+        exec: jest.fn().mockResolvedValue(socket),
+      };
+      const waitForExecSocket = jest.spyOn(
+        configuredService as any,
+        'waitForExecSocket',
+      );
+
+      await expect(
+        (configuredService as any).capturePodTarStream(
+          'execution-pod',
+          '/tmp/supercheck/run-test/report',
+        ),
+      ).resolves.toEqual(Buffer.alloc(0));
+      expect(waitForExecSocket).toHaveBeenCalledWith(
+        socket,
+        'artifact extraction from pod execution-pod',
+        123456,
+      );
+    });
+  });
+
   describe('kubernetes execution', () => {
+    it.each([false, true])(
+      'uses the complete snapshot over replayed logs, retaining the buffer on fetch failure=%s',
+      async (snapshotFails) => {
+        service['batchApi'] = {
+          createNamespacedJob: jest
+            .fn()
+            .mockResolvedValue({ metadata: { uid: 'job-uid' } }),
+        } as unknown as NonNullable<(typeof service)['batchApi']>;
+        service['createExecutionSecret'] = jest
+          .fn()
+          .mockResolvedValue(undefined);
+        service['waitForExecutionPod'] = jest.fn().mockResolvedValue('pod');
+        service['waitForExecutionOutcome'] = jest.fn().mockResolvedValue({
+          exitCode: 0,
+          timedOut: false,
+          cancelled: false,
+        });
+        service['startLogStreamWithReconnect'] = jest.fn(
+          (_pod: string, sink: Writable) => {
+            sink.write('line\nline\n');
+            return new AbortController();
+          },
+        );
+        service['signalExecutionExit'] = jest.fn().mockResolvedValue(undefined);
+        service['deleteExecutionJob'] = jest.fn().mockResolvedValue(undefined);
+        const snapshot = jest.fn().mockResolvedValue('line\n');
+        service['fetchPodLogsSnapshot'] = snapshot;
+        if (snapshotFails)
+          snapshot.mockRejectedValue(new Error('snapshot unavailable'));
+        const result = await service.executeInContainer(
+          null,
+          ['node'],
+          defaultOptions,
+        );
+        expect(result.success).toBe(true);
+        expect(result.stdout).toBe(snapshotFails ? 'line\nline\n' : 'line\n');
+      },
+    );
+
     it('delegates valid executions to the kubernetes backend', async () => {
       const executeInKubernetes = jest
         .spyOn(service as any, 'executeInKubernetes')
@@ -265,7 +450,13 @@ describe('ContainerExecutorService', () => {
           ...defaultOptions,
           _workspace: '/tmp/supercheck/run-456',
         } as any,
-        ['k6', 'run', '--out', 'json=/tmp/k6-output/metrics.json', '/tmp/test.js'],
+        [
+          'k6',
+          'run',
+          '--out',
+          'json=/tmp/k6-output/metrics.json',
+          '/tmp/test.js',
+        ],
       );
 
       expect(script).toContain(
@@ -284,12 +475,87 @@ describe('ContainerExecutorService', () => {
       );
 
       expect(script).toContain(
-        "ln -s \"$PWD/node_modules\" '/tmp/supercheck/run-789/node_modules'",
+        'ln -s "$PWD/node_modules" \'/tmp/supercheck/run-789/node_modules\'',
       );
     });
   });
 
   describe('job spec building', () => {
+    it('mounts payload/runtime Secrets without exposing secret values in the Job', () => {
+      const job = (service as any).buildExecutionJob({
+        jobName: 'sc-exec-secure-payload',
+        workspace: '/tmp/supercheck/run-123',
+        workingDir: '/worker',
+        limits: {
+          valid: true,
+          memoryLimitMb: 512,
+          cpuLimit: 0.5,
+          timeoutMs: 30000,
+        },
+        options: {
+          ...defaultOptions,
+          env: {
+            PUBLIC_SETTING: 'visible',
+            SUPERCHECK_SECRETS_B64: 'plaintext-secret-material',
+          },
+        },
+        payloadSecretNames: [
+          'sc-exec-secure-payload-payload-0',
+          'sc-exec-secure-payload-payload-1',
+        ],
+        runtimeSecretName: 'sc-exec-secure-payload-runtime',
+      });
+
+      const podSpec = job.spec.template.spec;
+      const container = podSpec.containers[0];
+      const serializedJob = JSON.stringify(job);
+      const bootstrapScript = container.command[2] as string;
+
+      expect(podSpec.serviceAccountName).toBe('execution-runner');
+      expect(podSpec.automountServiceAccountToken).toBe(false);
+      expect(container.env).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ name: 'PUBLIC_SETTING', value: 'visible' }),
+        ]),
+      );
+      expect(container.env).not.toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ name: 'SUPERCHECK_SECRETS_B64' }),
+        ]),
+      );
+      expect(podSpec.volumes).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            name: 'runtime-secrets',
+            secret: expect.objectContaining({
+              secretName: 'sc-exec-secure-payload-runtime',
+            }),
+          }),
+          expect.objectContaining({
+            name: 'payload-0',
+            secret: expect.objectContaining({
+              secretName: 'sc-exec-secure-payload-payload-0',
+            }),
+          }),
+        ]),
+      );
+      expect(serializedJob).not.toContain('plaintext-secret-material');
+      expect(bootstrapScript).toContain("mkdir -p '/tmp/supercheck/run-123'");
+      expect(bootstrapScript.indexOf('mkdir -p')).toBeLessThan(
+        bootstrapScript.indexOf('cat '),
+      );
+    });
+
+    it('uses a unique Kubernetes Job name for each attempt of the same run', () => {
+      const runId = '018f0000-0000-7000-8000-000000000001';
+      const first = (service as any).buildExecutionJobName(runId);
+      const second = (service as any).buildExecutionJobName(runId);
+
+      expect(first).toMatch(/^sc-exec-[a-f0-9]{16}-[a-f0-9]{8}$/);
+      expect(second).toMatch(/^sc-exec-[a-f0-9]{16}-[a-f0-9]{8}$/);
+      expect(second).not.toBe(first);
+    });
+
     it('does not hardcode node placement by default', () => {
       const job = (service as any).buildExecutionJob({
         jobName: 'sc-exec-test',
@@ -366,8 +632,8 @@ describe('ContainerExecutorService', () => {
         '/tmp/supercheck/run-123/.supercheck-exit-now',
       );
 
-      expect(script).toContain(".supercheck-exit-code");
-      expect(script).toContain(".supercheck-exit-now");
+      expect(script).toContain('.supercheck-exit-code');
+      expect(script).toContain('.supercheck-exit-now');
       expect(script).toContain('DEADLINE=$(( $(date +%s) + 300 ))');
       expect(script).toContain('while [ ! -f');
       expect(script).not.toContain('while true; do sleep 5; done');
@@ -518,6 +784,125 @@ describe('ContainerExecutorService', () => {
   });
 
   describe('log collection', () => {
+    beforeEach(() => jest.useFakeTimers());
+    afterEach(() => jest.useRealTimers());
+
+    it('keeps the first successful stream complete after startup retries', async () => {
+      const forward = jest.fn();
+      const collector = service['createLogCollector']({
+        onStdoutChunk: forward,
+      });
+      const log = jest
+        .fn()
+        .mockRejectedValueOnce(new Error('HTTP-Code: 400'))
+        .mockImplementationOnce(
+          (_namespace, _pod, _container, sink: Writable) => {
+            sink.write('first execution line\n');
+            return Promise.resolve(new AbortController());
+          },
+        );
+      service['logClient'] = { log } as unknown as NonNullable<
+        (typeof service)['logClient']
+      >;
+      const controller = service['startLogStreamWithReconnect'](
+        'pod',
+        collector.stream,
+        'job',
+      );
+      await jest.advanceTimersByTimeAsync(2_000);
+      expect(log).toHaveBeenCalledTimes(2);
+      expect(log.mock.calls[1][4]).not.toHaveProperty('sinceSeconds');
+      expect(forward).toHaveBeenCalledWith('first execution line\n');
+      controller.abort();
+    });
+
+    it.each(['close', 'error'])(
+      'reconnects on response %s without ending the collector',
+      async (event) => {
+        const collector = service['createLogCollector']({});
+        const sources: PassThrough[] = [];
+        const requests: AbortController[] = [];
+        const log = jest
+          .fn()
+          .mockImplementation(
+            (_namespace, _pod, _container, sink: Writable) => {
+              const source = new PassThrough();
+              const request = new AbortController();
+              sources.push(source);
+              requests.push(request);
+              source.pipe(sink);
+              return Promise.resolve(request);
+            },
+          );
+        service['logClient'] = { log } as unknown as NonNullable<
+          (typeof service)['logClient']
+        >;
+        const controller = service['startLogStreamWithReconnect'](
+          'pod',
+          collector.stream,
+          'job',
+        );
+        await jest.advanceTimersByTimeAsync(0);
+        sources[0].write('before disconnect\n');
+        if (event === 'error')
+          sources[0].emit('error', new Error('ECONNRESET'));
+        else sources[0].end();
+        await jest.advanceTimersByTimeAsync(2_000);
+        expect(log).toHaveBeenCalledTimes(2);
+        expect(collector.stream.writableEnded).toBe(false);
+        expect(requests[0].signal.aborted).toBe(true);
+        expect(log.mock.calls[1][4]).toMatchObject({ sinceSeconds: 5 });
+        sources[1].write('after reconnect\n');
+        expect(collector.getOutput()).toBe(
+          'before disconnect\nafter reconnect\n',
+        );
+        controller.abort();
+      },
+    );
+
+    it('aborts a request that becomes ready after execution cleanup', async () => {
+      const collector = service['createLogCollector']({});
+      let ready!: (request: AbortController) => void;
+      const log = jest.fn().mockReturnValue(
+        new Promise<AbortController>((resolve) => {
+          ready = resolve;
+        }),
+      );
+      service['logClient'] = { log } as unknown as NonNullable<
+        (typeof service)['logClient']
+      >;
+      const controller = service['startLogStreamWithReconnect'](
+        'pod',
+        collector.stream,
+        'job',
+      );
+      controller.abort();
+      const request = new AbortController();
+      ready(request);
+      await jest.advanceTimersByTimeAsync(10_000);
+      expect(request.signal.aborted).toBe(true);
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(jest.getTimerCount()).toBe(0);
+    });
+
+    it('cancels a pending reconnect when execution cleanup aborts', async () => {
+      const collector = service['createLogCollector']({});
+      const log = jest.fn().mockRejectedValue(new Error('HTTP-Code: 400'));
+      service['logClient'] = { log } as unknown as NonNullable<
+        (typeof service)['logClient']
+      >;
+      const controller = service['startLogStreamWithReconnect'](
+        'pod',
+        collector.stream,
+        'job',
+      );
+      await jest.advanceTimersByTimeAsync(0);
+      controller.abort();
+      expect(jest.getTimerCount()).toBe(0);
+      await jest.advanceTimersByTimeAsync(10_000);
+      expect(log).toHaveBeenCalledTimes(1);
+    });
+
     it('suppresses live forwarding during replay windows', async () => {
       const onStdoutChunk = jest.fn();
       const collector = (service as any).createLogCollector({

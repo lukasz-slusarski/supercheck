@@ -9,7 +9,7 @@ info:
     name: Supercheck
     url: https://supercheck.io
   license:
-    name: AGPL-3.0
+    name: AGPL-3.0-only
     url: https://github.com/supercheck-io/supercheck/blob/main/LICENSE
 servers:
   - url: https://demo.supercheck.dev
@@ -41,11 +41,359 @@ tags:
     description: Alert history
   - name: Audit
     description: Audit log access
+  - name: AI SRE
+    description: Project-scoped incident response, investigation, Copilot, and
+      service topology
   - name: System
     description: Health checks and metadata
   - name: Status Pages
     description: Manage status pages for uptime dashboards
+  - name: Organizations
+    description: Organization membership, settings, invitations, and usage stats.
+      Session cookies or CLI bearer tokens are accepted. Organizations are
+      created automatically at signup; POST is disabled.
 paths:
+  /api/sre/incidents:
+    get:
+      operationId: listSreIncidents
+      summary: List AI SRE incidents
+      tags:
+        - AI SRE
+      parameters:
+        - name: incidentNumber
+          in: query
+          description: Resolve an incident number within the authenticated organization
+            and project.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 2147483647
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum:
+              - triggered
+              - investigating
+              - identified
+              - recommendations_ready
+              - user_applying_fix
+              - verifying
+              - resolved
+        - name: severity
+          in: query
+          schema:
+            type: string
+            enum:
+              - sev1
+              - sev2
+              - sev3
+              - sev4
+      responses:
+        "200":
+          description: Tenant-scoped incident list
+        "400":
+          description: Invalid filters
+        "401":
+          description: Authentication required
+        "403":
+          description: Insufficient permission
+  /api/sre/incidents/{id}:
+    get:
+      operationId: getSreIncident
+      summary: Get an AI SRE incident
+      tags:
+        - AI SRE
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Incident details
+        "404":
+          description: Incident not found in the active project
+  /api/sre/incidents/{id}/timeline:
+    get:
+      operationId: getSreIncidentTimeline
+      summary: Get an incident timeline
+      tags:
+        - AI SRE
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Chronological incident timeline
+        "404":
+          description: Incident not found in the active project
+  /api/sre/incidents/{id}/resolve:
+    post:
+      operationId: resolveSreIncident
+      summary: Resolve an incident with an audit comment
+      tags:
+        - AI SRE
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - comment
+              properties:
+                comment:
+                  type: string
+                  minLength: 1
+                  maxLength: 2000
+      responses:
+        "200":
+          description: Incident resolved; timeline and audit events recorded
+        "400":
+          description: Invalid ID or comment
+        "403":
+          description: Insufficient permission
+        "404":
+          description: Incident not found in the active project
+  /api/sre/triage:
+    post:
+      operationId: triageSreIncident
+      summary: Run AI incident triage
+      tags:
+        - AI SRE
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - incidentId
+              properties:
+                incidentId:
+                  type: string
+                  format: uuid
+      responses:
+        "200":
+          description: Triage result
+        "429":
+          description: Rate limited
+        "503":
+          description: Feature disabled or temporarily unavailable
+  /api/sre/investigate:
+    post:
+      operationId: startSreInvestigation
+      summary: Start an asynchronous deep investigation
+      description: Returns a durable investigationRunId before background execution
+        finishes. Poll the incident details to review the run status and saved
+        result. Live connectors require explicit opt-in and connector
+        investigation permission.
+      tags:
+        - AI SRE
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - incidentId
+              properties:
+                incidentId:
+                  type: string
+                  format: uuid
+                useLiveConnectors:
+                  type: boolean
+                  default: false
+      responses:
+        "202":
+          description: Investigation accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - success
+                  - accepted
+                  - investigationRunId
+                properties:
+                  success:
+                    type: boolean
+                    const: true
+                  accepted:
+                    type: boolean
+                    const: true
+                  investigationRunId:
+                    type: string
+                    format: uuid
+        "400":
+          description: Invalid investigation request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+        "401":
+          description: Authentication required
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+        "402":
+          description: Execution access denied
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+        "403":
+          description: Insufficient permissions or invalid request origin
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+        "404":
+          description: Incident not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+        "409":
+          description: An investigation is already running for this incident
+        "429":
+          description: Rate limited
+        "503":
+          description: Feature disabled or temporarily unavailable
+  /api/sre/chat:
+    post:
+      operationId: streamSreChat
+      summary: Stream a read-only Copilot conversation
+      tags:
+        - AI SRE
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - message
+              properties:
+                message:
+                  type: string
+                  minLength: 1
+                  maxLength: 4000
+                incidentId:
+                  type:
+                    - string
+                    - "null"
+                  format: uuid
+                conversationId:
+                  type:
+                    - string
+                    - "null"
+                  format: uuid
+                useLiveConnectorTools:
+                  type: boolean
+                  default: true
+                  description: Read-only live connectors are enabled by default when authorized.
+                    Set false to use conversation text and stored incident
+                    evidence only. General chat uses selected project services;
+                    incident chat stays scoped to its linked service.
+      responses:
+        "200":
+          description: Server-sent event stream
+        "429":
+          description: Rate limited
+  /api/sre/evidence-brief/stream:
+    post:
+      operationId: streamSreEvidenceBrief
+      summary: Generate and stream an incident evidence brief
+      tags:
+        - AI SRE
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - incidentId
+              properties:
+                incidentId:
+                  type: string
+                  format: uuid
+      responses:
+        "200":
+          description: Server-sent event stream
+        "429":
+          description: Rate limited
+  /api/sre/services:
+    get:
+      operationId: listSreServices
+      summary: List AI SRE services
+      tags:
+        - AI SRE
+      responses:
+        "200":
+          description: Tenant-scoped service catalog
+        "403":
+          description: Insufficient permission
+  /api/sre/services/{id}:
+    get:
+      operationId: getSreService
+      summary: Get service details, health, and dependencies
+      tags:
+        - AI SRE
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Service, latest health snapshot, and dependency edges
+        "404":
+          description: Service not found in the active project
   /api/health:
     get:
       operationId: getHealth
@@ -113,13 +461,81 @@ paths:
                             type: integer
                           error:
                             type: string
+                  build:
+                    type: object
+                    properties:
+                      revision:
+                        type: string
+                    required:
+                      - revision
                 required:
                   - status
                   - timestamp
                   - latencyMs
                   - checks
+                  - build
         "503":
-          description: Service unavailable — one or more required services unhealthy
+          description: Service unhealthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum:
+                      - ok
+                      - degraded
+                      - unhealthy
+                  timestamp:
+                    type: string
+                    format: date-time
+                  latencyMs:
+                    type: integer
+                  checks:
+                    type: object
+                    properties:
+                      database:
+                        type: object
+                        properties:
+                          status:
+                            type: string
+                            enum:
+                              - ok
+                              - error
+                          latencyMs:
+                            type: integer
+                          error:
+                            type: string
+                      redis:
+                        type: object
+                        properties:
+                          status:
+                            type: string
+                            enum:
+                              - ok
+                              - error
+                          latencyMs:
+                            type: integer
+                          error:
+                            type: string
+                      s3:
+                        type: object
+                        properties:
+                          status:
+                            type: string
+                            enum:
+                              - ok
+                              - error
+                          latencyMs:
+                            type: integer
+                          error:
+                            type: string
+                required:
+                  - status
+                  - timestamp
+                  - latencyMs
+                  - checks
   /api/locations:
     get:
       operationId: listLocations
@@ -314,7 +730,7 @@ paths:
         - Jobs
       parameters:
         - $ref: "#/components/parameters/Page"
-        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/JobLimit"
       responses:
         "200":
           description: Paginated list of jobs
@@ -355,7 +771,7 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
         "402":
-          description: Active subscription required
+          description: Access denied by deployment policy
         "403":
           $ref: "#/components/responses/Forbidden"
   /api/jobs/{id}:
@@ -439,6 +855,35 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+    put:
+      operationId: replaceJobConfiguration
+      summary: Update a job configuration
+      description: Update job configuration. Only provided fields are changed. PUT is
+        retained for CLI deploy and backward compatibility; interactive partial
+        updates should prefer PATCH.
+      tags:
+        - Jobs
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JobUpdateRequest"
+      responses:
+        "200":
+          description: Job updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobUpdateResponse"
+        "400":
+          description: Invalid job update payload
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
   /api/jobs/{id}/trigger:
     parameters:
       - name: id
@@ -454,7 +899,10 @@ paths:
       description: "Trigger a job run using a job-scoped trigger key in the
         `Authorization: Bearer <trigger-key>` header. For k6 jobs, an optional
         `location` query parameter can target an enabled location code or
-        `global` for unrestricted any-worker routing."
+        `global` for unrestricted any-worker routing. Note: this endpoint only
+        accepts a job trigger key (`sck_trigger_*` / legacy `job_*`) in the
+        `Authorization` header. CLI tokens (`sck_live_*`) are rejected with
+        401."
       tags:
         - Jobs
       parameters:
@@ -479,7 +927,7 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
         "402":
-          description: Active subscription required
+          description: Access denied by deployment policy
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
@@ -571,7 +1019,6 @@ paths:
                   enum:
                     - manual
                     - remote
-                    - schedule
                   description: Requested trigger source. CLI-authenticated calls are normalized to
                     `remote` by the server.
                 location:
@@ -607,7 +1054,7 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
         "402":
-          description: Active subscription required
+          description: Access denied by deployment policy
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
@@ -787,7 +1234,7 @@ paths:
         - Runs
       parameters:
         - $ref: "#/components/parameters/Page"
-        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/RunLimit"
         - name: jobId
           in: query
           schema:
@@ -1070,9 +1517,16 @@ paths:
                     `performance`"
                 description:
                   type: string
+                priority:
+                  type: string
+                  enum:
+                    - low
+                    - medium
+                    - high
+                    - critical
+                  default: medium
               required:
                 - title
-                - script
       responses:
         "201":
           description: Test created
@@ -1188,6 +1642,46 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           description: Test is in use by jobs or synthetic monitors and cannot be deleted
+    put:
+      operationId: updateTestLegacyPut
+      summary: Update a test using the legacy PUT alias
+      description: Update test title, script, description, or type. PUT is retained
+        for CLI deploy and backward compatibility; interactive partial updates
+        should prefer PATCH.
+      tags:
+        - Tests
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title:
+                  type: string
+                script:
+                  type: string
+                description:
+                  type: string
+                type:
+                  type: string
+                  enum:
+                    - browser
+                    - api
+                    - performance
+                    - database
+                    - custom
+      responses:
+        "200":
+          description: Test updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Test"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
   /api/tests/{id}/tags:
     parameters:
       - name: id
@@ -1338,8 +1832,14 @@ paths:
                     type: string
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "402":
+          description: Execution access denied
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "429":
+          description: Execution rate limit exceeded
   /api/monitors:
     get:
       operationId: listMonitors
@@ -1349,7 +1849,7 @@ paths:
         - Monitors
       parameters:
         - $ref: "#/components/parameters/Page"
-        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/MonitorLimit"
       responses:
         "200":
           description: Paginated list of monitors
@@ -1389,10 +1889,37 @@ paths:
           description: Invalid monitor payload
         "401":
           $ref: "#/components/responses/Unauthorized"
-        "402":
-          description: Active subscription required
         "403":
           $ref: "#/components/responses/Forbidden"
+    put:
+      operationId: updateMonitorByBodyId
+      summary: Update a monitor (collection PUT)
+      description: Compatibility update that requires `id` in the JSON body. Prefer
+        `PATCH /api/monitors/{id}` or `PUT /api/monitors/{id}` for new
+        integrations. The monitor must belong to the current project.
+      tags:
+        - Monitors
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MonitorCollectionUpdateRequest"
+      responses:
+        "200":
+          description: Monitor updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Monitor"
+        "400":
+          description: Monitor ID missing or invalid payload
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
   /api/monitors/{id}:
     parameters:
       - name: id
@@ -1467,6 +1994,35 @@ paths:
                 required:
                   - success
                   - message
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      operationId: replaceMonitorConfiguration
+      summary: Update a monitor configuration
+      description: Update monitor configuration. Only provided fields are changed. PUT
+        is retained for CLI deploy and backward compatibility; interactive
+        partial updates should prefer PATCH.
+      tags:
+        - Monitors
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MonitorUpdateRequest"
+      responses:
+        "200":
+          description: Monitor updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Monitor"
+        "400":
+          description: Invalid monitor update payload
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -1554,9 +2110,9 @@ paths:
     get:
       operationId: listVariables
       summary: List variables
-      description: List all project variables for the current project. Secret
-        values are redacted in the response. File-type variables include metadata
-        such as type, fileName, fileSize, and mimeType.
+      description: List all project variables for the current project. Secret values
+        are redacted in the response. File-type variables include metadata such
+        as type, fileName, fileSize, and mimeType.
       tags:
         - Variables
       responses:
@@ -1573,9 +2129,9 @@ paths:
     post:
       operationId: createVariable
       summary: Create a variable
-      description: Create a new text or secret project variable. File-type
-        variables are managed through the project UI upload workflow rather than
-        this public JSON endpoint.
+      description: Create a new text or secret project variable. File-type variables
+        are managed through the project UI upload workflow rather than this
+        public JSON endpoint.
       tags:
         - Variables
       requestBody:
@@ -1638,9 +2194,9 @@ paths:
     put:
       operationId: updateVariable
       summary: Update a variable
-      description: Update an existing text or secret variable's key, value,
-        secret flag, or description. File-type variables must be managed through
-        the project UI upload workflow.
+      description: Update an existing text or secret variable's key, value, secret
+        flag, or description. File-type variables must be managed through the
+        project UI upload workflow.
       tags:
         - Variables
       requestBody:
@@ -1752,6 +2308,66 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+    get:
+      operationId: getTag
+      summary: Get a tag
+      description: Return a single tag by ID.
+      tags:
+        - Tags
+      responses:
+        "200":
+          description: Tag
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Tag"
+        "400":
+          description: Tag ID is required
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          description: Internal server error
+    put:
+      operationId: updateTag
+      summary: Update a tag
+      description: Rename a tag or change its color.
+      tags:
+        - Tags
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+                color:
+                  type: string
+                  nullable: true
+      responses:
+        "200":
+          description: Updated tag
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Tag"
+        "400":
+          description: Tag name is required
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          description: Internal server error
   /api/notification-providers:
     get:
       operationId: listNotificationProviders
@@ -1963,6 +2579,65 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "500":
           description: Failed to fetch alert history
+    post:
+      operationId: createAlertHistory
+      summary: Create an alert history entry
+      description: Record an alert event (for example a manually created failure or
+        recovery signal). Requires monitor manage permission.
+      tags:
+        - Alerts
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - type
+                - message
+                - target
+                - targetType
+                - provider
+              properties:
+                type:
+                  type: string
+                message:
+                  type: string
+                target:
+                  type: string
+                targetType:
+                  type: string
+                provider:
+                  type: string
+                status:
+                  type: string
+                  nullable: true
+                monitorId:
+                  type: string
+                  format: uuid
+                  nullable: true
+                jobId:
+                  type: string
+                  format: uuid
+                  nullable: true
+                errorMessage:
+                  type: string
+                  nullable: true
+      responses:
+        "201":
+          description: Alert history entry created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AlertHistoryEntry"
+        "400":
+          description: Missing required fields
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Internal server error
   /api/audit:
     get:
       operationId: getAuditLogs
@@ -2043,6 +2718,44 @@ paths:
           description: Subdomain parameter is required
         "404":
           $ref: "#/components/responses/NotFound"
+    post:
+      operationId: checkStatusPageSubdomainPost
+      summary: Check status page subdomain (POST)
+      description: Verify a status page subdomain is published and return its ID.
+        Public endpoint (no authentication required).
+      tags:
+        - Status Pages
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - subdomain
+              properties:
+                subdomain:
+                  type: string
+      responses:
+        "200":
+          description: Status page lookup
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+        "400":
+          description: Invalid request
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          description: Internal server error
   /api/status-pages/{id}:
     parameters:
       - name: id
@@ -2220,13 +2933,834 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "500":
           description: Validation service error
+  /api/monitors/{id}/status:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Monitor ID
+    patch:
+      operationId: updateMonitorStatus
+      summary: Update monitor status
+      description: Pause, resume, or otherwise set a monitor's status (for example
+        `paused` or `maintenance`). Requires monitor manage or update
+        permission. Automated status changes from checks are handled separately.
+        Read current monitor status with `GET /api/monitors/{id}`; this route
+        does not support GET.
+      tags:
+        - Monitors
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - status
+              properties:
+                status:
+                  type: string
+                  enum:
+                    - up
+                    - down
+                    - paused
+                    - pending
+                    - maintenance
+                    - error
+      responses:
+        "200":
+          description: Monitor status updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  id:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+                    enum:
+                      - up
+                      - down
+                      - paused
+                      - pending
+                      - maintenance
+                      - error
+                  updatedAt:
+                    type: string
+                    format: date-time
+        "400":
+          description: Invalid status value
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          description: Internal server error
+  /api/monitors/{id}/notifications:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Monitor ID
+    get:
+      operationId: getMonitorNotifications
+      summary: List monitor notification links
+      description: Return the notification providers linked to a monitor.
+      tags:
+        - Monitors
+      responses:
+        "200":
+          description: Linked notification providers
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/MonitorNotificationLink"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          description: Internal server error
+    post:
+      operationId: createMonitorNotification
+      summary: Link a notification provider to a monitor
+      description: Attach a notification provider to a monitor. The provider must
+        belong to the same project as the monitor.
+      tags:
+        - Monitors
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - notificationProviderId
+              properties:
+                notificationProviderId:
+                  type: string
+                  format: uuid
+      responses:
+        "201":
+          description: Notification link created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MonitorNotificationLink"
+        "400":
+          description: Missing notification provider ID
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: Monitor or provider not found
+        "409":
+          description: Monitor already linked to this provider
+        "500":
+          description: Internal server error
+    delete:
+      operationId: deleteMonitorNotification
+      summary: Unlink a notification provider from a monitor
+      description: Remove a notification provider link from a monitor.
+      tags:
+        - Monitors
+      parameters:
+        - name: notificationProviderId
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Notification provider to unlink
+      responses:
+        "200":
+          description: Notification link removed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+        "400":
+          description: Missing notification provider ID
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          description: Internal server error
+  /api/monitors/{id}/permissions:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Monitor ID
+    get:
+      operationId: getMonitorPermissions
+      summary: Get monitor permissions
+      description: Return the current user's effective permissions for a monitor.
+      tags:
+        - Monitors
+      responses:
+        "200":
+          description: Effective permissions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MonitorPermissionsResponse"
+        "400":
+          description: Invalid monitor ID
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          description: Internal server error
+  /api/monitors/{id}/location-stats:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Monitor ID
+      - name: days
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 90
+          default: 7
+        description: Number of days to look back (1-90)
+    get:
+      operationId: getMonitorLocationStats
+      summary: Get monitor location stats
+      description: Return per-location aggregated statistics (uptime, response times)
+        for a monitor over the requested window.
+      tags:
+        - Monitors
+      responses:
+        "200":
+          description: Per-location statistics
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/MonitorLocationStats"
+        "400":
+          description: Days must be between 1 and 90
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          description: Internal server error
+  /api/status-pages/{id}/badge:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Status page ID
+    get:
+      operationId: getStatusPageBadge
+      summary: Get status page badge
+      description: Returns a public SVG status badge. Successful responses are cached
+        for five minutes.
+      tags:
+        - Status Pages
+      security: []
+      parameters:
+        - name: style
+          in: query
+          schema:
+            type: string
+            enum:
+              - flat
+              - flat-square
+            default: flat
+        - name: label
+          in: query
+          schema:
+            type: string
+            maxLength: 64
+            default: status
+      responses:
+        "200":
+          description: SVG status badge
+          content:
+            image/svg+xml:
+              schema:
+                type: string
+        "400":
+          description: Invalid status page ID
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          description: Failed to generate badge
+  /api/status-pages/{id}/ical:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Status page ID
+    get:
+      operationId: getStatusPageIcal
+      summary: Get status page calendar feed
+      description: Returns an RFC 5545 iCalendar feed for a published status page.
+      tags:
+        - Status Pages
+      security: []
+      responses:
+        "200":
+          description: iCalendar feed
+          content:
+            text/calendar:
+              schema:
+                type: string
+        "400":
+          description: Invalid status page ID
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          description: Failed to generate calendar feed
+  /api/organizations:
+    get:
+      operationId: listOrganizations
+      summary: Get assigned organization
+      description: "Returns the selected project's host organization, or the default
+        account organization when no project is selected. Users cannot create or
+        switch organizations directly; they can select projects from their
+        account and invited teams. The existing list response is preserved for
+        compatibility: data contains zero or one organization and
+        activeOrganizationId identifies that organization; it is not a directory
+        of all team memberships."
+      tags:
+        - Organizations
+      responses:
+        "200":
+          description: Organizations for the current user
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/OrganizationSummary"
+                  activeOrganizationId:
+                    type: string
+                    format: uuid
+                    nullable: true
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          description: Internal server error
+  /api/organizations/current:
+    get:
+      operationId: getCurrentOrganization
+      summary: Get the active organization
+      description: Returns the organization from the current auth context. Requires
+        org_admin or org_owner.
+      tags:
+        - Organizations
+      responses:
+        "200":
+          description: Active organization
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    $ref: "#/components/schemas/OrganizationCurrent"
+        "400":
+          description: No active organization found
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          description: Internal server error
+  /api/organizations/stats:
+    get:
+      operationId: getOrganizationStats
+      summary: Get organization usage stats
+      description: Counts of projects, jobs, tests, monitors, runs, and members for
+        the active organization. Requires org_admin or org_owner.
+      tags:
+        - Organizations
+      responses:
+        "200":
+          description: Organization stats
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    $ref: "#/components/schemas/OrganizationStats"
+        "400":
+          description: No active organization found
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Internal server error
+  /api/organizations/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Organization ID
+    get:
+      operationId: getOrganization
+      summary: Get organization details
+      description: Returns organization details, the caller's role, and project/member
+        counts. Requires membership.
+      tags:
+        - Organizations
+      responses:
+        "200":
+          description: Organization details
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  organization:
+                    $ref: "#/components/schemas/OrganizationDetail"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          description: Internal server error
+    put:
+      operationId: updateOrganization
+      summary: Update organization
+      description: Update the organization name (2–50 characters after trim). Optional
+        slug, logo, and metadata. Requires org_admin or org_owner. Browser
+        updates require a same-origin request; CLI tokens retain their existing
+        authorization.
+      tags:
+        - Organizations
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OrganizationUpdateRequest"
+      responses:
+        "200":
+          description: Organization updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  organization:
+                    type: object
+        "400":
+          description: Invalid organization name
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          description: Internal server error
+    delete:
+      operationId: deleteOrganization
+      summary: Delete organization
+      description: Owner only. Only empty organizations without protected dependencies
+        can be deleted. Selected browser session references are cleared
+        atomically. Organizations containing projects or protected dependencies
+        return 409; contact an administrator or support for safe removal.
+        Browser mutations require a same-origin request; CLI tokens retain their
+        existing authorization.
+      tags:
+        - Organizations
+      responses:
+        "200":
+          description: Organization deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Organization contains projects or protected dependencies; removal
+            requires administrator or support assistance.
+        "500":
+          description: Internal server error
+  /api/organizations/members:
+    get:
+      operationId: listOrganizationMembers
+      summary: List members and invitations
+      description: List members (with project assignments), pending/expired
+        invitations, and the current user's org role. Requires org_admin or
+        org_owner.
+      tags:
+        - Organizations
+      responses:
+        "200":
+          description: Members and invitations
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: object
+                    properties:
+                      members:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/OrganizationMember"
+                      invitations:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/OrganizationInvitation"
+                      currentUserRole:
+                        type: string
+        "400":
+          description: No active organization found
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Internal server error
+  /api/organizations/members/{memberId}:
+    parameters:
+      - name: memberId
+        in: path
+        required: true
+        schema:
+          type: string
+        description: User ID of the organization member
+    put:
+      operationId: updateOrganizationMember
+      summary: Update member role and projects
+      description: Update a member's role and project assignments. Cannot change the
+        owner, your own role, or (as org_admin) another org_admin. Only
+        org_owner can assign org_admin.
+      tags:
+        - Organizations
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OrganizationMemberUpdateRequest"
+      responses:
+        "200":
+          description: Member updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  data:
+                    type: object
+                    properties:
+                      memberId:
+                        type: string
+                      newRole:
+                        type: string
+                      oldRole:
+                        type: string
+        "400":
+          description: Invalid role or project assignments
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          description: Internal server error
+    delete:
+      operationId: removeOrganizationMember
+      summary: Remove a member
+      description: Remove a member and their project assignments in this organization.
+        Cannot remove the owner or yourself. Only org_owner can remove org_admin
+        members.
+      tags:
+        - Organizations
+      responses:
+        "200":
+          description: Member removed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  data:
+                    type: object
+                    properties:
+                      memberId:
+                        type: string
+                      removedRole:
+                        type: string
+        "400":
+          description: No active organization found
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          description: Internal server error
+  /api/organizations/members/invite:
+    post:
+      operationId: inviteOrganizationMember
+      summary: Invite a member
+      description: Create a pending invitation and send email. Rate limited per user
+        (`INVITE_RATE_LIMIT_MAX`, default 10/hour). Requires org_admin or
+        org_owner. Only org_owner can invite org_admin.
+      tags:
+        - Organizations
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OrganizationInviteRequest"
+      responses:
+        "200":
+          description: Invitation created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      email:
+                        type: string
+                      role:
+                        type: string
+                      status:
+                        type: string
+                      expiresAt:
+                        type: string
+                        format: date-time
+                      inviteLink:
+                        type: string
+                      emailSent:
+                        type: boolean
+        "400":
+          description: Invalid invite payload or user already a member
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          description: Rate limit exceeded
+        "500":
+          description: Internal server error
+  /api/organizations/members/invite/{invitationId}:
+    parameters:
+      - name: invitationId
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Invitation ID
+    delete:
+      operationId: cancelOrganizationInvitation
+      summary: Cancel an invitation
+      description: Cancel a pending invitation. Requires org_admin or org_owner.
+      tags:
+        - Organizations
+      responses:
+        "200":
+          description: Invitation cancelled
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+        "400":
+          description: Invitation is not pending
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          description: Internal server error
+    post:
+      operationId: resendOrganizationInvitation
+      summary: Resend an invitation
+      description: Resend a pending invitation email. Rate limited (5/hour). Expired
+        invitations have expiry extended by 7 days.
+      tags:
+        - Organizations
+      responses:
+        "200":
+          description: Invitation resent
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  data:
+                    type: object
+                    properties:
+                      emailSent:
+                        type: boolean
+                      expiryExtended:
+                        type: boolean
+        "400":
+          description: Invitation is not pending
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          description: Rate limit exceeded
+        "500":
+          description: Internal server error
+  /api/organizations/invitations:
+    get:
+      operationId: listOrganizationInvitations
+      summary: List invitations
+      description: List invitations for the active organization. Requires org_admin or
+        org_owner.
+      tags:
+        - Organizations
+      responses:
+        "200":
+          description: Invitations
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/OrganizationInvitation"
+        "400":
+          description: No active organization found
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Internal server error
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
-      description: CLI token (`sck_live_*`) for full API access, or trigger key
-        (`sck_trigger_*` / legacy `job_*`) for job trigger endpoint only.
+      description: Project-scoped CLI token (`sck_live_*` or `sck_test_*`) for
+        documented API operations that accept bearer authentication. Interactive
+        browser operations may require a session cookie. Trigger keys
+        (`sck_trigger_*` / legacy `job_*`) are accepted only by job trigger
+        endpoints.
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: better-auth.session_token
+      description: Interactive Better Auth browser session. Secure deployments may use
+        the `__Secure-` cookie prefix.
   parameters:
     Page:
       name: page
@@ -2247,6 +3781,37 @@ components:
         maximum: 100
         example: 20
       description: Items per page
+    JobLimit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        default: 100
+        minimum: 1
+        maximum: 100
+        example: 100
+      description: Jobs per page
+    MonitorLimit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        default: 50
+        minimum: 1
+        maximum: 100
+        example: 50
+      description: Monitors per page. For backward compatibility, omitting both page
+        and limit returns all matching monitors.
+    RunLimit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        default: 1000
+        minimum: 1
+        maximum: 1000
+        example: 100
+      description: Runs per page. Omitting limit returns up to 1000 matching runs.
   responses:
     Unauthorized:
       description: Authentication required or token invalid
@@ -2895,18 +4460,24 @@ components:
           format: uuid
         key:
           type: string
+          pattern: ^[A-Z][A-Z0-9_]*$
+          minLength: 4
+          maxLength: 20
+          description: Variable key. Uppercase letters, digits, and underscores only; 4-20
+            characters; must not use the `SUPERCHECK_` prefix or a reserved name
+            (for example PATH, HOME).
         type:
           type: string
           enum:
             - variable
             - secret
             - file
-          description: Variable type. File variables expose metadata in API
-            responses; file contents are not returned.
+          description: Variable type. File variables expose metadata in API responses;
+            file contents are not returned.
         value:
           type: string
-          description: Plaintext for regular variables, redacted for secrets,
-            and empty for file variables
+          description: Plaintext for regular variables, redacted for secrets, and empty
+            for file variables
         isSecret:
           type: boolean
         description:
@@ -3664,14 +5235,275 @@ components:
         errorType:
           type: string
           nullable: true
-        suggestedType:
-          type: string
-          enum:
-            - browser
-            - api
-            - performance
-            - database
-            - custom
-          nullable: true
         isValidationError:
           type: boolean
+    MonitorNotificationLink:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        monitorId:
+          type: string
+          format: uuid
+        notificationProviderId:
+          type: string
+          format: uuid
+    MonitorPermissionsResponse:
+      type: object
+      properties:
+        canView:
+          type: boolean
+        canEdit:
+          type: boolean
+        canDelete:
+          type: boolean
+        canToggle:
+          type: boolean
+        userRole:
+          type: string
+    MonitorLocationStats:
+      type: object
+      properties:
+        location:
+          type: string
+        totalChecks:
+          type: integer
+          nullable: true
+        upChecks:
+          type: integer
+          nullable: true
+        uptimePercentage:
+          type: number
+          nullable: true
+        avgResponseTime:
+          type: number
+          nullable: true
+        minResponseTime:
+          type: number
+          nullable: true
+        maxResponseTime:
+          type: number
+          nullable: true
+    MonitorCollectionUpdateRequest:
+      allOf:
+        - $ref: "#/components/schemas/MonitorUpdateRequest"
+        - type: object
+          required:
+            - id
+          properties:
+            id:
+              type: string
+              format: uuid
+              description: Monitor ID to update
+    OrganizationSummary:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        slug:
+          type: string
+        logo:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        role:
+          type: string
+          enum:
+            - org_owner
+            - org_admin
+            - project_admin
+            - project_editor
+            - project_viewer
+        isActive:
+          type: boolean
+        subscriptionPlan:
+          type: string
+          nullable: true
+        subscriptionStatus:
+          type: string
+          nullable: true
+        subscriptionEndsAt:
+          type: string
+          format: date-time
+          nullable: true
+    OrganizationDetail:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        slug:
+          type: string
+          nullable: true
+        logo:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        metadata:
+          type: object
+          nullable: true
+        role:
+          type: string
+        stats:
+          type: object
+          properties:
+            projectCount:
+              type: integer
+            memberCount:
+              type: integer
+    OrganizationCurrent:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        slug:
+          type: string
+          nullable: true
+        logo:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+    OrganizationStats:
+      type: object
+      properties:
+        projects:
+          type: integer
+        jobs:
+          type: integer
+        tests:
+          type: integer
+        monitors:
+          type: integer
+        runs:
+          type: integer
+        members:
+          type: integer
+    OrganizationMember:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        email:
+          type: string
+        role:
+          type: string
+          enum:
+            - org_owner
+            - org_admin
+            - project_admin
+            - project_editor
+            - project_viewer
+        joinedAt:
+          type: string
+          format: date-time
+        projects:
+          type: array
+          items:
+            type: object
+            properties:
+              projectId:
+                type: string
+              projectName:
+                type: string
+    OrganizationInvitation:
+      type: object
+      properties:
+        id:
+          type: string
+        email:
+          type: string
+        role:
+          type: string
+        status:
+          type: string
+        expiresAt:
+          type: string
+          format: date-time
+        inviterName:
+          type: string
+        inviterEmail:
+          type: string
+    OrganizationUpdateRequest:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 50
+          description: Display name. Leading and trailing whitespace is trimmed.
+        slug:
+          type: string
+          nullable: true
+        logo:
+          type: string
+          nullable: true
+        metadata:
+          type: object
+          nullable: true
+    OrganizationInviteRequest:
+      type: object
+      required:
+        - email
+        - role
+      properties:
+        email:
+          type: string
+          format: email
+        role:
+          type: string
+          enum:
+            - org_owner
+            - org_admin
+            - project_admin
+            - project_editor
+            - project_viewer
+        selectedProjects:
+          type: array
+          items:
+            type: string
+          description: Required for project_admin and project_editor. Must be active
+            projects in the current organization.
+    OrganizationMemberUpdateRequest:
+      type: object
+      required:
+        - role
+      properties:
+        role:
+          type: string
+          enum:
+            - org_owner
+            - org_admin
+            - project_admin
+            - project_editor
+            - project_viewer
+        selectedProjects:
+          type: array
+          items:
+            type: string
+        projectAssignments:
+          type: array
+          description: Accepted as project ID strings or `{ projectId }` objects.
+            Normalized to selectedProjects.
+          items:
+            oneOf:
+              - type: string
+              - type: object
+                properties:
+                  projectId:
+                    type: string

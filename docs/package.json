@@ -1,9 +1,17 @@
 {
   "name": "docs",
   "version": "0.0.0",
+  "license": "AGPL-3.0-only",
   "private": true,
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
-    "build": "next build",
+    "build": "npm run check:openapi && npm run check:diagrams && next build",
+    "sync:openapi": "node scripts/sync-openapi.mjs",
+    "check:openapi": "node scripts/sync-openapi.mjs --check",
+    "test:openapi": "node --test scripts/sync-openapi.spec.mjs",
+    "check:diagrams": "node scripts/check-diagram-titles.mjs",
     "dev": "next dev",
     "start": "next start",
     "postinstall": "fumadocs-mdx",
@@ -11,25 +19,26 @@
     "lint": "eslint"
   },
   "dependencies": {
-    "fumadocs-core": "^16.5.1",
+    "fumadocs-core": "16.8.0",
     "fumadocs-mdx": "13.0.8",
-    "fumadocs-openapi": "^10.3.2",
-    "fumadocs-ui": "^16.5.1",
+    "fumadocs-openapi": "10.6.8",
+    "fumadocs-ui": "16.8.0",
     "lucide-react": "^0.544.0",
     "mermaid": "^11.15.0",
-    "next": "16.2.6",
-    "next-themes": "^0.4.6",
+    "next": "16.3.8",
+    "next-themes": "npm:@teispace/next-themes@^3.0.2",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "shiki": "^3.22.0",
     "tailwindcss-animate": "^1.0.7"
   },
   "overrides": {
+    "next-themes": "npm:@teispace/next-themes@^3.0.2",
     "ajv@^8.0.0": "8.18.0",
     "@babel/core": "^7.29.7",
-    "dompurify": ">=3.4.9",
+    "dompurify": ">=3.4.16",
     "esbuild": "^0.28.1",
-    "fast-uri": "3.1.2",
+    "fast-uri": "3.1.8",
     "fast-xml-parser": ">=5.7.0",
     "fast-xml-builder": "1.1.7",
     "lodash-es": ">=4.18.0",
@@ -38,9 +47,12 @@
     "picomatch": ">=2.3.2",
     "path-to-regexp@^8.0.0": ">=8.4.0",
     "uuid@^11.0.0": "11.1.1",
-    "brace-expansion@^2.0.0": "2.0.3",
-    "brace-expansion@^5.0.0": "5.0.6",
-    "postcss": "8.5.15"
+    "brace-expansion@^2.0.0": "2.1.7",
+    "brace-expansion@^5.0.0": "5.0.12",
+    "postcss": "8.5.28",
+    "sharp": "0.35.5",
+    "source-map-js": "1.2.2",
+    "katex": "0.18.2"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3",
@@ -50,10 +62,11 @@
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "eslint": "^9",
-    "eslint-config-next": "16.2.6",
-    "postcss": "8.5.15",
+    "eslint-config-next": "16.3.8",
+    "postcss": "8.5.28",
     "tailwindcss": "^4.1.14",
     "tsx": "^4.21.0",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "yaml": "2.9.1"
   }
 }

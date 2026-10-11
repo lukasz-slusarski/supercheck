@@ -1,17 +1,6 @@
-/**
- * Pomocnicze liczenie zakresu dat dla wynikow monitora.
- *
- * Funkcja mieszkala wczesniej w route.ts, ale Next.js 16 pozwala eksportowac
- * z pliku trasy wylacznie handlery (GET/POST/...) i kilka zarezerwowanych pol
- * konfiguracyjnych. Kazdy inny eksport wywala build:
- *   "buildMonitorResultsDateRange" is not a valid Route export field.
- * Stad wydzielenie do osobnego modulu, ktory route.ts i testy importuja.
- */
-
 const DATE_FILTER_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
-export const MAX_TIMEZONE_OFFSET_MINUTES = 14 * 60;
 
-export type DateRange = {
+type DateRange = {
   start: Date;
   end: Date;
 };

@@ -14,7 +14,7 @@ A job is a collection of tests that run together. When a job executes:
 
 1. All selected tests run in sequence
 2. Results are collected and aggregated
-3. Alerts are sent if any test fails
+3. Your selected channels receive notifications for the alert types you enable
 4. Reports are generated with full details
 
 **Use jobs for:**
@@ -45,8 +45,6 @@ Choose which tests to include in the job. You can select any combination of:
 
 <Callout type="info">
 Tests run in the order you select them. Put critical tests first so failures are detected early.
-
-**Note:** While tests in a job execute sequentially one-by-one, individual Playwright tests may use internal parallelism (workers) to run faster. This doesn't affect the order of test execution within the job.
 
 The Playwright HTML report will display tests in their execution order, making it easy to trace through the test sequence.
 </Callout>
@@ -79,9 +77,9 @@ Set up notifications for job results:
 
 | Setting | Description |
 |---------|-------------|
-| **Alert on Failure** | Notify when any test in the job fails |
-| **Alert on Success** | Notify when all tests pass (optional) |
-| **Alert on Timeout** | Notify if job exceeds maximum execution time |
+| **Job failures** | Notify when any test in the job fails |
+| **Job success completion** | Notify when all tests pass (optional) |
+| **Job timeouts** | Notify if the job exceeds its maximum execution time |
 | **Notification Channels** | Select Slack, email, Discord, Telegram, or webhook |
 
 ## Parallel Execution
@@ -90,11 +88,13 @@ Run multiple jobs or tests simultaneously to reduce total execution time. The pa
 
 ![Parallel Execution Dialog](/screenshots/parallel-execution-dialog.png)
 
-**How it works:**
-- Jobs are queued and processed by available workers
-- Multiple jobs can run in parallel up to your plan's capacity limit
-- View all running executions across your organization in real-time
-- Cancel any running job if needed
+**Manage executions:**
+
+- Click the **RUNNING / QUEUED** indicator to view active and waiting runs.
+- Open a run to inspect its progress.
+- Cancel a run you no longer need.
+
+Runs wait when execution capacity is full. Multiple jobs can run at once up to your capacity limit.
 
 **Capacity limits:**
 
@@ -110,32 +110,51 @@ The parallel execution indicator appears in the top navigation bar showing **RUN
 
 Trigger jobs from your CI/CD pipeline to run tests after every deployment.
 
+Create a job trigger key, store it as a secret in your CI/CD platform, and call the copied trigger URL after deployment. To make the pipeline wait for the result and fail when tests fail, use the [CLI CI/CD workflow](/docs/cli/ci-cd) with `supercheck job trigger --wait`.
+
+<p className="text-sm md:hidden">Scroll horizontally to view the full diagram.</p>
+
+<div className="overflow-x-auto" role="region" aria-label="Jobs workflow diagram" tabIndex={0}>
+<div className="min-w-[48rem]">
+
 ```mermaid
 sequenceDiagram
-    participant CI as CI/CD
-    participant API
-    participant Worker
-    participant Alerts
+    accTitle: CI pipeline trigger
+    accDescr: Authorize a pipeline, trigger a job, and wait for its result.
+    autonumber
+    participant You as You
+    participant App as Supercheck
+    participant Environment as Your pipeline
 
-    CI->>API: POST /trigger
-    API->>Worker: Queue job
-    API-->>CI: 202 Accepted
-    Worker->>Worker: Execute tests
-    Worker->>API: Result
-    API->>Alerts: Notify
-    CI->>API: GET status
-    API-->>CI: Final result
+    rect rgba(139, 92, 246, 0.08)
+        You->>App: Create job trigger key
+        App-->>You: Trigger key and job ID
+        You->>Environment: Store keys and CLI token as secrets
+    end
+    rect rgba(59, 130, 246, 0.08)
+        You->>Environment: Configure CLI trigger --wait
+        Environment->>App: Trigger job and wait
+        App-->>Environment: Completed run result
+    end
+    rect rgba(16, 185, 129, 0.08)
+        Environment-->>You: Pipeline success or failure
+    end
 ```
+
+</div>
+</div>
+
+This shows the CLI workflow with `--wait`. A plain HTTP trigger starts the job but does not wait for the test result.
 
 ### Setting Up API Triggers
 
 1. Open the job you want to trigger
-2. Go to the **CI/CD** tab
-3. Click **Generate API Key**
+2. Open the job's **Edit** action and continue to **CI/CD Settings**
+3. Click **Create Key**
 
 ![CI/CD Tab](/screenshots/edit-job-add-cicd-apikey-1.png)
 
-![Generate API Key](/screenshots/edit-job-add-cicd-apikey-2.png)
+![Create API Key](/screenshots/edit-job-add-cicd-apikey-2.png)
 
 4. Copy the trigger URL and API key
 
@@ -149,7 +168,8 @@ sequenceDiagram
 **Basic trigger:**
 
 ```bash
-curl -X POST https://your-instance.com/api/jobs/{jobId}/trigger \
+curl --fail-with-body --show-error --silent -X POST \
+  "https://your-instance.example/api/jobs/YOUR_JOB_ID/trigger" \
   -H "Authorization: Bearer YOUR_API_KEY"
 ```
 
@@ -161,7 +181,7 @@ curl -X POST https://your-instance.com/api/jobs/{jobId}/trigger \
 ```yaml
 - name: Run Supercheck Tests
   run: |
-    curl -X POST ${{ secrets.SUPERCHECK_TRIGGER_URL }} \
+    curl --fail-with-body --show-error --silent -X POST "${{ secrets.SUPERCHECK_TRIGGER_URL }}" \
       -H "Authorization: Bearer ${{ secrets.SUPERCHECK_API_KEY }}"
 ```
 
@@ -173,7 +193,9 @@ curl -X POST https://your-instance.com/api/jobs/{jobId}/trigger \
 ```yaml
 test:
   script:
-    - curl -X POST $SUPERCHECK_TRIGGER_URL -H "Authorization: Bearer $SUPERCHECK_API_KEY"
+    - |
+      curl --fail-with-body --show-error --silent -X POST "$SUPERCHECK_TRIGGER_URL" \
+        -H "Authorization: Bearer $SUPERCHECK_API_KEY"
 ```
 
 </Tab>
@@ -201,8 +223,7 @@ You can cancel a running job at any time:
 
 1. Click the **Cancel** button on the running job
 2. Confirm the cancellation
-3. All running tests are stopped immediately
-4. Partial results are saved
+3. Review the cancellation status and any partial results in the run details
 
 ### Viewing Results
 

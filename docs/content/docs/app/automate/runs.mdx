@@ -14,27 +14,29 @@ Every test or job execution creates a run with results, logs, and artifacts.
 |--------|-------------|
 | **Passed** | All tests completed successfully |
 | **Failed** | One or more tests failed |
-| **Error** | Execution error (timeout, crash) |
+| **Error** | Execution error (timeout, crash, infrastructure) |
 | **Running** | Currently executing |
 | **Queued** | Waiting to execute |
-| **Blocked** | Blocked by plan limits |
+| **Blocked** | Execution denied by access or spending controls |
 
 ## View Runs
 
-1. Go to **Jobs** or **Tests**
-2. Select the item
-3. Click **Runs** tab
-4. Select a run to view details
+1. Go to **Automate → Runs**
+2. Select a run to view its details
+
+When a running execution is cancelled, Supercheck stops it and records the run as **Error** with cancellation details.
 
 ## Run Details
 
 Each run includes:
 
 - **Results** — Pass/fail count and duration
-- **Screenshots** — Visual state at each step
+- **Screenshots** — Available screenshots from browser checks
 - **Videos** — Browser test recordings
-- **Logs** — Console output
+- **Logs** — Console output and live streaming logs
 - **Trace** — Step-by-step execution replay
+
+![Run Results and Execution Logs](/screenshots/performance-test-result-logs.png)
 
 ## Debug Failures
 
@@ -50,7 +52,7 @@ Click **AI Analyze** on any job run to generate an AI-powered analysis report.
 
 **What AI Analyze Provides:**
 - **Execution Summary** — Overview of what happened during the run
-- **Failure Analysis** — Root cause identification with specific error messages
+- **Failure Analysis** — Suggested causes supported by the available run data
 - **Performance Insights** — Duration analysis and optimization suggestions
 - **Recommendations** — Actionable next steps based on actual run data
 
@@ -59,6 +61,5 @@ Click **AI Analyze** on any job run to generate an AI-powered analysis report.
 - **K6** — Analyzes performance metrics and threshold breaches
 
 <Callout type="info">
-AI Analyze requires a configured AI provider. See [Deployment](/docs/app/deployment/self-hosted#ai-configuration) for setup.
+For self-hosted deployments, an administrator must [configure an AI provider](/docs/app/deployment/self-hosted#optional-configuration) to enable AI Analyze.
 </Callout>
-

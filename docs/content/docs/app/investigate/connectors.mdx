@@ -1,0 +1,107 @@
+---
+title: Connectors
+description: Add read-only evidence sources for AI SRE investigations
+icon: Plug
+---
+
+Add a connector when you want an investigation to use evidence from a tool your team already operates. Configure connectors under **Organization Admin → Integrations** with a role that can configure connectors.
+
+![Add Connector Dialog](/screenshots/sre-add-connector-dialog.png)
+
+## Supported Providers
+
+Choose one of these providers in **Add connector**:
+
+- **Metrics & Dashboards** — Prometheus, Grafana, AWS CloudWatch
+- **Operational Events** — Datadog
+- **Logs & Search** — Loki, Elasticsearch / OpenSearch
+- **Distributed Traces** — Grafana Tempo
+- **Cloud & Orchestration** — Kubernetes
+- **Error Tracking** — Sentry
+- **Code & Deployments** — GitHub, GitLab
+- **Incident Management** — PagerDuty, Opsgenie
+
+Existing records for unsupported providers are labeled **Setup only** and cannot run searches.
+
+## Choose How to Connect
+
+| Your provider | Choose | What you need to do |
+|---|---|---|
+| A public API that Supercheck can reach | **Direct** | Enter the provider endpoint and read-only credentials. Cloud endpoints must use HTTPS. |
+| An API reachable only inside your network | **Private Agent** | [Set up an agent with Docker Compose](/docs/app/deployment/private-agent), then select it when adding the connector. |
+| An internal API reachable from your self-hosted instance | **Direct** or **Private Agent** | Use Direct if your instance can reach it; otherwise deploy an agent in that network. |
+
+Private Agent mode supports GitHub, Kubernetes, Prometheus, Grafana, Sentry, Datadog, Loki, Elasticsearch/OpenSearch, Tempo, and AWS CloudWatch. GitLab, PagerDuty, and Opsgenie support **Direct** only.
+
+Use an endpoint reachable from the selected execution location. Supercheck Cloud Direct mode cannot reach private IPs or private DNS names. Self-hosted Direct mode and Private Agents allow internal HTTP or HTTPS endpoints. All modes reject loopback and cloud metadata endpoints and credentials embedded in URLs; enter credentials in the dedicated fields.
+
+<p className="text-sm">Scroll horizontally on smaller screens to view all steps.</p>
+
+<div className="overflow-x-auto" role="region" aria-label="Connector setup workflow" tabIndex={0}>
+<div className="min-w-[84rem]">
+
+```mermaid
+%%{init: {"flowchart":{"nodeSpacing":20,"rankSpacing":24,"padding":12,"wrappingWidth":140}}}%%
+flowchart LR
+    Provider[Choose a supported provider] --> Reachable{Can Supercheck reach it directly?}
+    Reachable -->|Yes|Direct[Choose Direct]
+    Reachable -->|No|Agent[Register and start a Private Agent]
+    Agent --> Private[Choose Private Agent and select it]
+    Direct --> Configure[Set endpoint, credentials, and service scope]
+    Private --> Configure
+    Configure --> Validate[Validate and run a known-result query]
+    Validate --> Use[Enable live sources in an investigation]
+
+    classDef action fill:#1d4ed8,stroke:#60a5fa,color:#fff
+    classDef decision fill:#92400e,stroke:#fbbf24,color:#fff
+    class Provider,Direct,Agent,Private,Configure,Validate,Use action
+    class Reachable decision
+```
+
+</div>
+</div>
+
+## Adding a Connector
+
+To register a connector:
+
+1. Navigate to **Organization Admin → Integrations** and click **Add connector**.
+2. Select your provider type and assign a recognizable name (e.g. `Production GitHub`).
+3. Choose the execution mode (**Direct** or **Private Agent**). For Private Agent mode, first register an agent under **Organization Admin → Private Agents**, then select it in the connector dialog.
+4. Enter the API endpoint URL and configure a least-privilege read-only credential token.
+5. Define the **Service scope** to restrict which services may access this connector.
+6. Save, validate, and run one known-result query and one no-result query before relying on it during an incident.
+
+Kubernetes searches require an explicit namespace. Grant the connector service account read-only access only to the namespaces under test; do not grant cluster-admin or write permissions.
+
+Choose the smallest service scope and query time window that answer your question. If a search returns no evidence, check the service scope, provider permissions, and time range.
+
+## Query Examples
+
+Each provider uses its own read-only query language:
+
+- **GitLab** — `project:acme/checkout deploy`
+- **PagerDuty** — `status:triggered service:checkout`
+- **Opsgenie** — `status:open AND priority:P1`
+- **Prometheus** — PromQL, e.g. `sum(rate(http_requests_total{status=~"5.."}[5m]))`
+- **Loki** — LogQL with a stream selector, e.g. `{service="checkout"} |= "error"`
+- **Kubernetes** — `*` or a verified label selector with an explicit namespace
+
+## Credential Best Practices
+
+Always provision dedicated, read-only credentials limited to the specific service scope:
+
+| Provider | Recommended Minimum Access Scope |
+|---|---|
+| **GitHub** | Read-only token limited to the repositories needed for commit search |
+| **GitLab** | Personal, project, or group access token with `read_api` access limited to the required repositories |
+| **Kubernetes** | ServiceAccount with read-only permissions scoped to application namespaces |
+| **Grafana** | Service Account token with `Viewer` role; never use administrative accounts |
+| **Prometheus / Loki** | Read-only bearer token or gateway credential for query endpoints |
+| **Sentry** | Read-only integration token restricted to relevant project IDs |
+| **Datadog** | API key plus application key with read-only event access for the correct regional site |
+| **AWS CloudWatch** | Access key ID and secret access key with `cloudwatch:DescribeAlarms` and `cloudwatch:GetMetricData`; prefer short-lived STS credentials and include the session token |
+
+<Callout type="info">
+Store provider credentials in the connector credential fields, not in prompts or endpoint URLs. Supercheck encrypts stored credentials and does not include them in AI prompts.
+</Callout>

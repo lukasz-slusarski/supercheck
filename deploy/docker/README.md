@@ -1,6 +1,8 @@
 # Docker Compose Configurations
 
-Production-ready Docker Compose files for self-hosting Supercheck.
+Docker Compose files for self-hosting Supercheck.
+
+For agent-assisted installation, use [INSTALL.md](./INSTALL.md).
 
 ## Quick Start
 
@@ -9,7 +11,7 @@ git clone https://github.com/supercheck-io/supercheck.git
 cd supercheck/deploy/docker
 
 # Generate secrets and set up the execution sandbox
-sudo bash init-secrets.sh
+./init-secrets.sh
 sudo bash setup-k3s.sh
 
 # Edit .env for optional integrations (SMTP, AI, OAuth)
@@ -18,25 +20,31 @@ nano .env
 # Start self-hosted stack
 KUBECONFIG_FILE=/etc/rancher/k3s/supercheck-worker.kubeconfig docker compose up -d
 
-# Or start with HTTPS
-KUBECONFIG_FILE=/etc/rancher/k3s/supercheck-worker.kubeconfig docker compose -f docker-compose-secure.yml up -d
+# For HTTPS, set COMPOSE_PROFILES=https, APP_DOMAIN and ACME_EMAIL in .env.
+# The start command stays the same.
 ```
 
 ## Prerequisites
 
-> **Modern Docker Compose Required**: Use `docker compose` (with space), not `docker-compose` (with hyphen).
+> **Docker Compose v2.24.4 or newer is required.** Use `docker compose` (with space).
 
 ```bash
 docker compose version
-# Should show: Docker Compose version v2.x.x or higher
+# Should show v2.24.4 or newer
 ```
 
-**Install Docker (Linux only):**
+**Install Docker (Linux only):** For production hosts, prefer Docker's
+[distribution-specific Engine installation instructions](https://docs.docker.com/engine/install/).
+If you use Docker's convenience script, download and review it before running it:
+
 ```bash
-curl -fsSL https://get.docker.com | sh
+curl -fsSL https://get.docker.com -o get-docker.sh
+sudo sh get-docker.sh
+sudo usermod -aG docker "$USER"
+newgrp docker
 ```
 
-> **Linux Required:** Supercheck uses K3s and gVisor for sandboxed test execution, which require the Linux kernel. Only Linux servers (Ubuntu 22.04+, Debian 12+) are supported. macOS, Windows, and WSL2 are not supported.
+> **Linux Required:** The test-execution sandbox requires the Linux kernel. Only Linux servers (Ubuntu 22.04+, Debian 12+) are supported. macOS, Windows, and WSL2 are not supported.
 
 ---
 
@@ -44,10 +52,15 @@ curl -fsSL https://get.docker.com | sh
 
 | File | Use Case |
 |------|----------|
-| `docker-compose.yml` | Self-hosted deployment (HTTP, localhost:3000) |
-| `docker-compose-secure.yml` | Production with HTTPS |
+| `docker-compose.yml` | Bundled stack; optional `https` and `private-agent` profiles |
+| `docker-compose-secure.yml` | Compatibility entry point for existing HTTPS installations |
+| `docker-compose-external.yml` | Connect to managed external PostgreSQL, Redis, and S3 services |
 | `docker-compose-worker.yml` | Remote regional worker |
+| `docker-compose-private-agent.yml` | Standalone agent for remote networks or Supercheck Cloud |
 | `docker-compose-local.yml` | Source-based local development |
+| `docker-compose-aisre-lab.yml` | Optional AI SRE integration lab with OSS telemetry and webhook capture |
+
+The optional [AI SRE integration lab](./aisre-lab/README.md) is for connector development and testing; it is not needed for installation.
 
 All worker Docker definitions use the worker readiness endpoint (`/health/ready`) for healthchecks. A worker is marked unhealthy when it cannot reach required dependencies such as PostgreSQL, Redis, or its queues.
 
@@ -65,16 +78,15 @@ Use `./init-secrets.sh` to generate secure defaults, then configure:
 | `SIGNUP_ENABLED` | Toggle open email/password signup (default: `true`) |
 | `ALLOWED_EMAIL_DOMAINS` | Optional comma-separated signup allowlist (default: empty = allow all) |
 | `STATUS_PAGE_HIDE_BRANDING` | Hide the `Powered by Supercheck` footer on all public status and incident pages when set to `true` (default: `false`) |
+| `NEXT_PUBLIC_APP_URL` | Browser-reachable app origin, including scheme and port, with no trailing slash (default: `http://localhost:3000`) |
 
 OAuth (`GITHUB_*` / `GOOGLE_*`) is optional in self-hosted mode.
 
-### Production (docker-compose-secure.yml)
+HTTP evaluation is bound to localhost. Use an SSH port forward for remote evaluation; use HTTPS for a public server.
 
-| Variable | Description |
-|----------|-------------|
-| `APP_DOMAIN` | Your domain (e.g., `app.yourdomain.com`) |
-| `ACME_EMAIL` | Email for Let's Encrypt |
-| `STATUS_PAGE_DOMAIN` | Reserved hostname namespace for default status page URLs (e.g., `yourdomain.com`) |
+### HTTPS Profile
+
+Set `COMPOSE_PROFILES=https`, `APP_DOMAIN`, and `ACME_EMAIL` in `.env`. App and authentication URLs derive from `APP_DOMAIN`; update any existing `NEXT_PUBLIC_APP_URL` override to the same HTTPS origin. Point DNS at the server and open ports 80 and 443. Run the same `docker compose up -d` command.
 
 `STATUS_PAGE_DOMAIN` reserves the default status-page namespace (`[uuid].STATUS_PAGE_DOMAIN`). In the HTTPS Compose variants, Supercheck derives the custom-domain target shown in Settings from it, usually `cname.STATUS_PAGE_DOMAIN`. In self-hosted deployments, that target must already point to your app, usually through an A/AAAA record or a wildcard record that already covers it. Keep customer-facing custom domains outside the `STATUS_PAGE_DOMAIN` namespace (for example, `status.example.net`) and point their CNAME to the exact target shown in Settings (for example, `cname.example.com`). The Compose HTTPS variants include a lower-priority Traefik catch-all router so verified custom domains route to the app automatically, but TLS for those hostnames still requires your own certificate workflow. If you use Cloudflare, keep the custom CNAME on DNS-only until verification and origin HTTPS are working.
 
@@ -87,13 +99,16 @@ When you are running the app locally on `http://localhost:3000`, Supercheck keep
 | `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` | Optional GitHub social sign-in | - |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | Optional Google social sign-in | - |
 | `SMTP_HOST`, `SMTP_FROM_EMAIL` (+ optional `SMTP_USER`/`SMTP_PASSWORD`) | Email notifications (disabled if SMTP_HOST not set) | - |
-| `AI_PROVIDER` | AI provider (`openai`, `azure`, `anthropic`, `gemini`, `google-vertex`, `bedrock`, `openrouter`) | `openai` |
-| `AI_MODEL` | AI model name | `gpt-4o-mini` |
+| `AI_PROVIDER` | AI provider (`openai`, `azure`, `anthropic`, `gemini`, `google-vertex`, `bedrock`, `openrouter`, `deepseek`) | `openai` |
+| `AI_MODEL` | AI model name | `gpt-6-luna` |
 | `OPENAI_API_KEY` | AI features (for default OpenAI provider) | - |
+| `DEEPSEEK_API_KEY` | DeepSeek V4.1 Flash (optional) | - |
 | `WORKER_REPLICAS` | Number of worker containers (worker-side scaling knob) | `1` |
 | `RUNNING_CAPACITY` | App-side gate: max concurrent test runs (set equal to `WORKER_REPLICAS`) | `1` |
 | `QUEUED_CAPACITY` | App-side gate: max queued test runs before new submissions are rejected | `10` |
 | `WORKER_LOCATION` | Worker queue mode (`local` for single-server self-hosted, or any enabled Super Admin location code) | `local` |
+
+OpenAI GPT-6 Luna is the default. To opt into DeepSeek V4.1 Flash, set `AI_PROVIDER=deepseek`, `AI_MODEL=deepseek-flash`, and `DEEPSEEK_API_KEY`. This sends AI prompts, code, requirement text, and supplied evidence to DeepSeek's hosted API; review data handling and China-related residency requirements first. Provider selection applies to the entire installation.
 
 ---
 
@@ -124,9 +139,9 @@ Run the bootstrap script on your host:
 sudo bash setup-k3s.sh
 ```
 
-This installs the execution sandbox, creates the `supercheck-execution` namespace with appropriate resource limits and network policies, and writes a restricted worker kubeconfig to `/etc/rancher/k3s/supercheck-worker.kubeconfig`.
+Run this once before starting the workers. It prepares the isolated environment required for Playwright and k6 test execution, including resource limits and network restrictions.
 
-> **Linux host required:** Docker Engine on a Linux server (Ubuntu 22.04+, Debian 12+) is the only supported target. macOS, Windows, and WSL2 are not supported because K3s and gVisor require the Linux kernel.
+> **Linux host required:** Docker Engine on a Linux server (Ubuntu 22.04+, Debian 12+) is the only supported target. macOS, Windows, and WSL2 are not supported because the execution sandbox requires the Linux kernel.
 
 ---
 
@@ -138,7 +153,7 @@ KUBECONFIG_FILE=/etc/rancher/k3s/supercheck-worker.kubeconfig \
 docker compose up -d
 ```
 
-> **Upgrading from pre-1.3.3 releases:** Supercheck moved from Docker socket-based execution to K3s + gVisor in `1.3.3`. Before upgrading an older deployment, back up your database and run `sudo bash setup-k3s.sh` to install the execution sandbox. See the [deployment guide](https://supercheck.io/docs/app/deployment/self-hosted) for details.
+> **Upgrading from pre-1.3.3 releases:** Supercheck introduced the current isolated execution sandbox in `1.3.3`. Before upgrading an older deployment, back up your database and run `sudo bash setup-k3s.sh` to install the execution sandbox. See the [deployment guide](https://supercheck.io/docs/app/deployment/self-hosted) for details.
 
 ---
 
@@ -146,10 +161,10 @@ docker compose up -d
 
 ```bash
 # Create backup
-docker compose exec postgres pg_dump -U postgres supercheck > backup.sql
+docker compose exec postgres sh -c 'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"' > backup.sql
 
 # Restore backup
-docker compose exec -T postgres psql -U postgres supercheck < backup.sql
+docker compose exec -T postgres sh -c 'psql -U "$POSTGRES_USER" "$POSTGRES_DB"' < backup.sql
 ```
 
 ---
@@ -157,3 +172,15 @@ docker compose exec -T postgres psql -U postgres supercheck < backup.sql
 ## Documentation
 
 Full documentation: **[supercheck.io/docs/app/deployment](https://supercheck.io/docs/app/deployment)**
+
+## AI SRE
+
+Configure an AI provider to use AI SRE. Investigations, Copilot, and automatic alert triage are enabled by default. Migrations run when the app starts.
+
+Set `SRE_AUTOMATION_ENABLED=false` for manual investigations only, or `SRE_ENABLED=false` to disable AI SRE. Automatic triage can incur AI-provider charges. After changing `.env`, run `docker compose up -d --force-recreate app worker` with the configured profiles.
+
+### Private Agent Profile
+
+For a colocated agent, register it in Organization Admin → Private Agents, set its `PRIVATE_AGENT_ID` and `PRIVATE_AGENT_TOKEN`, and add `private-agent` to `COMPOSE_PROFILES` (for example `https,private-agent`). Run `docker compose up -d private-agent`. It uses the app's internal origin and an isolated Docker network, with no database, Redis, or S3 credentials.
+
+Stop it with `docker compose stop private-agent` before removing the profile. Recreate it after `.env` changes, preserving `private-agent-state`. Use the standalone file only when the agent runs on another network or connects to Cloud.

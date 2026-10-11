@@ -5,19 +5,27 @@ import { z } from "zod";
 import { auth } from "@/utils/auth";
 import { headers } from "next/headers";
 import { createLogger } from "@/lib/logger/pino-config";
+import { db } from "@/utils/db";
+import { apikey } from "@/db/schema";
+import { and, eq, like, or } from "drizzle-orm";
+import { requireAuthContext } from "@/lib/auth-context";
+import { checkPermissionWithContext } from "@/lib/rbac/middleware";
 
 const logger = createLogger({ module: "extension-auth" });
 
 const EXTENSION_API_KEY_CONFIG_ID = "default";
 const EXTENSION_API_KEY_PREFIX = "ext";
 const EXTENSION_API_KEY_LIST_LIMIT = 1000;
+const EXTENSION_API_KEY_MAX_NAME_LENGTH = 32;
+const DEFAULT_EXTENSION_API_KEY_NAME = "Supercheck Recorder Extension";
+const EXTENSION_API_KEY_NAME_PREFIX = "Recorder: ";
 const EXTENSION_API_KEY_PERMISSIONS: Record<string, string[]> = {
   recorder: ["save"],
 };
 const EXTENSION_PERMISSION_STATEMENT = "recorder:save";
 
 const authRequestSchema = z.object({
-  name: z.string().optional().default("SuperCheck Recorder Extension"),
+  name: z.string().optional().default("Supercheck Recorder Extension"),
   extensionVersion: z.string().optional(),
 });
 
@@ -30,6 +38,11 @@ type ListedApiKey = Awaited<
 >["apiKeys"][number];
 
 const apiKeyServerApi = auth.api as typeof auth.api & ApiKeyServerApi;
+
+function normalizeExtensionKeyName(name: string | undefined) {
+  const trimmed = name?.trim() || DEFAULT_EXTENSION_API_KEY_NAME;
+  return `${EXTENSION_API_KEY_NAME_PREFIX}${trimmed}`.slice(0, EXTENSION_API_KEY_MAX_NAME_LENGTH);
+}
 
 function getPermissionStatements(rawPermissions: unknown): string[] {
   if (!rawPermissions) {
@@ -67,9 +80,10 @@ function getPermissionStatements(rawPermissions: unknown): string[] {
 }
 
 function isExtensionKey(
-  apiKey: Pick<ListedApiKey, "permissions" | "prefix">
+  apiKey: Pick<ListedApiKey, "name" | "permissions" | "prefix">
 ): boolean {
   return (
+    apiKey.name?.startsWith(EXTENSION_API_KEY_NAME_PREFIX) === true ||
     apiKey.prefix === EXTENSION_API_KEY_PREFIX ||
     getPermissionStatements(apiKey.permissions).includes(
       EXTENSION_PERMISSION_STATEMENT
@@ -77,12 +91,44 @@ function isExtensionKey(
   );
 }
 
+function getBetterAuthErrorStatus(error: unknown) {
+  const candidate = error as { statusCode?: unknown; status?: unknown } | null;
+
+  if (typeof candidate?.statusCode === "number" && candidate.statusCode >= 400 && candidate.statusCode < 600) {
+    return candidate.statusCode;
+  }
+
+  switch (candidate?.status) {
+    case "BAD_REQUEST":
+      return 400;
+    case "UNAUTHORIZED":
+      return 401;
+    case "FORBIDDEN":
+      return 403;
+    case "NOT_FOUND":
+      return 404;
+    default:
+      return 500;
+  }
+}
+
+function getBetterAuthErrorMessage(error: unknown) {
+  const candidate = error as { body?: { message?: unknown }; message?: unknown } | null;
+  const message = typeof candidate?.body?.message === "string"
+    ? candidate.body.message
+    : typeof candidate?.message === "string"
+      ? candidate.message
+      : null;
+
+  return message || "Failed to generate API key";
+}
+
 /**
  * POST /api/extension/auth
- * Generate an API key for the SuperCheck Recorder extension
+ * Generate an API key for the Supercheck Recorder extension
  * 
  * Authentication: Session cookie (user must be logged in)
- * Used by: SuperCheck web app to connect the extension
+ * Used by: Supercheck web app to connect the extension
  */
 export async function POST(request: NextRequest) {
   try {
@@ -96,6 +142,14 @@ export async function POST(request: NextRequest) {
       return NextResponse.json(
         { success: false, error: "Authentication required" },
         { status: 401 }
+      );
+    }
+
+    const authContext = await requireAuthContext();
+    if (!checkPermissionWithContext("apiKey", "create", authContext)) {
+      return NextResponse.json(
+        { success: false, error: "Insufficient permissions" },
+        { status: 403 }
       );
     }
 
@@ -118,6 +172,39 @@ export async function POST(request: NextRequest) {
     }
 
     const data = validation.data;
+    const apiKeyName = normalizeExtensionKeyName(data.name);
+
+    const [persistedExtensionKey] = await db
+      .select({ id: apikey.id })
+      .from(apikey)
+      .where(
+        and(
+          eq(apikey.referenceId, userId),
+          eq(apikey.configId, EXTENSION_API_KEY_CONFIG_ID),
+          eq(apikey.enabled, true),
+          or(
+            eq(apikey.prefix, EXTENSION_API_KEY_PREFIX),
+            like(apikey.name, `${EXTENSION_API_KEY_NAME_PREFIX}%`),
+          ),
+        ),
+      )
+      .orderBy(apikey.createdAt)
+      .limit(1);
+
+    if (persistedExtensionKey) {
+      return NextResponse.json({
+        success: true,
+        data: {
+          message: "Extension already connected",
+          keyId: persistedExtensionKey.id,
+          user: {
+            id: session.user.id,
+            email: session.user.email,
+            name: session.user.name,
+          },
+        },
+      });
+    }
 
     const { apiKeys } = await apiKeyServerApi.listApiKeys({
       headers: requestHeaders,
@@ -129,7 +216,7 @@ export async function POST(request: NextRequest) {
 
     const existingExtensionKey = apiKeys.find(isExtensionKey);
 
-    if (existingExtensionKey && existingExtensionKey.enabled) {
+    if (existingExtensionKey && existingExtensionKey.enabled !== false) {
       // Return existing key info (but not the key itself for security)
       return NextResponse.json({
         success: true,
@@ -146,11 +233,15 @@ export async function POST(request: NextRequest) {
     }
 
     // Create a new extension-scoped key using Better Auth's supported API key flow.
+    // Do not pass request headers here: Better Auth treats permissions as a
+    // server-only property whenever headers/request context are present. The
+    // route already authenticated the session above, so binding the key to that
+    // user ID is the intended server-side flow.
     const newKey = await apiKeyServerApi.createApiKey({
-      headers: requestHeaders,
       body: {
+        userId,
         configId: EXTENSION_API_KEY_CONFIG_ID,
-        name: data.name,
+        name: apiKeyName,
         prefix: EXTENSION_API_KEY_PREFIX,
         permissions: EXTENSION_API_KEY_PERMISSIONS,
       },
@@ -175,10 +266,11 @@ export async function POST(request: NextRequest) {
     });
   } catch (error) {
     logger.error({ err: error }, "Failed to generate extension API key");
+    const status = getBetterAuthErrorStatus(error);
 
     return NextResponse.json(
-      { success: false, error: "Failed to generate API key" },
-      { status: 500 }
+      { success: false, error: status >= 500 ? "Failed to generate API key" : getBetterAuthErrorMessage(error) },
+      { status }
     );
   }
 }

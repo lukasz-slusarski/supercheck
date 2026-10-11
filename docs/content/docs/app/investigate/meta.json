@@ -1,0 +1,10 @@
+{
+  "title": "Investigate",
+  "description": "Incident investigation, evidence, and Copilot",
+  "pages": [
+    "index",
+    "incidents",
+    "copilot",
+    "connectors"
+  ]
+}

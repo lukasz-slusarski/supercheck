@@ -1,20 +1,21 @@
 ---
 title: CLI Overview
-description: Supercheck CLI for CI/CD integration, automation, and monitoring-as-code
+description: Open-source testing, monitoring, and AI SRE — as code with the Supercheck CLI
 icon: Terminal
 ---
 
-The Supercheck CLI (`@supercheck/cli`) provides a first-class command-line interface for CI/CD pipelines, automation workflows, and monitoring-as-code. Built with TypeScript, it supports all major Supercheck operations — jobs, tests, monitors, variables, and more.
+The Supercheck CLI (`@supercheck/cli`) provides a first-class command-line interface for CI/CD pipelines, automation workflows, monitoring-as-code, and AI-assisted incident response. Use it to manage jobs, tests, monitors, incidents, service topology, variables, and more.
 
-[View the package on npm](https://www.npmjs.com/package/@supercheck/cli).
+[View the package on npm](https://www.npmjs.com/package/@supercheck/cli). CLI releases from 0.3.1 are [Apache-2.0](https://github.com/supercheck-io/supercheck/blob/main/cli/LICENSE); earlier releases retain their original licenses.
 
 ## Key Features
 
 - **CI/CD Integration** — Trigger jobs, wait for results, and gate deployments
 - **Monitoring-as-Code** — Define monitors, tests, jobs, notification providers, variables, tags, and status pages in `supercheck.config.ts`
-- **Full CRUD** — Manage all resources from the terminal
+- **Resource management** — Manage supported resources from the terminal within your permissions
 - **JSON Output** — Machine-readable output for scripting with `--json`
-- **Retry & Rate Limiting** — Automatic retries with exponential backoff
+- **AI SRE** — Triage incidents, start investigations, stream Copilot answers, and inspect service dependencies
+- **Safe Retry & Rate Limiting** — Exponential backoff for rate limits and idempotent failures without replaying uncertain mutations
 - **Self-Hosted Support** — Works with any Supercheck deployment
 
 ## Quick Start
@@ -34,13 +35,17 @@ supercheck health
 supercheck job list
 supercheck monitor list
 supercheck test list
+
+# Investigate reliability incidents
+supercheck incident list
+supercheck sre ask "Summarize active reliability risks"
 ```
 
 <Callout type="info">
   In CI/CD, set `SUPERCHECK_TOKEN` for general CLI/API commands. For `supercheck job trigger`, set `SUPERCHECK_TRIGGER_KEY`, and add `SUPERCHECK_TOKEN` only when you also use `--wait`.
 </Callout>
 
-## How It Works
+## Choose Your Credential
 
 Most CLI commands use **CLI tokens** (`sck_live_*`). `supercheck job trigger` is the exception: it uses a job-specific **trigger key** (`sck_trigger_*`) and optionally a CLI token when waiting for completion.
 
@@ -54,8 +59,8 @@ supercheck job trigger <id>   → Triggers jobs from CI/CD
 
 ## Next Steps
 
-- [Installation](./installation) — Install and set up the CLI
-- [Authentication](./authentication) — Token types and security
-- [Configuration](./configuration) — `supercheck.config.ts` reference
-- [Commands](./commands) — Full command reference
-- [CI/CD Integration](./ci-cd) — GitHub Actions, GitLab CI, Docker
+- [Installation](/docs/cli/installation) — Install and set up the CLI
+- [Authentication](/docs/cli/authentication) — Token types and security
+- [Configuration](/docs/cli/configuration) — `supercheck.config.ts` reference
+- [Commands](/docs/cli/commands) — Full command reference
+- [CI/CD Integration](/docs/cli/ci-cd) — GitHub Actions, GitLab CI, Docker

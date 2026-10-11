@@ -1,11 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/utils/db';
 import { invitation, member, organization, projects, projectMembers, session, user as userTable } from '@/db/schema';
-import { eq, and, inArray, desc } from 'drizzle-orm';
+import { eq, and, inArray, desc, asc, gt } from 'drizzle-orm';
 import { requireUserAuthContext, isAuthError } from '@/lib/auth-context';
 import { getCurrentUser } from '@/lib/session';
 import { auth } from '@/utils/auth';
 import { headers } from 'next/headers';
+import { isCloudHosted } from '@/lib/feature-flags';
 
 export async function GET(
   request: NextRequest,
@@ -60,21 +61,27 @@ export async function GET(
       );
     }
 
+    const viewer = await auth.api.getSession({ headers: await headers() });
+    const isMatchingUser = Boolean(viewer?.user?.email &&
+      viewer.user.email.toLowerCase().trim() === invite.email.toLowerCase().trim());
+    const canViewEmail = isMatchingUser;
+    const canViewPersonalDetails = isMatchingUser && (isCloudHosted() ? viewer?.user?.emailVerified === true : true);
+
     return NextResponse.json({
       success: true,
       data: {
-        // NOTE: This endpoint serves both the invite acceptance page and the sign-in/sign-up
-        // page (for pre-filling forms). The invite page requires role, expiresAt, and inviter
-        // info to render the invitation details. The role is already disclosed in the
-        // invitation email, so including it here does not increase exposure.
+        // Public invite pages need only the organization, role and expiry.
+        // Personal details are returned only to the matching account.
         organizationName: invite.orgName,
-        email: invite.email,
+        ...(canViewEmail ? { email: invite.email } : {}),
         role: invite.role,
         expiresAt: invite.expiresAt.toISOString(),
-        inviterName: invite.inviterName,
-        inviterEmail: invite.inviterEmail,
+        ...(canViewPersonalDetails ? {
+          inviterName: invite.inviterName,
+          inviterEmail: invite.inviterEmail,
+        } : {}),
       }
-    });
+    }, { headers: { 'Cache-Control': 'private, no-store' } });
   } catch (error) {
     console.error('Error fetching invitation:', error);
     return NextResponse.json(
@@ -161,6 +168,19 @@ export async function POST(
         { status: 400 }
       );
     }
+    if (isCloudHosted()) {
+      const [acceptingUser] = await db
+        .select({ emailVerified: userTable.emailVerified })
+        .from(userTable)
+        .where(eq(userTable.id, currentUser.id))
+        .limit(1);
+      if (!acceptingUser?.emailVerified) {
+        return NextResponse.json(
+          { error: 'Verify your email address before accepting this invitation', code: 'EMAIL_NOT_VERIFIED' },
+          { status: 403 }
+        );
+      }
+    }
 
     // Check if user is already a member
     const existingMember = await db
@@ -192,30 +212,34 @@ export async function POST(
       );
     }
 
+    const sessionData = await auth.api.getSession({ headers: await headers() });
+    if (!sessionData?.session?.token) {
+      return NextResponse.json({ error: 'Please sign in again to accept the invitation' }, { status: 401 });
+    }
+
     await db.transaction(async (tx) => {
+      // Serialize acceptance with signup and other invitations for this user.
+      // The user lock makes the membership check authoritative across requests.
+      const [acceptingUser] = await tx.select({ id: userTable.id }).from(userTable)
+        .where(eq(userTable.id, currentUser.id)).limit(1).for("update");
+      if (!acceptingUser) throw new Error('INVITE_SESSION_CHANGED');
+      // Claim the pending invitation before any membership/session changes.
+      // A concurrent acceptance/cancellation must not succeed twice.
+      const [claimed] = await tx.update(invitation).set({ status: 'accepted' })
+        .where(and(eq(invitation.id, token), eq(invitation.status, 'pending'), gt(invitation.expiresAt, new Date())))
+        .returning({ id: invitation.id });
+      if (!claimed) throw new Error('INVITE_ALREADY_USED');
       const role = invite.role!.toLowerCase();
       const requiresProjectAssignments = role === 'project_admin' || role === 'project_editor';
 
-      // 1. Add user to organization
-      try {
-        await tx
-          .insert(member)
-          .values({
-            organizationId: invite.organizationId,
-            userId: currentUser.id,
-            role: invite.role as 'org_owner' | 'org_admin' | 'project_admin' | 'project_editor' | 'project_viewer',
-            createdAt: new Date()
-          });
-      } catch (error: unknown) {
-        const dbError = error as { constraint?: string; code?: string; message?: string };
-        if (dbError?.constraint === 'member_uniqueUserOrg' || 
-            dbError?.code === '23505' || 
-            dbError?.message?.includes('duplicate key')) {
-          console.log(`ℹ️ User ${currentUser.email} was already a member of organization ${invite.orgName} - continuing`);
-        } else {
-          throw error;
-        }
-      }
+      // Do not catch unique violations inside PostgreSQL transactions: they
+      // abort the transaction. A duplicate membership is safe to leave intact.
+      await tx.insert(member).values({
+        organizationId: invite.organizationId,
+        userId: currentUser.id,
+        role: role as 'org_admin' | 'project_admin' | 'project_editor' | 'project_viewer',
+        createdAt: new Date(),
+      }).onConflictDoNothing({ target: [member.userId, member.organizationId] });
 
       // 2. Assign user to selected projects
       // Parse selectedProjects — handles both jsonb arrays and legacy JSON-stringified arrays
@@ -249,7 +273,7 @@ export async function POST(
         throw new Error("INVITE_PROJECT_SCOPE_MISMATCH");
       }
 
-      if (normalizedSelectedProjectIds.length > 0) {
+      if (requiresProjectAssignments && normalizedSelectedProjectIds.length > 0) {
         // SECURITY: Filter by organization ID to prevent cross-org project assignment
         const selectedProjectsList = await tx
           .select({
@@ -270,94 +294,54 @@ export async function POST(
         }
 
         for (const project of selectedProjectsList) {
-          try {
-            await tx
-              .insert(projectMembers)
-              .values({
-                userId: currentUser.id,
-                projectId: project.id,
-                role: invite.role as 'org_owner' | 'org_admin' | 'project_admin' | 'project_editor' | 'project_viewer',
-                createdAt: new Date()
-              });
-          } catch (error: unknown) {
-            const dbError = error as { constraint?: string; code?: string; message?: string };
-            if (dbError?.constraint === 'project_members_uniqueUserProject' || 
-                dbError?.code === '23505' || 
-                dbError?.message?.includes('duplicate key')) {
-              console.log(`ℹ️ User ${currentUser.email} was already assigned to project "${project.name}" - skipping`);
-            } else {
-              // In a transaction, non-duplicate errors should cause rollback
-              throw error;
-            }
-          }
+          await tx.insert(projectMembers).values({
+            userId: currentUser.id,
+            projectId: project.id,
+            role: role as 'project_admin' | 'project_editor',
+            createdAt: new Date(),
+          }).onConflictDoNothing({ target: [projectMembers.userId, projectMembers.projectId] });
         }
 
         const projectNames = selectedProjectsList.map(p => p.name);
         console.log(`✅ Assigned user ${currentUser.email} to projects: ${projectNames.join(', ')} in organization "${invite.orgName}"`);
       }
 
-      // 3. Mark invitation as accepted (inside transaction)
-      await tx
-        .update(invitation)
-        .set({ status: 'accepted' })
-        .where(eq(invitation.id, token));
+      // Select both tenant scopes in the same transaction as acceptance.
+      const isProjectScopedRole = requiresProjectAssignments;
+      const firstProject = isProjectScopedRole
+        ? await tx
+            .select({ id: projects.id })
+            .from(projects)
+            .innerJoin(projectMembers, and(
+              eq(projectMembers.projectId, projects.id),
+              eq(projectMembers.userId, currentUser.id)
+            ))
+            .where(and(
+              eq(projects.organizationId, invite.organizationId),
+              eq(projects.status, 'active')
+            ))
+            .orderBy(desc(projects.isDefault), asc(projects.createdAt), asc(projects.id))
+            .limit(1)
+        : await tx
+            .select({ id: projects.id })
+            .from(projects)
+            .innerJoin(member, and(
+              eq(member.organizationId, invite.organizationId),
+              eq(member.userId, currentUser.id)
+            ))
+            .where(and(
+              eq(projects.organizationId, invite.organizationId),
+              eq(projects.status, 'active')
+            ))
+            .orderBy(desc(projects.isDefault), asc(projects.createdAt), asc(projects.id))
+            .limit(1);
+
+      const [selected] = await tx.update(session)
+        .set({ activeOrganizationId: invite.organizationId, activeProjectId: firstProject[0]?.id ?? null })
+        .where(and(eq(session.token, sessionData.session.token), eq(session.userId, currentUser.id)))
+        .returning({ id: session.id });
+      if (!selected) throw new Error('INVITE_SESSION_CHANGED');
     });
-
-    // Set the invited org's first project as active in the user's session so that
-    // subsequent requests (SSE streams, API calls) don't hit "No active project found".
-    // This follows the same pattern as setup-defaults/route.ts.
-    try {
-      const sessionData = await auth.api.getSession({
-        headers: await headers(),
-      });
-
-      if (sessionData?.session?.token) {
-        // Follow existing RBAC patterns:
-        // - project_admin / project_editor: need explicit project_members rows
-        // - org_admin / org_owner / project_viewer: org membership grants access
-        //   to any active project (project_viewer is intentionally org-wide read-only)
-        const role = (invite.role ?? '').toLowerCase();
-        const isProjectScopedRole = role === 'project_admin' || role === 'project_editor';
-
-        const firstProject = isProjectScopedRole
-          ? await db
-              .select({ id: projects.id })
-              .from(projects)
-              .innerJoin(projectMembers, and(
-                eq(projectMembers.projectId, projects.id),
-                eq(projectMembers.userId, currentUser.id)
-              ))
-              .where(and(
-                eq(projects.organizationId, invite.organizationId),
-                eq(projects.status, 'active')
-              ))
-              .orderBy(desc(projects.isDefault))
-              .limit(1)
-          : await db
-              .select({ id: projects.id })
-              .from(projects)
-              .innerJoin(member, and(
-                eq(member.organizationId, invite.organizationId),
-                eq(member.userId, currentUser.id)
-              ))
-              .where(and(
-                eq(projects.organizationId, invite.organizationId),
-                eq(projects.status, 'active')
-              ))
-              .orderBy(desc(projects.isDefault))
-              .limit(1);
-
-        if (firstProject.length > 0) {
-          await db
-            .update(session)
-            .set({ activeProjectId: firstProject[0].id })
-            .where(eq(session.token, sessionData.session.token));
-        }
-      }
-    } catch (sessionError) {
-      // Non-fatal: the session will be fixed on next page load via setDefaultProjectInSession
-      console.warn('⚠️ Failed to set active project in session after invitation acceptance:', sessionError);
-    }
 
     return NextResponse.json({
       success: true,
@@ -368,6 +352,12 @@ export async function POST(
       }
     });
   } catch (error) {
+    if (error instanceof Error && error.message === 'INVITE_SESSION_CHANGED') {
+      return NextResponse.json({ error: 'Session changed. Please sign in again.' }, { status: 401 });
+    }
+    if (error instanceof Error && error.message === 'INVITE_ALREADY_USED') {
+      return NextResponse.json({ error: 'Invitation has expired, been used or cancelled' }, { status: 400 });
+    }
     if (error instanceof Error && error.message === "INVITE_PROJECT_SCOPE_MISMATCH") {
       return NextResponse.json(
         { error: 'Invitation contains invalid project assignments. Please request a new invitation.' },

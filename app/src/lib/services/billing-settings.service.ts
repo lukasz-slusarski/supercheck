@@ -1,6 +1,6 @@
 /**
  * Billing Settings Service
- * 
+ *
  * Manages organization billing settings including:
  * - Spending limits
  * - Notification preferences
@@ -8,8 +8,14 @@
  */
 
 import { db } from "@/utils/db";
-import { billingSettings, type BillingSettings, type BillingSettingsInsert } from "@/db/schema";
+import {
+  billingSettings,
+  organization,
+  type BillingSettings,
+  type BillingSettingsInsert,
+} from "@/db/schema";
 import { eq } from "drizzle-orm";
+import { BillingSettingsValidationError } from "@/lib/billing-errors";
 
 export interface BillingSettingsUpdate {
   monthlySpendingLimitCents?: number | null;
@@ -47,7 +53,7 @@ type NotificationThreshold =
   | "spending_limit"
   | "spending_90";
 
-type NotificationResource = "playwright" | "k6" | "ai";
+type NotificationResource = "playwright" | "k6" | "ai" | "sre";
 
 class BillingSettingsService {
   /**
@@ -61,18 +67,25 @@ class BillingSettingsService {
 
     // Create default settings if none exist
     if (!settings) {
-      const [newSettings] = await db.insert(billingSettings).values({
-        organizationId,
-        enableSpendingLimit: false,
-        hardStopOnLimit: false,
-        notifyAt50Percent: false,
-        notifyAt80Percent: true,
-        notifyAt90Percent: true,
-        notifyAt100Percent: true,
-      }).returning();
-      settings = newSettings;
+      const [newSettings] = await db
+        .insert(billingSettings)
+        .values({
+          organizationId,
+          enableSpendingLimit: false,
+          hardStopOnLimit: false,
+          notifyAt50Percent: false,
+          notifyAt80Percent: true,
+          notifyAt90Percent: true,
+          notifyAt100Percent: true,
+        })
+        .onConflictDoNothing({ target: billingSettings.organizationId })
+        .returning();
+      settings = newSettings ?? await db.query.billingSettings.findFirst({
+        where: eq(billingSettings.organizationId, organizationId),
+      });
     }
 
+    if (!settings) throw new Error("Billing settings are unavailable");
     return this.formatSettings(settings);
   }
 
@@ -81,7 +94,7 @@ class BillingSettingsService {
    */
   async updateSettings(
     organizationId: string,
-    updates: BillingSettingsUpdate
+    updates: BillingSettingsUpdate,
   ): Promise<BillingSettingsResponse> {
     // Ensure settings exist
     await this.getSettings(organizationId);
@@ -123,13 +136,25 @@ class BillingSettingsService {
       updateData.notificationEmails = updates.notificationEmails;
     }
 
-    const [updated] = await db
-      .update(billingSettings)
-      .set(updateData)
-      .where(eq(billingSettings.organizationId, organizationId))
-      .returning();
-
-    return this.formatSettings(updated);
+    return db.transaction(async (tx) => {
+      // Validate partial updates against the locked row, so concurrent saves
+      // cannot leave a limit enabled with a null or nonpositive amount.
+      const [current] = await tx.select().from(billingSettings)
+        .where(eq(billingSettings.organizationId, organizationId)).for("update");
+      if (!current) throw new Error("Billing settings are unavailable");
+      const enabled = updates.enableSpendingLimit ?? current.enableSpendingLimit;
+      const cents = updates.monthlySpendingLimitCents !== undefined
+        ? updates.monthlySpendingLimitCents : current.monthlySpendingLimitCents;
+      if (cents !== null && (!Number.isInteger(cents) || cents < 0 || cents > 2147483647)) {
+        throw new BillingSettingsValidationError("Spending limits must be representable as whole cents");
+      }
+      if (enabled && (cents === null || cents <= 0)) {
+        throw new BillingSettingsValidationError("A positive monthly spending limit is required when spending limits are enabled");
+      }
+      const [updated] = await tx.update(billingSettings).set(updateData)
+        .where(eq(billingSettings.organizationId, organizationId)).returning();
+      return this.formatSettings(updated);
+    });
   }
 
   /**
@@ -138,9 +163,10 @@ class BillingSettingsService {
   async setSpendingLimit(
     organizationId: string,
     limitDollars: number | null,
-    hardStop: boolean = false
+    hardStop: boolean = false,
   ): Promise<BillingSettingsResponse> {
-    const limitCents = limitDollars !== null ? Math.round(limitDollars * 100) : null;
+    const limitCents =
+      limitDollars !== null ? Math.round(limitDollars * 100) : null;
 
     return this.updateSettings(organizationId, {
       monthlySpendingLimitCents: limitCents,
@@ -152,7 +178,9 @@ class BillingSettingsService {
   /**
    * Disable spending limit
    */
-  async disableSpendingLimit(organizationId: string): Promise<BillingSettingsResponse> {
+  async disableSpendingLimit(
+    organizationId: string,
+  ): Promise<BillingSettingsResponse> {
     return this.updateSettings(organizationId, {
       enableSpendingLimit: false,
       hardStopOnLimit: false,
@@ -170,7 +198,7 @@ class BillingSettingsService {
       notifyAt90Percent?: boolean;
       notifyAt100Percent?: boolean;
       emails?: string[];
-    }
+    },
   ): Promise<BillingSettingsResponse> {
     return this.updateSettings(organizationId, {
       notifyAt50Percent: preferences.notifyAt50Percent,
@@ -184,8 +212,11 @@ class BillingSettingsService {
   /**
    * Reset notifications sent this period (called on billing period reset)
    */
-  async resetNotificationsForPeriod(organizationId: string): Promise<void> {
-    await db
+  async resetNotificationsForPeriod(
+    organizationId: string,
+    database: Pick<typeof db, "update"> = db,
+  ): Promise<void> {
+    await database
       .update(billingSettings)
       .set({
         notificationsSentThisPeriod: null,
@@ -200,31 +231,31 @@ class BillingSettingsService {
   async markNotificationSent(
     organizationId: string,
     threshold: NotificationThreshold,
-    resource?: NotificationResource
+    resource?: NotificationResource,
+    periodStart?: Date | null,
   ): Promise<void> {
-    const settings = await db.query.billingSettings.findFirst({
-      where: eq(billingSettings.organizationId, organizationId),
-    });
+    await db.transaction(async (tx) => {
+      // Rollover holds this same lock. An email sent for the old period must
+      // not suppress the new period's alert after the counter reset commits.
+      const [org] = await tx.select({ usagePeriodStart: organization.usagePeriodStart })
+        .from(organization).where(eq(organization.id, organizationId)).for("update");
+      if (!org || (periodStart !== undefined &&
+        org.usagePeriodStart?.getTime() !== periodStart?.getTime())) return;
+      const settings = await tx.query.billingSettings.findFirst({
+        where: eq(billingSettings.organizationId, organizationId),
+      });
+      if (!settings) return;
 
-    if (!settings) return;
-
-    // notificationsSentThisPeriod is a jsonb array. Positive numbers are
-    // resource-qualified usage thresholds; negative numbers are spending alerts.
-    const sentThisPeriod: number[] = settings.notificationsSentThisPeriod ?? [];
-    const thresholdNum = this.getNotificationSentKey(threshold, resource);
-
-    if (!sentThisPeriod.includes(thresholdNum)) {
-      sentThisPeriod.push(thresholdNum);
-    }
-
-    await db
-      .update(billingSettings)
-      .set({
+      // Positive keys identify quota/resource thresholds; negative keys identify
+      // spending alerts. The lock also prevents concurrent keys being lost.
+      const sentThisPeriod: number[] = settings.notificationsSentThisPeriod ?? [];
+      const thresholdNum = this.getNotificationSentKey(threshold, resource);
+      if (!sentThisPeriod.includes(thresholdNum)) sentThisPeriod.push(thresholdNum);
+      await tx.update(billingSettings).set({
         notificationsSentThisPeriod: sentThisPeriod,
-        lastNotificationSentAt: new Date(),
-        updatedAt: new Date(),
-      })
-      .where(eq(billingSettings.organizationId, organizationId));
+        lastNotificationSentAt: new Date(), updatedAt: new Date(),
+      }).where(eq(billingSettings.organizationId, organizationId));
+    });
   }
 
   /**
@@ -235,7 +266,7 @@ class BillingSettingsService {
   async hasNotificationBeenSent(
     organizationId: string,
     threshold: NotificationThreshold,
-    resource?: NotificationResource
+    resource?: NotificationResource,
   ): Promise<boolean> {
     const settings = await db.query.billingSettings.findFirst({
       where: eq(billingSettings.organizationId, organizationId),
@@ -253,7 +284,7 @@ class BillingSettingsService {
 
   private getNotificationSentKey(
     threshold: NotificationThreshold,
-    resource?: NotificationResource
+    resource?: NotificationResource,
   ): number {
     if (threshold === "spending_warning") return -1;
     if (threshold === "spending_limit") return -2;
@@ -262,6 +293,7 @@ class BillingSettingsService {
     const thresholdNum = parseInt(threshold, 10);
     if (resource === "k6") return 1000 + thresholdNum;
     if (resource === "ai") return 2000 + thresholdNum;
+    if (resource === "sre") return 3000 + thresholdNum;
     return thresholdNum;
   }
 
