@@ -211,6 +211,7 @@ x-common-env: &common-env # Database Configuration - External PostgreSQL
   # Get your API key from: https://console.anthropic.com/settings/keys
   # --------------------------------------------------------------------------
   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  ANTHROPIC_WORKSPACE_ID: ${ANTHROPIC_WORKSPACE_ID:-}
 
   # --------------------------------------------------------------------------
   # Provider D: Google Gemini (AI Studio - simple API key, recommended)

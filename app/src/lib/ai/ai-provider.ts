@@ -12,7 +12,7 @@
 
 import { openai, createOpenAI } from "@ai-sdk/openai";
 import { azure } from "@ai-sdk/azure";
-import { anthropic } from "@ai-sdk/anthropic";
+import { anthropic, createAnthropic } from "@ai-sdk/anthropic";
 import { google } from "@ai-sdk/google";
 import { vertex } from "@ai-sdk/google-vertex";
 import { createAmazonBedrock } from "@ai-sdk/amazon-bedrock";
@@ -256,7 +256,12 @@ export function getProviderModel(): LanguageModel {
         // ANTHROPIC_API_KEY is read automatically from env
         const model = modelName || "claude-3-5-haiku-20241022";
         console.log(`[AI Provider] Initializing Anthropic with model: ${model}`);
-        return anthropic(model) as unknown as LanguageModel;
+        // Keys not scoped to a workspace require the anthropic-workspace-id header
+        const workspaceId = process.env.ANTHROPIC_WORKSPACE_ID?.trim();
+        const anthropicProvider = workspaceId
+          ? createAnthropic({ headers: { "anthropic-workspace-id": workspaceId } })
+          : anthropic;
+        return anthropicProvider(model) as unknown as LanguageModel;
       }
 
       case "gemini": {
