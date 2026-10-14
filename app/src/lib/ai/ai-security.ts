@@ -319,11 +319,22 @@ export class AISecurityService {
       // Only allow HTTP(S) in production, also allow http for development
       const isProduction = process.env.NODE_ENV === "production";
       if (isProduction && parsedUrl.protocol !== "https:") {
-        // Allow http only for localhost in production (for internal services)
+        // Allow http only for localhost and for the configured internal S3
+        // endpoint when it is itself http (self-hosted MinIO, e.g. http://minio:9000)
+        let internalS3Host: string | null = null;
+        try {
+          const s3 = process.env.S3_ENDPOINT
+            ? new URL(process.env.S3_ENDPOINT)
+            : null;
+          if (s3 && s3.protocol === "http:") internalS3Host = s3.hostname;
+        } catch {
+          // Ignore invalid S3_ENDPOINT URLs
+        }
         if (
           parsedUrl.protocol === "http:" &&
           (parsedUrl.hostname === "localhost" ||
-            parsedUrl.hostname === "127.0.0.1")
+            parsedUrl.hostname === "127.0.0.1" ||
+            parsedUrl.hostname === internalS3Host)
         ) {
           // Allow localhost HTTP in production for internal services
         } else {

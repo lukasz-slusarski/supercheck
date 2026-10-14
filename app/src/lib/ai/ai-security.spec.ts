@@ -613,4 +613,32 @@ describe("URL Validation Security", () => {
       }
     });
   });
+
+  describe("internal http S3 endpoint in production", () => {
+    const env = process.env;
+    afterEach(() => {
+      process.env = env;
+    });
+
+    it("should accept http URLs on the configured S3 endpoint host", () => {
+      process.env = { ...env, NODE_ENV: "production", S3_ENDPOINT: "http://minio:9000" };
+      expect(
+        AISecurityService.validateReportUrl(
+          "http://minio:9000/playwright-test-artifacts/id/report/index.html"
+        )
+      ).toBe(true);
+    });
+
+    it("should still reject http URLs on other hosts", () => {
+      process.env = { ...env, NODE_ENV: "production", S3_ENDPOINT: "http://minio:9000" };
+      expect(AISecurityService.validateReportUrl("http://evil.com/report.md")).toBe(false);
+    });
+
+    it("should reject http when the S3 endpoint itself is https", () => {
+      process.env = { ...env, NODE_ENV: "production", S3_ENDPOINT: "https://minio.example.com" };
+      expect(
+        AISecurityService.validateReportUrl("http://minio.example.com/report.md")
+      ).toBe(false);
+    });
+  });
 });
