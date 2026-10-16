@@ -301,7 +301,18 @@ describe('ContainerExecutorService', () => {
         close: jest.fn(),
       });
       (configuredService as any).execClient = {
-        exec: jest.fn().mockResolvedValue(socket),
+        exec: jest.fn(
+          async (
+            _ns: string,
+            _pod: string,
+            _c: string,
+            _cmd: string[],
+            out: Writable,
+          ) => {
+            out.write('0\n');
+            return socket;
+          },
+        ),
       };
       const waitForExecSocket = jest.spyOn(
         configuredService as any,
@@ -312,13 +323,90 @@ describe('ContainerExecutorService', () => {
         (configuredService as any).capturePodTarStream(
           'execution-pod',
           '/tmp/supercheck/run-test/report',
+          '/tmp/supercheck/run-test',
         ),
       ).resolves.toEqual(Buffer.alloc(0));
       expect(waitForExecSocket).toHaveBeenCalledWith(
         socket,
-        'artifact extraction from pod execution-pod',
+        'artifact packing in pod execution-pod',
         123456,
       );
+    });
+
+    it('copies the artifact archive in chunks and re-reads a short chunk', async () => {
+      const chunkBytes = 4 * 1024 * 1024;
+      const archive = Buffer.alloc(chunkBytes + 1000, 7);
+      archive.fill(9, chunkBytes);
+      const commands: string[] = [];
+      let truncateNextChunk = true;
+      (service as any).execClient = {
+        exec: jest.fn(
+          async (
+            _ns: string,
+            _pod: string,
+            _c: string,
+            cmd: string[],
+            out: Writable,
+          ) => {
+            const script = cmd[2];
+            commands.push(script);
+            if (script.includes('tar cf')) {
+              out.write(`${archive.length}\n`);
+            } else if (script.startsWith('dd ')) {
+              const skip = Number(/skip=(\d+)/.exec(script)![1]) * 64 * 1024;
+              let data = archive.subarray(skip, skip + chunkBytes);
+              if (skip === 0 && truncateNextChunk) {
+                truncateNextChunk = false;
+                data = data.subarray(0, 1024);
+              }
+              out.write(data);
+            }
+            return Object.assign(new EventEmitter(), {
+              readyState: 3,
+              close: jest.fn(),
+            });
+          },
+        ),
+      };
+
+      const result: Buffer = await (service as any).capturePodTarStream(
+        'execution-pod',
+        '/tmp/supercheck/run-test/report',
+        '/tmp/supercheck/run-test',
+      );
+
+      expect(result.equals(archive)).toBe(true);
+      expect(commands.filter((c) => c.startsWith('dd '))).toHaveLength(3);
+      expect(commands[commands.length - 1]).toContain('rm -f');
+    });
+
+    it('fails when a chunk stays incomplete after all attempts', async () => {
+      (service as any).execClient = {
+        exec: jest.fn(
+          async (
+            _ns: string,
+            _pod: string,
+            _c: string,
+            cmd: string[],
+            out: Writable,
+          ) => {
+            if (cmd[2].includes('tar cf')) out.write('5000\n');
+            else if (cmd[2].startsWith('dd ')) out.write(Buffer.alloc(10));
+            return Object.assign(new EventEmitter(), {
+              readyState: 3,
+              close: jest.fn(),
+            });
+          },
+        ),
+      };
+
+      await expect(
+        (service as any).capturePodTarStream(
+          'execution-pod',
+          '/tmp/supercheck/run-test/report',
+          '/tmp/supercheck/run-test',
+        ),
+      ).rejects.toThrow('incomplete after 3 attempts');
     });
   });
 

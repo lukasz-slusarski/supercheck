@@ -172,6 +172,11 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
 
   /** Max artifact tar archive size in bytes (100 MB) */
   private static readonly MAX_ARTIFACT_ARCHIVE_BYTES = 100 * 1024 * 1024;
+  private static readonly ARTIFACT_ARCHIVE_NAME = '.supercheck-artifacts.tar';
+  /** Artifacts are copied out of the pod in chunks of this size (4 MB) */
+  private static readonly ARTIFACT_CHUNK_BYTES = 4 * 1024 * 1024;
+  private static readonly ARTIFACT_BLOCK_BYTES = 64 * 1024;
+  private static readonly ARTIFACT_CHUNK_ATTEMPTS = 3;
 
   /**
    * Memory overhead added to the pod memory limit to account for:
@@ -870,6 +875,9 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
           );
         } catch (extractError) {
           artifactExtractionDurationMs = Date.now() - extractionStartedAt;
+          // The test outcome comes from the exit code file, not the artifacts.
+          // Failing the run here used to hide the real test result behind a
+          // tar error, so a missing report is logged and the run continues.
           this.logger.error(
             `Failed to extract pod artifacts after ${artifactExtractionDurationMs}ms: ${
               extractError instanceof Error
@@ -877,7 +885,6 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
                 : String(extractError)
             }`,
           );
-          throw extractError;
         }
       }
 
@@ -1848,7 +1855,11 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
       );
     }
 
-    const archive = await this.capturePodTarStream(podName, cleanSource);
+    const archive = await this.capturePodTarStream(
+      podName,
+      cleanSource,
+      workspaceRoot,
+    );
     if (archive.length === 0) {
       this.logger.debug(`No artifacts found at ${cleanSource} in ${podName}`);
       return;
@@ -1868,10 +1879,114 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
     await finished(Readable.from(archive).pipe(extractor));
   }
 
+  /**
+   * Packs the artifacts into a tar file inside the pod and copies it out in
+   * fixed-size chunks, checking the length of every chunk. Streaming the whole
+   * archive through one exec socket was occasionally cut short on larger
+   * reports (TAR_BAD_ARCHIVE: Truncated input), so a short chunk is re-read
+   * instead of failing the run.
+   */
   private async capturePodTarStream(
     podName: string,
     sourcePath: string,
+    workspaceRoot: string,
   ): Promise<Buffer> {
+    const archivePath = `${workspaceRoot}/${ContainerExecutorService.ARTIFACT_ARCHIVE_NAME}`;
+    const source = this.escapeShellArg(sourcePath);
+    const archive = this.escapeShellArg(archivePath);
+
+    const packed = await this.execInPodToBuffer(
+      podName,
+      [
+        '/bin/sh',
+        '-c',
+        `if [ -e ${source} ]; then tar cf ${archive} --exclude=${this.escapeShellArg(ContainerExecutorService.ARTIFACT_ARCHIVE_NAME)} -C ${source} . && wc -c < ${archive}; else echo 0; fi`,
+      ],
+      `artifact packing in pod ${podName}`,
+    );
+    const archiveSize = Number.parseInt(
+      packed.stdout.toString('utf8').trim(),
+      10,
+    );
+    if (!Number.isFinite(archiveSize) || archiveSize < 0) {
+      throw new Error(
+        `tar extraction failed: ${packed.stderr || 'archive size unavailable'}`,
+      );
+    }
+    if (archiveSize === 0) {
+      return Buffer.alloc(0);
+    }
+    if (archiveSize > ContainerExecutorService.MAX_ARTIFACT_ARCHIVE_BYTES) {
+      throw new Error(
+        `Artifact archive exceeded ${ContainerExecutorService.MAX_ARTIFACT_ARCHIVE_BYTES} bytes`,
+      );
+    }
+
+    try {
+      const chunkBytes = ContainerExecutorService.ARTIFACT_CHUNK_BYTES;
+      const blockBytes = ContainerExecutorService.ARTIFACT_BLOCK_BYTES;
+      const blocksPerChunk = chunkBytes / blockBytes;
+      const chunks: Buffer[] = [];
+      for (let offset = 0; offset < archiveSize; offset += chunkBytes) {
+        const expected = Math.min(chunkBytes, archiveSize - offset);
+        const command = [
+          '/bin/sh',
+          '-c',
+          `dd if=${archive} bs=${blockBytes} skip=${offset / blockBytes} count=${blocksPerChunk} 2>/dev/null`,
+        ];
+        let chunk: Buffer | undefined;
+        for (
+          let attempt = 1;
+          attempt <= ContainerExecutorService.ARTIFACT_CHUNK_ATTEMPTS;
+          attempt++
+        ) {
+          const read = await this.execInPodToBuffer(
+            podName,
+            command,
+            `artifact extraction from pod ${podName}`,
+          ).catch((error: unknown) => {
+            if (attempt === ContainerExecutorService.ARTIFACT_CHUNK_ATTEMPTS) {
+              throw error;
+            }
+            this.logger.warn(
+              `Artifact chunk at ${offset} from ${podName} failed (attempt ${attempt}): ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+            return undefined;
+          });
+          if (read && read.stdout.length === expected) {
+            chunk = read.stdout;
+            break;
+          }
+          if (read) {
+            this.logger.warn(
+              `Artifact chunk at ${offset} from ${podName} was ${read.stdout.length} of ${expected} bytes (attempt ${attempt})`,
+            );
+          }
+        }
+        if (!chunk) {
+          throw new Error(
+            `Artifact chunk at ${offset} from ${podName} incomplete after ${ContainerExecutorService.ARTIFACT_CHUNK_ATTEMPTS} attempts`,
+          );
+        }
+        chunks.push(chunk);
+      }
+      return Buffer.concat(chunks);
+    } finally {
+      await this.execInPod(podName, [
+        '/bin/sh',
+        '-c',
+        `rm -f ${archive}`,
+      ]).catch(() => undefined);
+    }
+  }
+
+  private async execInPodToBuffer(
+    podName: string,
+    command: string[],
+    operation: string,
+  ): Promise<{ stdout: Buffer; stderr: string }> {
     const chunks: Buffer[] = [];
     let totalBytes = 0;
     const stdout = new Writable({
@@ -1900,11 +2015,6 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
       },
     });
 
-    const command = [
-      '/bin/sh',
-      '-c',
-      `if [ -e ${this.escapeShellArg(sourcePath)} ]; then tar cf - -C ${this.escapeShellArg(sourcePath)} .; fi`,
-    ];
     const socket = (await this.execClient!.exec(
       this.executionNamespace,
       podName,
@@ -1918,16 +2028,16 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
 
     await this.waitForExecSocket(
       socket,
-      `artifact extraction from pod ${podName}`,
+      operation,
       this.artifactSocketTimeoutMs,
     );
 
     const stderrText = Buffer.concat(stderrChunks).toString('utf8').trim();
     if (stderrText) {
-      throw new Error(`tar extraction failed: ${stderrText}`);
+      this.logger.debug(`${operation} stderr: ${stderrText}`);
     }
 
-    return Buffer.concat(chunks);
+    return { stdout: Buffer.concat(chunks), stderr: stderrText };
   }
 
   private async validateTarArchive(archive: Buffer): Promise<void> {
