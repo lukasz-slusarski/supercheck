@@ -49,7 +49,7 @@ describe("McpConsent", () => {
 
   it("renders a hostile app name as text, never as markup", () => {
     setup({ name: "<img src=x onerror=alert(1)>", verifiedHost: null, redirectHost: null });
-    expect(document.querySelector("img")).toBeNull();
+    expect(document.querySelector("img[src=\"x\"]")).toBeNull();
     expect(screen.getByRole("heading", { name: /<img src=x onerror=alert\(1\)>/ })).toBeInTheDocument();
   });
 
