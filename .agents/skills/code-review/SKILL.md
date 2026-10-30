@@ -59,12 +59,13 @@ flowchart TD
   CHECK -->|yes| CLEAN{State and docs clean?}
   CLEAN -->|no| BLOCK
   CLEAN -->|yes| COMMIT[Commit-ready]
-  COMMIT --> CI[Required CI/review]
+  COMMIT --> CI[Required CI and human review]
   CI --> ACCEPT[Browser/provider/deployment acceptance]
   ACCEPT --> RELEASE[Release-ready]
 ```
 
-- Run proportionate focused checks and broaden for shared/high-risk contracts.
+- Run proportionate focused checks and broaden for shared/high-risk contracts (commands in `supercheck-testing-qa`).
+- CI coverage gaps to account for: `*.db.spec.ts` suites run only under `npm run test:db`, not `npm test`; the PR E2E job only typechecks and lists specs (`playwright test --list`), and the browser suite runs in `e2e-full.yml`. A green PR does not prove either.
 - Confirm whitespace/diff checks, package contents, ignored/generated files, migrations, and docs/skills parity.
 - Separate commit readiness from merge and release readiness.
 - An unavailable browser/provider/production check is a disclosed acceptance boundary, never a pass.

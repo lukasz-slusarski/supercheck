@@ -19,4 +19,7 @@ export class MonitorJobDataDto {
   executionLocation?: MonitoringLocation;
   executionGroupId?: string;
   expectedLocations?: MonitoringLocation[];
+  aggregationOnly?: boolean;
+  /** Set by the app when MISSING_CYCLE_CLOSURE_ENABLED persisted a cycle row for executionGroupId. */
+  monitorCycle?: boolean;
 }

@@ -1,3 +1,4 @@
+import { isUuid } from "@/lib/uuid";
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/utils/db";
 import { monitors } from "@/db/schema";
@@ -22,7 +23,7 @@ export async function PATCH(
   const { id } = params;
 
   try {
-    const { userId } = await requireUserAuthContext();
+    const { userId, projectId: tokenProjectId, isCliAuth } = await requireUserAuthContext();
     const data = await request.json();
     const { status } = data;
 
@@ -34,6 +35,7 @@ export async function PATCH(
     }
 
     // Get current monitor status for audit logging
+    if (!isUuid((await context.params).id)) return NextResponse.json({ error: "Monitor not found" }, { status: 404 });
     const currentMonitor = await db.query.monitors.findFirst({
       where: eq(monitors.id, id),
     });
@@ -45,7 +47,14 @@ export async function PATCH(
       );
     }
 
+    if (isCliAuth && tokenProjectId !== currentMonitor.projectId) {
+      return NextResponse.json({ error: "CLI token does not authorize this project" }, { status: 403 });
+    }
+
     // Check permission to manage/update monitor
+    if (!currentMonitor.organizationId || !currentMonitor.projectId) {
+      return NextResponse.json({ error: "Monitor not found" }, { status: 404 });
+    }
     if (currentMonitor.organizationId && currentMonitor.projectId) {
       const canManage = await hasPermissionForUser(userId, 'monitor', 'manage', {
         organizationId: currentMonitor.organizationId,
@@ -122,4 +131,4 @@ export async function PATCH(
       { status: 500 }
     );
   }
-} 
+}

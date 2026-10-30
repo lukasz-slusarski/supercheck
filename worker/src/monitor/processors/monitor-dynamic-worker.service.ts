@@ -5,10 +5,15 @@ import {
   Logger,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Worker, Job } from 'bullmq';
+import { Worker, Job, DelayedError, UnrecoverableError } from 'bullmq';
+import { consumesWorkerQueue } from '../../common/worker-queues';
+import { locationSupportsWorkload } from '../../common/location/location-capability';
 import Redis from 'ioredis';
 import { buildRedisOptions } from '../../common/redis/redis-options';
-import { MonitorService } from '../monitor.service';
+import {
+  MonitorService,
+  MonitorAggregationBusyError,
+} from '../monitor.service';
 import { MonitorJobDataDto } from '../dto/monitor-job.dto';
 import { MonitorExecutionResult } from '../types/monitor-result.type';
 import {
@@ -17,8 +22,15 @@ import {
 } from '../monitor.constants';
 import { HeartbeatService } from '../../common/heartbeat/heartbeat.service';
 import { DbService } from '../../db/db.service';
-import { and, eq, sql } from 'drizzle-orm';
+import { ExecutionCapacityError } from '../../execution/services/execution-admission.service';
+import { deferForCapacity } from '../../common/capacity-deferral';
+import { getErrorMessage } from '../../common/validation';
+import { and, desc, eq, sql } from 'drizzle-orm';
 import * as schema from '../../db/schema';
+import { getDatabasePoolMax } from '../../db/db-pool';
+
+/** How many times a skipped group's closure waits (about a minute each) for the aggregation lease. */
+const MAX_AGGREGATION_BUSY_RETRIES = 30;
 
 /**
  * Dynamically creates BullMQ Workers for regional monitor queues.
@@ -36,6 +48,13 @@ export class MonitorDynamicWorkerService
   private readonly logger = new Logger('MonitorDynamicWorkerService');
   private readonly workers = new Map<string, Worker>();
   private readonly activeQueueNames = new Set<string>();
+  // Leave work budget for execution and lease renewal; all regional queues share this limit.
+  private readonly monitorConcurrency = Math.max(
+    1,
+    Math.min(10, getDatabasePoolMax() - 2),
+  );
+  private activeChecks = 0;
+  private readonly waitingChecks: Array<() => void> = [];
   private connection: Redis | null = null;
   private subscriber: Redis | null = null;
   private workerLocation = 'local';
@@ -54,6 +73,13 @@ export class MonitorDynamicWorkerService
     this.workerLocation = this.configService
       .get<string>('WORKER_LOCATION', 'local')
       .toLowerCase();
+
+    if (!consumesWorkerQueue('monitor')) {
+      this.logger.log(
+        'WORKER_QUEUES excludes "monitor": monitor queues will not be consumed',
+      );
+      return;
+    }
 
     this.connection = this.createRedisConnection();
 
@@ -116,15 +142,34 @@ export class MonitorDynamicWorkerService
 
     const worker = new Worker(
       queueName,
-      async (job: Job<MonitorJobDataDto>) => this.processJob(job),
+      async (job: Job<MonitorJobDataDto>) => {
+        if (this.activeChecks >= this.monitorConcurrency) {
+          await new Promise<void>((resolve) =>
+            this.waitingChecks.push(resolve),
+          );
+        } else {
+          this.activeChecks++;
+        }
+        try {
+          return await this.processJob(job);
+        } finally {
+          const next = this.waitingChecks.shift();
+          if (next) next();
+          else this.activeChecks--;
+        }
+      },
       {
         // BullMQ creates and closes its own blocking connection. The service
         // owns this shared command connection and closes it during shutdown.
         connection: this.connection,
-        concurrency: 1,
-        lockDuration: 5 * 60 * 1000,
+        concurrency: this.monitorConcurrency,
+        // A synthetic check may run 5 minutes plus pod startup and artifact
+        // extraction; keep the lock comfortably above that so a slow check is
+        // not reported as stalled and rerun.
+        lockDuration: 15 * 60 * 1000,
         stalledInterval: 30000,
         maxStalledCount: 2,
+        metrics: { maxDataPoints: 60 },
       },
     );
 
@@ -148,7 +193,7 @@ export class MonitorDynamicWorkerService
 
       // When the job has exhausted all retries and is part of a distributed
       // execution group, generate an error MonitorResult so the aggregation
-      // gate (Redis SCARD vs expectedLocations.length) can still complete.
+      // group can still contain a result for every expected location.
       // Without this, one failed location would stall aggregation for the
       // entire execution cycle.
       if (job?.data) {
@@ -324,35 +369,226 @@ export class MonitorDynamicWorkerService
     const jobLocation = job.data.executionLocation;
 
     if (jobLocation) {
-      const result = await this.monitorService.executeMonitor(
-        job.data,
-        jobLocation,
-      );
+      if (
+        (job.data as { _capacityGaveUp?: boolean; _groupSkipped?: boolean })
+          ._capacityGaveUp ||
+        (job.data as { _groupSkipped?: boolean })._groupSkipped
+      ) {
+        await this.closeSkippedGroup(job);
+        return [];
+      }
+      const saved =
+        job.data.aggregationOnly && job.data.executionGroupId
+          ? await this.dbService.db.query.monitorResults.findFirst({
+              where: and(
+                eq(schema.monitorResults.monitorId, job.data.monitorId),
+                eq(
+                  schema.monitorResults.executionGroupId,
+                  job.data.executionGroupId,
+                ),
+                eq(schema.monitorResults.location, jobLocation),
+              ),
+              orderBy: [desc(schema.monitorResults.checkedAt)],
+            })
+          : undefined;
+      if (job.data.aggregationOnly && !saved)
+        throw new Error(
+          'Persisted monitor result unavailable for aggregation retry',
+        );
+      // Backstop for stale/misrouted jobs. Only on the execute path: a saved
+      // result (aggregation retry) must always be allowed to finish, so revoking
+      // a capability never discards results already produced.
+      if (!saved) await this.assertBrowserCapability(job.data, jobLocation);
+      const result = saved
+        ? {
+            ...saved,
+            details: saved.details ?? undefined,
+            responseTimeMs: saved.responseTimeMs ?? undefined,
+            testExecutionId: saved.testExecutionId ?? undefined,
+            testReportS3Url: saved.testReportS3Url ?? undefined,
+          }
+        : await this.executeOrDefer(job, () =>
+            this.monitorService.executeMonitor(job.data, jobLocation),
+          );
 
-      if (!result) return [];
+      if (!result) {
+        // null means the check was deliberately not run: the monitor is paused, billing is on hold, the
+        // authorization lookup failed (never run a paid probe on unknown authorization), or there is no
+        // entitlement or allowance. None says anything about the target, so close the group or cycle instead
+        // of letting its deadline record this region as down.
+        await this.closeSkippedGroup(job);
+        return [];
+      }
 
-      await this.monitorService.saveDistributedMonitorResult(result, {
-        executionGroupId: job.data.executionGroupId,
-        expectedLocations: job.data.expectedLocations,
-      });
+      try {
+        await this.monitorService.saveDistributedMonitorResult(result, {
+          executionGroupId: job.data.executionGroupId,
+          expectedLocations: job.data.expectedLocations,
+          ...(job.data.monitorCycle ? { monitorCycle: true } : {}),
+          ...(saved ? { persisted: true } : {}),
+        });
+      } catch (error) {
+        if (error instanceof MonitorAggregationBusyError) {
+          await job.updateData({ ...job.data, aggregationOnly: true });
+          await job.moveToDelayed(Date.now() + error.retryAfterMs, job.token);
+          throw new DelayedError();
+        }
+        throw error;
+      }
 
       return [result];
     }
 
-    // Legacy/single queue mode
-    return this.monitorService.executeMonitorWithLocations(job.data);
+    // Legacy/single queue mode: the job runs from this worker's own location.
+    await this.assertBrowserCapability(job.data, this.workerLocation);
+    return (
+      (await this.executeOrDefer(job, () =>
+        this.monitorService.executeMonitorWithLocations(job.data),
+      )) ?? []
+    );
+  }
+
+  /**
+   * Persists the flags that tell the final-failure handler this check was skipped, not failed. They are already
+   * set on the in-memory job, so a failed write (typically a lost job lock) is only logged: failing here would
+   * abandon the closure after capacity was forfeited, and a retry could then record downtime.
+   */
+  private async rememberFlags(job: Job<MonitorJobDataDto>): Promise<void> {
+    await job.updateData(job.data).catch((error: unknown) => {
+      this.logger.warn(
+        `Could not persist skip flags for monitor ${job.data.monitorId}: ${getErrorMessage(error)}`,
+      );
+    });
+  }
+
+  /** Jobs whose skipped group was already closed in this attempt, so it is not closed twice. */
+  private readonly closedSkippedGroups = new WeakSet<object>();
+
+  /** A check that never ran must not leave its cycle to be closed with a false failure. */
+  private async abortCycleOf(job: Job<MonitorJobDataDto>): Promise<void> {
+    if (!job.data.monitorCycle || !job.data.executionGroupId) return;
+    await this.monitorService
+      .abortMonitorCycle(job.data.executionGroupId)
+      .catch((error) =>
+        this.logger.error(
+          `Could not abort cycle ${job.data.executionGroupId}: ${getErrorMessage(error)}`,
+        ),
+      );
+  }
+
+  /**
+   * Runs the check, or re-queues it when the organization's execution slot is
+   * occupied so the wait is never recorded as a monitor failure.
+   */
+  private async executeOrDefer<T>(
+    job: Job<MonitorJobDataDto>,
+    execute: () => Promise<T>,
+  ): Promise<T | null> {
+    try {
+      return await execute();
+    } catch (error) {
+      if (!(error instanceof ExecutionCapacityError)) throw error;
+      if (
+        job.data.monitorCycle &&
+        job.data.executionGroupId &&
+        job.data.executionLocation
+      ) {
+        await this.closeSkippedGroup(job);
+        return null;
+      }
+      return deferForCapacity(job, async (reason) => {
+        this.logger.error(
+          `Monitor ${job.data.monitorId} check dropped: ${reason}`,
+        );
+        // Remember why, so the final-failure handler does not turn "never got a slot" into downtime.
+        job.data = { ...job.data, _capacityGaveUp: true } as never;
+        await this.rememberFlags(job);
+        await this.closeSkippedGroup(job);
+      });
+    }
+  }
+
+  private async closeSkippedGroup(job: Job<MonitorJobDataDto>): Promise<void> {
+    const { monitorId, executionGroupId, monitorCycle } = job.data;
+    if (!executionGroupId) return;
+    // The capacity path closes the group and then reports "skipped" to processJob, which closes it again.
+    if (this.closedSkippedGroups.has(job)) return;
+    const flags = job.data as {
+      _capacityGaveUp?: boolean;
+      _groupSkipped?: boolean;
+    };
+    if (!flags._capacityGaveUp && !flags._groupSkipped) {
+      job.data = { ...job.data, _groupSkipped: true } as never;
+      await this.rememberFlags(job);
+    }
+    try {
+      await this.monitorService.skipDistributedMonitorGroup(
+        monitorId,
+        executionGroupId,
+        !!monitorCycle,
+      );
+      this.closedSkippedGroups.add(job);
+    } catch (error) {
+      // A busy lease or an outage of the database or Redis: wait it out, but not forever. A plain failure here
+      // would use up the job's few attempts in seconds, leave the cycle open, and let its deadline record a
+      // false down for a region that was only skipped. Past the cap the job fails
+      // for good, and its final-failure handler (the group is marked skipped) aborts the cycle without
+      // recording downtime.
+      const retries =
+        ((job.data as { _aggregationBusyRetries?: number })
+          ._aggregationBusyRetries ?? 0) + 1;
+      if (retries > MAX_AGGREGATION_BUSY_RETRIES) {
+        throw new UnrecoverableError(
+          `Monitor aggregation stayed busy for ${MAX_AGGREGATION_BUSY_RETRIES} attempts; giving up on closing the skipped group`,
+        );
+      }
+      job.data = { ...job.data, _aggregationBusyRetries: retries } as never;
+      await job.updateData(job.data);
+      const delayMs =
+        error instanceof MonitorAggregationBusyError
+          ? error.retryAfterMs
+          : 60_000;
+      if (!(error instanceof MonitorAggregationBusyError)) {
+        this.logger.warn(
+          `Closing skipped group for monitor ${monitorId} failed (attempt ${retries}): ${getErrorMessage(error)}`,
+        );
+      }
+      await job.moveToDelayed(Date.now() + delayMs, job.token);
+      throw new DelayedError();
+    }
+  }
+
+  /**
+   * Synthetic (Playwright) monitors run in this worker, so the job's effective
+   * execution location must support browser execution. HTTP/ping/port/SSL
+   * monitors are never checked. A revoked capability fails the job permanently
+   * (UnrecoverableError) so handleFinalJobFailure still completes aggregation
+   * with an error result; a DB error throws a normal error and retries.
+   */
+  private async assertBrowserCapability(
+    data: MonitorJobDataDto,
+    executionLocation: string,
+  ): Promise<void> {
+    if (data.type !== 'synthetic_test') return;
+    const allowed = await locationSupportsWorkload(
+      this.dbService,
+      executionLocation,
+      'browser',
+    );
+    if (!allowed) {
+      throw new UnrecoverableError(
+        `Browser checks are not available in location "${executionLocation}"`,
+      );
+    }
   }
 
   /**
    * Generate an error MonitorResult for a job that failed after all retries.
    * This ensures the distributed aggregation gate can still complete —
-   * without it, the Redis SCARD never reaches expectedLocations.length
-   * and the aggregation stalls until the TTL expires.
+   * without it, the persisted group never contains every expected location.
    *
    * If processJob() already persisted a real result (e.g. the probe
-   * succeeded but saveDistributedMonitorResult threw during Redis
-   * coordination), we skip writing a synthetic error to avoid
-   * overwriting a valid result.
+   * succeeded but aggregation threw), resume aggregation without overwriting it.
    */
   private async handleFinalJobFailure(
     job: Job<MonitorJobDataDto>,
@@ -367,6 +603,19 @@ export class MonitorDynamicWorkerService
 
     if (!executionGroupId || !executionLocation) return;
 
+    // The check never ran because the organization's slot stayed busy. That says nothing about the
+    // monitored service, so it must not be recorded as a failed check.
+    if (
+      (job.data as { _capacityGaveUp?: boolean })._capacityGaveUp ||
+      (job.data as { _groupSkipped?: boolean })._groupSkipped
+    ) {
+      this.logger.warn(
+        `Monitor ${monitorId}/${executionLocation} not recorded: no execution slot became free`,
+      );
+      await this.abortCycleOf(job);
+      return;
+    }
+
     // Stalled recovery and unrecoverable errors can fail permanently before
     // attemptsMade reaches attempts. Never synthesize an error for a retry.
     if ((await job.getState()) !== 'failed') return;
@@ -379,7 +628,6 @@ export class MonitorDynamicWorkerService
         eq(schema.monitorResults.executionGroupId, executionGroupId),
         eq(schema.monitorResults.location, executionLocation),
       ),
-      columns: { id: true },
     });
 
     if (existing) {
@@ -387,24 +635,40 @@ export class MonitorDynamicWorkerService
         `Skipping synthetic error for ${monitorId}/${executionLocation}: ` +
           `real result already persisted (executionGroupId=${executionGroupId})`,
       );
-      return;
     }
 
-    const errorResult: MonitorExecutionResult = {
-      monitorId,
-      location: executionLocation,
-      status: 'error',
-      checkedAt: new Date(),
-      isUp: false,
-      details: {
-        errorMessage: `Worker execution failed after ${job.attemptsMade} attempt(s): ${error.message}`,
-      },
-    };
+    const errorResult: MonitorExecutionResult = existing
+      ? {
+          ...existing,
+          details: existing.details ?? undefined,
+          responseTimeMs: existing.responseTimeMs ?? undefined,
+          testExecutionId: existing.testExecutionId ?? undefined,
+          testReportS3Url: existing.testReportS3Url ?? undefined,
+        }
+      : {
+          monitorId,
+          location: executionLocation,
+          status: 'error',
+          checkedAt: new Date(),
+          isUp: false,
+          details: {
+            errorMessage: `Worker execution failed after ${job.attemptsMade} attempt(s): ${error.message}`,
+          },
+        };
 
-    await this.monitorService.saveDistributedMonitorResult(errorResult, {
-      executionGroupId,
-      expectedLocations,
-    });
+    try {
+      await this.monitorService.saveDistributedMonitorResult(errorResult, {
+        executionGroupId,
+        expectedLocations,
+        ...(job.data.monitorCycle ? { monitorCycle: true } : {}),
+        ...(existing ? { persisted: true } : {}),
+      });
+    } catch (aggregationError) {
+      if (!(aggregationError instanceof MonitorAggregationBusyError))
+        throw aggregationError;
+      await job.updateData({ ...job.data, aggregationOnly: true });
+      await job.retry('failed');
+    }
   }
 
   /**

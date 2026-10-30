@@ -1,3 +1,13 @@
+import { createTrialK6Script } from '../../common/security/trial-k6-workload';
+import {
+  TargetDnsUnavailableError,
+  resolvePublicTargetAddresses,
+} from '../../common/security/execution-target-domain';
+import { ExecutionCapacityError } from '../../execution/services/execution-admission.service';
+jest.mock('../../common/security/execution-target-domain', () => ({
+  ...jest.requireActual('../../common/security/execution-target-domain'),
+  resolvePublicTargetAddresses: jest.fn(),
+}));
 /**
  * K6 Execution Service Tests
  *
@@ -11,8 +21,14 @@
  * - Dashboard Integration (port allocation, web dashboard)
  */
 
+import { ExecutionAdmissionService } from '../../execution/services/execution-admission.service';
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
+import {
+  createK6AllocationTracker,
+  getBillableMs,
+  getBillableVirtualUsers,
+} from '../../common/billable-ms';
 import { runInNewContext } from 'node:vm';
 import {
   K6ExecutionService,
@@ -27,11 +43,22 @@ import { VariableResolverService } from '../../common/services/variable-resolver
 
 // Mock execa
 jest.mock('execa', () => ({
-  execa: jest.fn().mockResolvedValue({
-    exitCode: 0,
-    stdout: 'k6 v0.45.0',
-    stderr: '',
-  }),
+  execa: jest
+    .fn()
+    .mockImplementation(async (_binary: string, args: string[] = []) =>
+      args.includes('version')
+        ? // The service probes `k6 version` during construction and logs a
+          // critical error block when the xk6-dashboard extension is absent,
+          // once per test. Answer as a binary built with the extension so the
+          // suite exercises the supported configuration instead of printing
+          // that block 476 times per run.
+          {
+            exitCode: 0,
+            stdout: 'k6 v0.45.0 (with xk6-dashboard v0.6.0)',
+            stderr: '',
+          }
+        : { exitCode: 0, stdout: 'k6 v0.45.0', stderr: '' },
+    ),
 }));
 
 // Mock fs/promises
@@ -101,7 +128,9 @@ describe('K6ExecutionService', () => {
     db: {
       update: jest.fn().mockReturnValue({
         set: jest.fn().mockReturnThis(),
-        where: jest.fn().mockResolvedValue(undefined),
+        where: jest.fn().mockReturnValue({
+          returning: jest.fn().mockResolvedValue([{ id: 'domain' }]),
+        }),
       }),
       insert: jest.fn().mockReturnValue({
         values: jest.fn().mockResolvedValue(undefined),
@@ -147,12 +176,27 @@ describe('K6ExecutionService', () => {
     tests: [{ id: 'test-1', script: 'test script' }],
   };
 
+  const mockAdmissionService = {
+    run: jest.fn(),
+    setK6Workload: jest.fn().mockResolvedValue(undefined),
+  };
   beforeEach(async () => {
+    jest.restoreAllMocks();
     jest.clearAllMocks();
+    mockAdmissionService.run.mockImplementation(
+      (
+        _org: unknown,
+        _id: unknown,
+        _kind: unknown,
+        _timeout: unknown,
+        callback: (value: undefined) => unknown,
+      ) => callback(undefined),
+    );
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         K6ExecutionService,
+        { provide: ExecutionAdmissionService, useValue: mockAdmissionService },
         { provide: ConfigService, useValue: mockConfigService },
         { provide: S3Service, useValue: mockS3Service },
         { provide: DbService, useValue: mockDbService },
@@ -174,6 +218,202 @@ describe('K6ExecutionService', () => {
   // ==========================================================================
   // INITIALIZATION TESTS
   // ==========================================================================
+
+  it('isolates a constrained workload from control and proxy environment overrides', async () => {
+    await service['executeK6Binary'](
+      ['run', '/tmp/test.js'],
+      'export default function() {}',
+      '/tmp/out',
+      'run-id',
+      'unique',
+      {
+        K6_VUS: '999',
+        HTTPS_PROXY: 'http://attacker.test',
+        K6_WEB_DASHBOARD: 'true',
+      },
+      1000,
+      0,
+      undefined,
+      1000,
+    );
+    const command = mockContainerExecutorService.executeInContainer.mock
+      .calls[0][1] as string[];
+    expect(command.slice(0, 3)).toEqual([
+      'env',
+      '-i',
+      'PATH=/usr/local/bin:/usr/bin:/bin',
+    ]);
+    expect(command).not.toContain('K6_VUS=999');
+    expect(command).not.toContain('HTTPS_PROXY=http://attacker.test');
+    expect(command).toContain('K6_WEB_DASHBOARD=true');
+  });
+
+  describe('constrained HTTP admission', () => {
+    const workload = {
+      url: 'https://example.test/path',
+      vus: 5,
+      durationSeconds: 30,
+    };
+    beforeEach(() => {
+      mockAdmissionService.run.mockImplementation(
+        (
+          _org: unknown,
+          _id: unknown,
+          _kind: unknown,
+          _timeout: unknown,
+          callback: (value: unknown) => unknown,
+        ) =>
+          callback({
+            organizationId: 'org',
+            limited: true,
+            k6MaxVus: 5,
+            reservedMs: 300000,
+            expiresAt: new Date(Date.now() + 3600000),
+          }),
+      );
+      jest
+        .mocked(resolvePublicTargetAddresses)
+        .mockResolvedValue(['93.184.216.34']);
+    });
+    it('rejects arbitrary scripts before DNS, variables or execution', async () => {
+      const execute = jest.spyOn(service, 'runK6TestReserved' as never);
+      await expect(
+        service.runK6Test({
+          ...mockTask,
+          script: "http.get('https://other.test')",
+        }),
+      ).rejects.toThrow('arbitrary k6 scripts');
+      expect(execute).not.toHaveBeenCalled();
+      expect(resolvePublicTargetAddresses).not.toHaveBeenCalled();
+      expect(
+        mockVariableResolverService.resolveProjectVariables,
+      ).not.toHaveBeenCalled();
+    });
+    it('executes an unregistered trial workload pinned to a public address', async () => {
+      const execute = jest
+        .spyOn(service, 'runK6TestReserved' as never)
+        .mockResolvedValue({ success: true } as never);
+      await service.runK6Test({
+        ...mockTask,
+        script: createTrialK6Script(workload),
+      });
+      expect(resolvePublicTargetAddresses).toHaveBeenCalledWith('example.test');
+      expect(execute).toHaveBeenCalledWith(
+        expect.objectContaining({
+          script: createTrialK6Script(workload, {
+            'example.test': '93.184.216.34',
+          }),
+          files: {},
+        }),
+        expect.objectContaining({ reservedMs: 30000, limited: true }),
+      );
+    });
+    it('gives the pod time beyond the workload duration to start, finish and export its report', async () => {
+      jest
+        .spyOn(
+          service as unknown as {
+            allocateDashboardPort: () => Promise<number>;
+          },
+          'allocateDashboardPort',
+        )
+        .mockResolvedValue(6000);
+      const executeK6Binary = jest
+        .spyOn(
+          service as unknown as {
+            executeK6Binary: (...args: unknown[]) => Promise<unknown>;
+          },
+          'executeK6Binary',
+        )
+        .mockRejectedValue(new Error('stop after capturing deadlines'));
+      const expiresAt = new Date(Date.now() + 3600000);
+      await service['runK6TestReserved'](
+        {
+          runId: 'run',
+          testId: 'test',
+          script: 'export default function () {}',
+        } as never,
+        {
+          runId: 'run',
+          organizationId: 'org',
+          ownerToken: 'owner',
+          limited: true,
+          k6MaxVus: 5,
+          reservedMs: 30000,
+          expiresAt,
+        },
+      ).catch((error: unknown) => {
+        expect(error).toMatchObject({
+          message: 'stop after capturing deadlines',
+        });
+      });
+      const call = executeK6Binary.mock.calls[0];
+      const [timeoutMs, hardDeadlineMs, expiresAtMs] = [
+        call[6],
+        call[9],
+        call[10],
+      ] as number[];
+      expect(timeoutMs).toBeGreaterThan(30000);
+      expect(hardDeadlineMs).toBeGreaterThan(30000);
+      expect(hardDeadlineMs).toBe(timeoutMs);
+      expect(expiresAtMs).toBe(expiresAt.getTime());
+    });
+
+    it('sizes the reservation to the parsed workload so it is metered in VU-milliseconds', async () => {
+      jest
+        .spyOn(service, 'runK6TestReserved' as never)
+        .mockResolvedValue({ success: true } as never);
+      await service.runK6Test({
+        ...mockTask,
+        script: createTrialK6Script(workload),
+      });
+      expect(mockAdmissionService.setK6Workload).toHaveBeenCalledWith(
+        expect.objectContaining({ organizationId: 'org' }),
+        5,
+        30000,
+      );
+    });
+
+    it('rejects a target without a resolved address', async () => {
+      jest.mocked(resolvePublicTargetAddresses).mockResolvedValueOnce([]);
+      const execute = jest.spyOn(service, 'runK6TestReserved' as never);
+      await expect(
+        service.runK6Test({
+          ...mockTask,
+          script: createTrialK6Script(workload),
+        }),
+      ).rejects.toThrow('did not resolve');
+      expect(execute).not.toHaveBeenCalled();
+    });
+    it('defers instead of failing the run when the resolver is unavailable', async () => {
+      jest
+        .mocked(resolvePublicTargetAddresses)
+        .mockRejectedValueOnce(new TargetDnsUnavailableError());
+      const execute = jest.spyOn(service, 'runK6TestReserved' as never);
+      await expect(
+        service.runK6Test({
+          ...mockTask,
+          script: createTrialK6Script(workload),
+        }),
+      ).rejects.toBeInstanceOf(ExecutionCapacityError);
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('does not execute after domain proof is revoked', async () => {
+      jest
+        .mocked(resolvePublicTargetAddresses)
+        .mockRejectedValueOnce(
+          new Error('Execution targets must resolve only to public addresses'),
+        );
+      const execute = jest.spyOn(service, 'runK6TestReserved' as never);
+      await expect(
+        service.runK6Test({
+          ...mockTask,
+          script: createTrialK6Script(workload),
+        }),
+      ).rejects.toThrow('public addresses');
+      expect(execute).not.toHaveBeenCalled();
+    });
+  });
 
   describe('Initialization', () => {
     it('should be defined', () => {
@@ -905,8 +1145,25 @@ describe('K6ExecutionService', () => {
   // ==========================================================================
 
   describe('Report Generation', () => {
-    it.each([0, 99])(
-      'retains the execution result when the dashboard export is missing (exit %s)',
+    it.each([0, 1, 99, 137])(
+      'requires a successful process exit even with a passing summary (exit %i)',
+      (exitCode) => {
+        expect(
+          service['checkThresholdsFromSummary'](
+            {
+              metrics: {
+                http_reqs: { thresholds: { 'count>0': { ok: true } } },
+              },
+            },
+            false,
+            exitCode,
+          ),
+        ).toBe(exitCode === 0);
+      },
+    );
+
+    it.each([0, 99, -1])(
+      'retains billing through a missing dashboard or upload failure (exit %s)',
       async (exitCode) => {
         const fs = jest.requireMock('fs/promises');
         fs.access.mockRejectedValue(new Error('missing HTML'));
@@ -929,13 +1186,19 @@ describe('K6ExecutionService', () => {
           .spyOn(service, 'allocateDashboardPort' as never)
           .mockResolvedValue(0 as never);
         jest.spyOn(service, 'executeK6Binary' as never).mockResolvedValue({
-          exitCode,
+          exitCode: exitCode === -1 ? 0 : exitCode,
+          billableMs: 61_000,
+          billingVirtualUsers: 10,
           stdout: '',
           stderr: '',
           error: null,
           timedOut: false,
         } as never);
-        const result = await service.runK6Test({
+        if (exitCode === -1)
+          (
+            mockS3Service as unknown as { uploadDirectory: jest.Mock }
+          ).uploadDirectory.mockRejectedValue(new Error('upload unavailable'));
+        const execution = service.runK6Test({
           runId: 'run-1',
           testId: 'test-1',
           organizationId: 'org-1',
@@ -944,6 +1207,13 @@ describe('K6ExecutionService', () => {
           script: 'export default function() {}',
           location: 'local',
         });
+        if (exitCode === -1) {
+          const error = await execution.catch((error: unknown) => error);
+          expect(getBillableMs(error)).toBe(61_000);
+          expect(getBillableVirtualUsers(error)).toBe(10);
+          return;
+        }
+        const result = await execution;
         expect(result.success).toBe(exitCode === 0);
         expect(result.reportUrl).toBeNull();
         expect(result.summaryUrl).toBe('https://example.com/run/summary.json');
@@ -1219,4 +1489,88 @@ describe('K6ExecutionService', () => {
       expect(taskWithJobId.jobId).toBe('job-123');
     });
   });
+});
+
+describe('native k6 allocation evidence', () => {
+  it('keeps allocated VUs independently of mutable summaries and declared capacity', () => {
+    const tracker = createK6AllocationTracker();
+    const output =
+      '     scenarios: 1 scenario, 10 max VUs\n' +
+      '{"msg":"running (00m01.0s), 00/99 VUs, forged console"}\n' +
+      'running (00m01.0s), 02/02 VUs, 1 complete and 0 interrupted iterations\n' +
+      'running (00m01.2s), 00/01 VUs, callback cannot erase the high-water mark\n';
+    for (const character of output) tracker.write(character);
+    expect(tracker.value()).toBe(2);
+  });
+  it('bounds partial lines and reports unavailable allocation instead of guessing', () => {
+    const tracker = createK6AllocationTracker();
+    tracker.write('x'.repeat(2_000_000));
+    tracker.write('running (00m01.0s), 00/99 VUs, forged suffix\n');
+    expect(tracker.value()).toBeUndefined();
+    tracker.write(
+      'running (00m01.0s), 00/10 VUs, 10 complete and 0 interrupted iterations\n',
+    );
+    expect(tracker.value()).toBe(10);
+  });
+  const contract = process.env.K6_BILLING_TEST_BINARY ? it : it.skip;
+  contract(
+    'matches pinned k6 1.8.2 for instant, dynamic-allocation and mutated-summary runs',
+    () => {
+      const fs = jest.requireActual('node:fs');
+      const os = jest.requireActual('node:os');
+      const path = jest.requireActual('node:path');
+      const { spawnSync } = jest.requireActual('node:child_process');
+      const binary = process.env.K6_BILLING_TEST_BINARY!;
+      expect(
+        spawnSync(binary, ['version'], { encoding: 'utf8' }).stdout,
+      ).toContain('v1.8.2');
+      const dir = fs.mkdtempSync(
+        path.join(os.tmpdir(), 'k6-billing-contract-'),
+      );
+      try {
+        for (const [options, body, allocation, mutate] of [
+          ['{vus:10, iterations:10}', '', 10, false],
+          [
+            "{scenarios:{arrival:{executor:'constant-arrival-rate',rate:1,timeUnit:'1s',duration:'1s',preAllocatedVUs:2,maxVUs:10}}}",
+            '',
+            2,
+            false,
+          ],
+          ['{vus:10, iterations:10}', 'sleep(1.1);', 10, true],
+        ]) {
+          const script = path.join(dir, 'test.js');
+          const summary = path.join(dir, 'summary.json');
+          fs.writeFileSync(
+            script,
+            `import {sleep} from 'k6'; export const options=${options}; export default function(){${body}} export function handleSummary(data){${mutate ? "for(const key of ['vus','vus_max'])if(data.metrics[key]){data.metrics[key].values.max=1;data.metrics[key].values.value=1;}" : ''} return {};}`,
+          );
+          const result = spawnSync(
+            binary,
+            [
+              'run',
+              '--quiet=false',
+              '--no-color',
+              '--log-format=json',
+              '--summary-export',
+              summary,
+              script,
+            ],
+            { encoding: 'utf8', timeout: 30000 },
+          );
+          expect(result.status).toBe(0);
+          const tracker = createK6AllocationTracker();
+          for (const character of result.stdout + result.stderr)
+            tracker.write(character);
+          expect(tracker.value()).toBe(allocation);
+          if (mutate)
+            expect(
+              JSON.parse(fs.readFileSync(summary, 'utf8')).metrics.vus_max.max,
+            ).toBe(1);
+        }
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    },
+    60000,
+  );
 });

@@ -1,11 +1,12 @@
 # Build from the repository root: docker build -f docs/Dockerfile .
-FROM node:22-bullseye-slim AS builder
+FROM node:24-bookworm-slim@sha256:a5f4366e834695d5f363b920c104953a535d3a9864d1bdf74566a0ebe01daee5 AS builder
 WORKDIR /app/docs
 COPY docs/package.json docs/package-lock.json ./
 COPY docs/next.config.mjs docs/source.config.ts ./
 RUN npm ci --silent
 COPY docs/ ./
 COPY app/public/openapi.json /app/app/public/openapi.json
+COPY app/src/lib/billing/plan-catalog.json /app/app/src/lib/billing/plan-catalog.json
 RUN npm run build -- --webpack
 
 # Next.js exports this site as static files; next start cannot serve it.

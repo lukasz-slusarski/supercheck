@@ -1,0 +1,180 @@
+import { requireMcpAuth } from "@better-auth/mcp";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
+import { InitializeRequestSchema, JSONRPCRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import type { JWTPayload } from "jose";
+import { auth } from "@/utils/auth";
+import { logAuditEvent } from "@/lib/audit-logger";
+import { getMcpAllowedOrigins, getMcpResourceUrl, isMcpServerEnabled, MCP_READ_SCOPE } from "@/lib/mcp/config";
+import { McpAccessDeniedError, resolveMcpCallContext } from "@/lib/mcp/context";
+import { registerMcpTools } from "@/lib/mcp/tools";
+import {
+  McpBodyTooLargeError,
+  admitMcpCall,
+  countMcpMessages,
+  isMcpRefusal,
+  readMcpBody,
+  type McpCallRefusal,
+} from "@/lib/mcp/call-limits";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+const MAX_BODY_BYTES = 1024 * 1024;
+const NO_STORE = { "Cache-Control": "no-store" };
+
+function json(body: unknown, status: number, extra: HeadersInit = {}): Response {
+  const headers = new Headers(extra);
+  headers.set("Cache-Control", NO_STORE["Cache-Control"]);
+  return Response.json(body, { status, headers });
+}
+
+/** MCP clients expect a JSON-RPC error object, not an ad-hoc body, even for transport-level refusals. */
+function rpcError(status: number, code: string, message: string, extra: HeadersInit = {}, rpcCode = -32000): Response {
+  return json({ jsonrpc: "2.0", id: null, error: { code: rpcCode, message, data: { code } } }, status, extra);
+}
+
+function refusalResponse(refusal: McpCallRefusal): Response {
+  const retry: Record<string, string> = refusal.retryAfter ? { "Retry-After": String(refusal.retryAfter) } : {};
+  const message =
+    refusal.status === 429 ? "Too many requests" : refusal.status === 503 ? "Rate limiting is temporarily unavailable" : "Batch is too large";
+  return rpcError(refusal.status, refusal.error, message, retry);
+}
+
+async function handle(request: Request, claims: JWTPayload): Promise<Response> {
+  const declared = Number(request.headers.get("content-length") ?? "0");
+  if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
+    return rpcError(413, "payload_too_large", "Request body is too large");
+  }
+
+  // Throttle per connected app and per user before reading the body or doing any database work, so a flood
+  // costs a Redis call, not a buffered payload or several queries. One message is charged up front; the rest
+  // of a batch is charged once the body is parsed, so a batch still counts once per JSON-RPC message.
+  const permit = await admitMcpCall(
+    {
+      user: typeof claims.sub === "string" ? claims.sub : "unknown",
+      client: typeof claims.azp === "string" ? claims.azp : "unknown",
+    },
+    1,
+  );
+  if (isMcpRefusal(permit)) return refusalResponse(permit);
+
+  try {
+    // Read the body once, capped even without a Content-Length, and reuse it for the transport.
+    let parsedBody: unknown;
+    try {
+      parsedBody = await readMcpBody(request, MAX_BODY_BYTES);
+    } catch (error) {
+      if (error instanceof McpBodyTooLargeError) return rpcError(413, "payload_too_large", "Request body is too large");
+      throw error;
+    }
+    const surcharge = await permit.charge(countMcpMessages(parsedBody));
+    if (surcharge) return refusalResponse(surcharge);
+
+    if (parsedBody === undefined) return rpcError(400, "parse_error", "Parse error", {}, -32700);
+    const messages = Array.isArray(parsedBody) ? parsedBody : [parsedBody];
+    for (const message of messages) {
+      const rpcRequest = JSONRPCRequestSchema.safeParse(message);
+      if (!rpcRequest.success || rpcRequest.data.method !== "initialize") continue;
+      if (messages.length > 1) return rpcError(400, "invalid_request", "Initialize must be sent as a single request", {}, -32600);
+      if (!InitializeRequestSchema.safeParse(message).success) {
+        return json({
+          jsonrpc: "2.0", id: rpcRequest.data.id,
+          error: { code: -32602, message: "Invalid initialize params", data: { code: "invalid_params" } },
+        }, 400);
+      }
+    }
+
+    let context;
+    try {
+      context = await resolveMcpCallContext(claims);
+    } catch (error) {
+      if (error instanceof McpAccessDeniedError) {
+        // The reason (ban, revoked consent, lost membership) stays in the server log, not the response.
+        console.warn("mcp access denied", error.reason);
+        await logAuditEvent({
+          userId: typeof claims.sub === "string" ? claims.sub : undefined,
+          action: "mcp_access_denied",
+          resource: "mcp",
+          metadata: { reason: error.reason, clientId: claims.azp },
+          success: false,
+        });
+        return rpcError(403, "access_denied", "Access denied");
+      }
+      console.error("mcp context resolution failed", error);
+      return rpcError(500, "server_error", "Internal error");
+    }
+
+    // Stateless: a fresh server and transport per request, safe across replicas.
+    const server = new McpServer({ name: "supercheck", version: "1.0.0" });
+    registerMcpTools(server, context);
+    const transport = new WebStandardStreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+      enableJsonResponse: true,
+      maxRequestBodySize: MAX_BODY_BYTES,
+      enableDnsRebindingProtection: true,
+      allowedHosts: [new URL(getMcpResourceUrl()).host],
+      // hasTrustedRequestOrigin in POST is the primary gate; the transport re-checks against the same list.
+      allowedOrigins: [new URL(getMcpResourceUrl()).origin, ...getMcpAllowedOrigins()],
+    });
+    await server.connect(transport);
+    return await transport.handleRequest(request, { parsedBody });
+  } finally {
+    permit.release();
+  }
+}
+
+function hasTrustedRequestOrigin(request: Request, resource: URL): boolean {
+  try {
+    const authority = request.headers.get("host") ?? new URL(request.url).host;
+    const host = new URL(`${resource.protocol}//${authority}`);
+    if (host.host !== resource.host || host.username || host.password || host.pathname !== "/" || host.search || host.hash) return false;
+    const origin = request.headers.get("origin");
+    return !origin || (new URL(origin).origin === origin &&
+      (origin === resource.origin || getMcpAllowedOrigins().includes(origin)));
+  } catch {
+    return false;
+  }
+}
+
+export async function POST(request: Request): Promise<Response> {
+  if (!isMcpServerEnabled()) return rpcError(404, "not_found", "Not found");
+  try {
+    const resource = new URL(getMcpResourceUrl());
+    if (!hasTrustedRequestOrigin(request, resource)) {
+      return rpcError(403, "invalid_request_origin", "Invalid request origin");
+    }
+    // Next may expose an internal request URL behind a proxy; validate the public Host, not forwarded headers.
+    const headers = new Headers(request.headers);
+    headers.set("host", resource.host);
+    const protectedHandler = requireMcpAuth(auth as never, handle, {
+      resource: resource.toString(),
+      requiredScopes: [MCP_READ_SCOPE],
+    } as never);
+    const response = await protectedHandler(new Request(request, { headers }));
+    const responseHeaders = new Headers(response.headers);
+    responseHeaders.set("Cache-Control", "no-store");
+    if (response.status >= 400) {
+      const body = await response.clone().json().catch(() => null) as { jsonrpc?: string } | null;
+      if (body?.jsonrpc !== "2.0") {
+        responseHeaders.delete("content-length");
+        responseHeaders.delete("content-type");
+        responseHeaders.delete("content-encoding");
+        const code = response.status === 401 ? "unauthorized" : response.status === 403 ? "access_denied" : "request_failed";
+        return rpcError(response.status, code, response.status === 401 ? "Authentication required" : "Request refused", responseHeaders);
+      }
+    }
+    return new Response(response.body, { status: response.status, statusText: response.statusText, headers: responseHeaders });
+  } catch (error) {
+    console.error("mcp request failed", error);
+    return rpcError(503, "server_unavailable", "Service temporarily unavailable");
+  }
+}
+
+function notAllowed(): Response {
+  if (!isMcpServerEnabled()) return rpcError(404, "not_found", "Not found");
+  return rpcError(405, "method_not_allowed", "Method not allowed", { Allow: "POST" }, -32601);
+}
+
+export const GET = notAllowed;
+export const DELETE = notAllowed;

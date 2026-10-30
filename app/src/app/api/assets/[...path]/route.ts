@@ -1,8 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { fetchFromS3 } from "@/lib/s3-proxy";
+import { requireProjectContext } from "@/lib/project-context";
+import { requirePermissions } from "@/lib/rbac/middleware";
 import { db } from "@/utils/db";
 import { statusPages } from "@/db/schema";
 import { and, eq } from "drizzle-orm";
+import { isUuid } from "@/lib/uuid";
 
 // Bucket name from environment
 const BUCKET_NAME =
@@ -17,7 +20,11 @@ function extractStatusPageIdFromKey(s3Key: string): string | null {
   const segments = s3Key.split("/").filter(Boolean);
   if (segments.length < 3) return null;
   if (segments[0] !== "status-pages") return null;
-  return segments[1] || null;
+  // The key is handed to S3 verbatim; a backend that normalizes paths would let
+  // "status-pages/<own-id>/../<other-id>/x" authorize against one page and read another.
+  if (segments.some((segment) => segment === "." || segment === ".." || segment.includes("\\"))) return null;
+  // A non-uuid id would reach the uuid column and fail with 22P02 (a 500) instead of a 404.
+  return isUuid(segments[1]) ? segments[1] : null;
 }
 
 async function isPublishedStatusPageAsset(s3Key: string): Promise<boolean> {
@@ -35,6 +42,17 @@ async function isPublishedStatusPageAsset(s3Key: string): Promise<boolean> {
   return !!page;
 }
 
+async function canPreviewStatusPageAsset(s3Key: string): Promise<boolean> {
+  const statusPageId = extractStatusPageIdFromKey(s3Key);
+  if (!statusPageId) return false;
+  try {
+    const { project, organizationId } = await requireProjectContext();
+    await requirePermissions({ status_page: ["view"] }, { organizationId, projectId: project.id });
+    const page = await db.query.statusPages.findFirst({ where: and(eq(statusPages.id, statusPageId), eq(statusPages.organizationId, organizationId), eq(statusPages.projectId, project.id)), columns: { id: true } });
+    return Boolean(page);
+  } catch { return false; }
+}
+
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ path: string[] }> }
@@ -49,7 +67,7 @@ export async function GET(
     }
 
     const isAllowedAsset = await isPublishedStatusPageAsset(s3Key);
-    if (!isAllowedAsset) {
+    if (!isAllowedAsset && !await canPreviewStatusPageAsset(s3Key)) {
       return NextResponse.json({ error: "Asset not found" }, { status: 404 });
     }
 
@@ -58,7 +76,7 @@ export async function GET(
 
     // Use the shared S3 proxy utility with appropriate cache control
     const response = await fetchFromS3(BUCKET_NAME, s3Key, {
-      cacheControl: isFavicon
+      cacheControl: !isAllowedAsset ? "private, no-store" : isFavicon
         ? "public, max-age=0, must-revalidate" // No cache for favicons - they change frequently
         : undefined, // Use default 1-year cache for other assets
     });
@@ -104,12 +122,12 @@ export async function HEAD(
     }
 
     const isAllowedAsset = await isPublishedStatusPageAsset(s3Key);
-    if (!isAllowedAsset) {
+    if (!isAllowedAsset && !await canPreviewStatusPageAsset(s3Key)) {
       return new NextResponse(null, { status: 404 });
     }
 
     // Use the shared S3 proxy utility with a minimal request
-    const response = await fetchFromS3(BUCKET_NAME, s3Key);
+    const response = await fetchFromS3(BUCKET_NAME, s3Key, { cacheControl: isAllowedAsset ? undefined : "private, no-store" });
 
     // Convert Response to NextResponse (head request)
     const headers: Record<string, string> = {};

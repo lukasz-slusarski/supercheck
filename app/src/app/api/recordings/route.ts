@@ -1,15 +1,16 @@
+import { isCredentialOwnerActive } from "@/lib/security/credential-owner";
 import { NextRequest, NextResponse } from "next/server";
 import { defaultKeyHasher } from "@better-auth/api-key";
 import { z } from "zod";
 import { db } from "@/utils/db";
-import { tests, projects, apikey } from "@/db/schema";
+import { tests, projects, apikey, user } from "@/db/schema";
 import { and, eq, or } from "drizzle-orm";
 import { logAuditEvent } from "@/lib/audit-logger";
 import { subscriptionService } from "@/lib/services/subscription-service";
-import { getUserRole, getUserAssignedProjects } from "@/lib/rbac/middleware";
-import { hasPermission as checkPermission } from "@/lib/rbac/permissions";
+import { resolveProjectPermissionContext, checkPermissionWithContext } from "@/lib/rbac/middleware";
 import { hashApiKey } from "@/lib/security/api-key-hash";
 import { createLogger } from "@/lib/logger/pino-config";
+import { MAX_SCRIPT_LENGTH } from "@/lib/validations/common";
 
 const logger = createLogger({ module: "recordings" });
 
@@ -56,7 +57,10 @@ const recordingSchema = z.object({
     .min(1, "Name is required")
     .max(255, "Name must be less than 255 characters")
     .transform((val) => val.trim()),
-  script: z.string().min(1, "Script is required"),
+  script: z
+    .string()
+    .min(1, "Script is required")
+    .max(MAX_SCRIPT_LENGTH, `Script cannot exceed ${MAX_SCRIPT_LENGTH} characters`),
   metadata: z.object({
     recordedAt: z.string(),
     duration: z.number().int().nonnegative(),
@@ -109,8 +113,11 @@ export async function POST(request: NextRequest) {
         expiresAt: apikey.expiresAt,
         permissions: apikey.permissions,
         prefix: apikey.prefix,
+        banned: user.banned,
+        banExpires: user.banExpires,
       })
       .from(apikey)
+      .innerJoin(user, eq(user.id, apikey.referenceId))
       .where(
         and(
           eq(apikey.enabled, true),
@@ -121,7 +128,7 @@ export async function POST(request: NextRequest) {
 
     const matchedKey = matchingKeys[0] ?? null;
 
-    if (!matchedKey) {
+    if (!isCredentialOwnerActive(matchedKey)) {
       logger.warn(
         { keyPrefix: apiKeyHeader.substring(0, 8) },
         "Invalid API key attempt"
@@ -210,20 +217,9 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Build permission context for the API key user (not session-based)
-    // This is required because this endpoint uses API key authentication
-    const userRole = await getUserRole(userId, project[0].organizationId || undefined);
-    const assignedProjects = await getUserAssignedProjects(userId);
-    
-    const permissionContext = {
-      userId,
-      role: userRole,
-      organizationId: project[0].organizationId || undefined,
-      projectId: data.projectId,
-      assignedProjectIds: assignedProjects,
-    };
-
-    const canCreate = checkPermission(permissionContext, "test", "create");
+    const permissionContext = await resolveProjectPermissionContext(userId, data.projectId);
+    const canCreate = permissionContext
+      && checkPermissionWithContext("test", "create", permissionContext);
 
     if (!canCreate) {
       return NextResponse.json(

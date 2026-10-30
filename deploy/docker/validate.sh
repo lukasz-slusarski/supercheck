@@ -11,7 +11,7 @@
 #   ./deploy/docker/validate.sh                      # validate everything
 #   ./deploy/docker/validate.sh docker-compose.yml   # validate specific files
 #
-# Requires: bash and the Docker Compose v2 plugin (`docker compose`).
+# Requires: bash, Python 3, and the Docker Compose v2 plugin (`docker compose`).
 
 set -euo pipefail
 
@@ -32,6 +32,7 @@ export WORKER_LOCATION="us-east"
 export PRIVATE_AGENT_ID="placeholder-agent"
 export PRIVATE_AGENT_TOKEN="placeholder-token"
 export SUPERCHECK_API_URL="http://localhost:3000"
+export SECRET_ENCRYPTION_KEY="0000000000000000000000000000000000000000000000000000000000000000"
 
 fail=0
 
@@ -44,6 +45,9 @@ for script in ./*.sh; do
     fail=1
   fi
 done
+
+echo "==> Installer regression checks"
+python3 ./install.spec.py
 
 if ! docker compose version >/dev/null 2>&1; then
   echo "ERROR: the Docker Compose v2 plugin ('docker compose') is required" >&2
@@ -68,6 +72,19 @@ for file in "${files[@]}"; do
     fail=1
   fi
 done
+
+echo "==> Compose routing regression checks"
+python3 ./compose.spec.py
+
+echo "==> install.sh default version matches docker-compose.yml"
+compose_ver="$(grep -o 'supercheck/app:[$]{SUPERCHECK_VERSION:-[^}]*}' docker-compose.yml | head -n1 | sed 's/.*:-//; s/}$//' || true)"
+installer_ver="$(sed -n 's/^SUPERCHECK_VERSION_DEFAULT="\(.*\)"/\1/p' install.sh | head -n1 || true)"
+if [ -n "$compose_ver" ] && [ "$compose_ver" = "$installer_ver" ]; then
+  echo "  ok   $installer_ver"
+else
+  echo "  FAIL install.sh says '$installer_ver', docker-compose.yml says '$compose_ver'"
+  fail=1
+fi
 
 if [ "$fail" -ne 0 ]; then
   echo "Deployment validation failed" >&2

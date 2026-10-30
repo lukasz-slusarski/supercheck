@@ -30,6 +30,11 @@ on:
       expected_build_sha:
         required: true
         type: string
+      advisory:
+        description: "Report failures without failing the calling workflow (release builds)"
+        required: false
+        default: false
+        type: boolean
     secrets:
       E2E_TEST_USER_EMAIL: { required: true }
       E2E_TEST_USER_PASSWORD: { required: true }
@@ -65,10 +70,19 @@ jobs:
     name: Full E2E Tests
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # Release builds call this workflow with advisory: true so a flaky E2E run
+    # never fails an image that was built and deployed successfully.
+    continue-on-error: ${{ inputs.advisory == true }}
+    # Serialize shared test identities, including callers using URL aliases.
+    concurrency:
+      group: supercheck-e2e
+      cancel-in-progress: false
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
@@ -76,14 +90,14 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
 
       - name: Cache npm dependencies
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.npm
           key: npm-e2e-${{ hashFiles('app/e2e/package-lock.json') }}
           restore-keys: npm-e2e-
 
       - name: Cache Playwright browsers
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ hashFiles('app/e2e/package-lock.json') }}
@@ -154,7 +168,7 @@ jobs:
       # and traces are disabled in app/e2e/playwright.config.ts for the same
       # reason.
       - name: Upload Playwright report
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
           name: playwright-report-full

@@ -8,8 +8,12 @@
 
 set -e
 
+# .env holds every secret: never create it world-readable, even briefly.
+umask 077
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_FILE="${SCRIPT_DIR}/.env"
+# SUPERCHECK_ENV_FILE lets a caller (install.sh) build the file atomically.
+ENV_FILE="${SUPERCHECK_ENV_FILE:-${SCRIPT_DIR}/.env}"
 
 # Colors for output
 GREEN='\033[0;32m'
@@ -30,6 +34,17 @@ if [ -f "$ENV_FILE" ] && [ "$1" != "--force" ]; then
     exit 0
 fi
 
+# The execution sandbox is Linux-only. Warn here, before secrets are generated,
+# so a user on macOS/Windows finds out now rather than after setup-k3s.sh fails.
+# Generating .env on a different machine and copying it to the server is fine.
+if [ "$(uname -s)" != "Linux" ]; then
+    echo -e "${YELLOW}⚠️  This host is $(uname -s), not Linux.${NC}"
+    echo -e "   Supercheck's execution sandbox requires Linux (Ubuntu 22.04+, Debian 12+)."
+    echo -e "   setup-k3s.sh will refuse to run here."
+    echo -e "   Secrets can still be generated, but continue on a Linux server."
+    echo ""
+fi
+
 # Generate secure random secrets
 generate_secret() {
     openssl rand -hex "$1" 2>/dev/null || head -c "$1" /dev/urandom | xxd -p | head -c $(($1 * 2))
@@ -43,10 +58,12 @@ BETTER_AUTH_SECRET=$(generate_secret 32)
 SECRET_ENCRYPTION_KEY=$(generate_secret 16)
 DB_PASSWORD=$(generate_secret 16)
 REDIS_PASSWORD=$(generate_secret 16)
-MINIO_ACCESS_KEY=$(generate_secret 16)
-MINIO_SECRET_KEY=$(generate_secret 32)
+S3_ACCESS_KEY=$(generate_secret 16)
+S3_SECRET_KEY=$(generate_secret 32)
 
-# Create .env file
+# Create .env file. Remove any existing file first (--force): truncating a 644 file in place
+# would write the new secrets into a world-readable file until the chmod below.
+rm -f "$ENV_FILE"
 cat > "$ENV_FILE" << EOF
 # ============================================================
 # Supercheck Self-Hosted Configuration
@@ -111,15 +128,14 @@ DB_USER=postgres
 DB_NAME=supercheck
 
 # Redis connection
-REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
 REDIS_HOST=redis
 REDIS_PORT=6379
 # REDIS_TLS_ENABLED=false
 
-# MinIO/S3 Credentials (auto-generated)
-AWS_ACCESS_KEY_ID=${MINIO_ACCESS_KEY}
-AWS_SECRET_ACCESS_KEY=${MINIO_SECRET_KEY}
-S3_ENDPOINT=http://minio:9000
+# S3 (RustFS) credentials (auto-generated)
+AWS_ACCESS_KEY_ID=${S3_ACCESS_KEY}
+AWS_SECRET_ACCESS_KEY=${S3_SECRET_KEY}
+S3_ENDPOINT=http://rustfs:9000
 
 # ────────────────────────────────────────────────────────────
 # OPTIONAL: Email Notifications (SMTP)
@@ -135,10 +151,12 @@ S3_ENDPOINT=http://minio:9000
 # ────────────────────────────────────────────────────────────
 # OPTIONAL: AI Features & AI SRE
 # ────────────────────────────────────────────────────────────
-# AI SRE and automation are enabled by default with a configured AI provider.
+# AI SRE is enabled by default with a configured AI provider; automatic
+# alert-triggered triage is off by default.
 # Optional deployment-wide controls (shared by app and worker):
 # SRE_ENABLED=false           # Disable AI SRE requests and automation
-# SRE_AUTOMATION_ENABLED=false # Keep manual SRE, disable alert-triggered AI work
+# SRE_AUTOMATION_ENABLED=true # Opt in to alert-triggered triage (may incur AI costs)
+# DEVICE_AUTH_ENABLED=true # Let the CLI sign in through the browser (supercheck login)
 
 # OpenAI (default provider)
 # AI_PROVIDER=openai
@@ -183,6 +201,8 @@ S3_ENDPOINT=http://minio:9000
 # ────────────────────────────────────────────────────────────
 # CHATWOOT_BASE_URL=https://app.chatwoot.com
 # CHATWOOT_WEBSITE_TOKEN=your-token
+# HMAC secret from Chatwoot inbox > Configuration > Identity Validation (verifies signed-in users)
+# CHATWOOT_IDENTITY_VALIDATION_KEY=
 
 
 # ────────────────────────────────────────────────────────────
@@ -206,11 +226,11 @@ S3_ENDPOINT=http://minio:9000
 # PLAYWRIGHT_VIDEO=retain-on-failure
 
 # Organization limits
-# MAX_PROJECTS_PER_ORG=10
 # MAX_DOCUMENT_SIZE_MB=10
 # MAX_DOCUMENTS_PER_PROJECT=100
 EOF
 
+chmod 600 "$ENV_FILE"
 echo -e "${GREEN}✅ Created .env file at: ${ENV_FILE}${NC}"
 echo ""
 echo -e "${YELLOW}📋 Next steps:${NC}"
@@ -223,7 +243,9 @@ echo -e "   2. Install local K3s + gVisor:"
 echo -e "      ${BLUE}sudo bash setup-k3s.sh${NC}"
 echo ""
 echo -e "   3. Start Supercheck:"
-echo -e "      ${BLUE}KUBECONFIG_FILE=/etc/rancher/k3s/supercheck-worker.kubeconfig docker compose up -d${NC}"
+echo -e "      ${BLUE}KUBECONFIG_FILE=/etc/rancher/k3s/supercheck-worker.kubeconfig docker compose up -d --wait --wait-timeout 300${NC}"
+echo -e "      Then check health:"
+echo -e "      ${BLUE}curl --fail --silent --show-error http://localhost:3000/api/health${NC}"
 echo ""
 echo -e "   4. Access at:"
 echo -e "      ${BLUE}http://localhost:3000${NC}"

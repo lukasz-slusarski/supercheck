@@ -1,3 +1,4 @@
+import { getClientIP } from "@/lib/session-security";
 import { NextRequest, NextResponse } from "next/server";
 import { AIFixService } from "@/lib/ai/ai-service";
 import { AISecurityService, AuthService } from "@/lib/ai/ai-security";
@@ -39,12 +40,12 @@ export async function POST(request: NextRequest) {
 
     // Step 2: Authentication and authorization
     const session = await AuthService.validateUserAccess(request, testId);
+    if (!(await AuthService.canAccessTestReport(session, testId, testType))) {
+      return NextResponse.json({ error: "Test report not found" }, { status: 404 });
+    }
 
     const headersList = await headers();
-    const clientIp =
-      headersList.get("x-forwarded-for")?.split(",")[0]?.trim() ||
-      headersList.get("x-real-ip") ||
-      "unknown";
+    const clientIp = getClientIP(headersList);
 
     await AuthService.checkRateLimit({
       userId: session.user.id,
@@ -80,9 +81,9 @@ export async function POST(request: NextRequest) {
           { status: 402 }
         );
       }
+    }
 
-      // Atomically consume AI credit (prevents race conditions)
-      // This increments first, then checks limit, and rolls back if exceeded
+    const consumeCredit = async () => {
       const creditResult = await usageTracker.consumeAICredit(activeOrg.id, "ai_fix");
       if (!creditResult.allowed) {
         return NextResponse.json(
@@ -101,12 +102,8 @@ export async function POST(request: NextRequest) {
           { status: creditResult.status ?? 429 }
         );
       }
-    }
-
-    // Step 3: Rate limiting check (with user/org context)
-
-
-
+      return null;
+    };
 
     // Step 4: Try to get markdown report URL first
     const markdownReportUrl = await getMarkdownReportUrl(testId);
@@ -199,6 +196,9 @@ export async function POST(request: NextRequest) {
             reason: "No detailed error report available",
           });
 
+          const creditError = await consumeCredit();
+          if (creditError) return creditError;
+
           const aiResponse = await AIFixService.generateScriptFix({
             prompt: basicPrompt,
             temperature: 0.2,
@@ -266,6 +266,9 @@ export async function POST(request: NextRequest) {
     });
 
     // Step 8: Call AI service with intelligent prompt using Vercel AI SDK
+    const creditError = await consumeCredit();
+    if (creditError) return creditError;
+
     const aiResponse = await AIFixService.generateScriptFix({
       prompt,
       maxTokens: 2000,

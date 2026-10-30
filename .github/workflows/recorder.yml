@@ -41,7 +41,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
-          node-version: "20"
+          node-version: "24"
           cache: npm
           cache-dependency-path: recorder/package-lock.json
 
@@ -55,6 +55,9 @@ jobs:
 
       - name: Run unit tests
         run: npm run test:unit
+
+      - name: Typecheck recorder source
+        run: npm run typecheck
 
   browser-tests:
     name: Browser Tests
@@ -70,7 +73,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
-          node-version: "20"
+          node-version: "24"
           cache: npm
           cache-dependency-path: recorder/package-lock.json
 
@@ -90,7 +93,7 @@ jobs:
 
       - name: Upload browser report
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: recorder-playwright-report
           path: |

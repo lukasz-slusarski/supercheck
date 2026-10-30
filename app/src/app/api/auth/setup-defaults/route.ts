@@ -8,6 +8,7 @@ import {
   session,
   invitation,
   user as userTable,
+  executionEntitlements,
 } from "@/db/schema";
 import { getCurrentUser } from "@/lib/session";
 import { eq, and, gte, desc, asc, sql } from "drizzle-orm";
@@ -18,6 +19,7 @@ import {
   isCloudHosted,
 } from "@/lib/feature-flags";
 import { ensurePolarCustomerAndLink } from "@/lib/services/organization-customer";
+import { buildTrialEntitlement, isTrialEnabled } from "@/lib/execution/trial-limits";
 import { requireSameOriginRequest } from "@/lib/security/same-origin";
 
 
@@ -125,7 +127,7 @@ export async function POST(request: NextRequest) {
     // This prevents race conditions where multiple concurrent calls could create duplicate orgs
     const result = await db.transaction(async (tx) => {
       // Serialize signup and invitation acceptance for this user.
-      const [lockedUser] = await tx.select({ id: userTable.id }).from(userTable)
+      const [lockedUser] = await tx.select({ id: userTable.id, trialGrantedAt: userTable.trialGrantedAt }).from(userTable)
         .where(eq(userTable.id, currentUser.id)).limit(1).for("update");
       if (!lockedUser) throw new Error("SESSION_CHANGED");
 
@@ -163,6 +165,14 @@ export async function POST(request: NextRequest) {
           subscriptionStatus: isSelfHosted ? "active" : "none",
         })
         .returning();
+
+      // Keep the grant on the locked user so deleting an organization cannot reset it.
+      if (!isSelfHosted && isTrialEnabled() && !lockedUser.trialGrantedAt) {
+        const trial = buildTrialEntitlement(newOrg.id);
+        await tx.insert(executionEntitlements).values(trial);
+        await tx.update(userTable).set({ trialGrantedAt: trial.trialStartedAt })
+          .where(eq(userTable.id, currentUser.id));
+      }
 
       // Add user as owner of the organization
       await tx.insert(member).values({

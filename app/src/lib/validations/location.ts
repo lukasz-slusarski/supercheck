@@ -25,6 +25,8 @@ const RESERVED_CODES = new Set([
   "none",
   "any",
   "local",
+  "scheduler",
+  "job-scheduler",
 ]);
 
 export const createLocationSchema = z.object({
@@ -41,7 +43,11 @@ export const createLocationSchema = z.object({
       lon: z.number().min(-180).max(180),
     })
     .optional(),
+  /** Defaults to true. Create disabled to stage a region before users can select it. */
+  isEnabled: z.boolean().optional(),
   isDefault: z.boolean().optional(),
+  supportsBrowser: z.boolean().optional(),
+  supportsK6: z.boolean().optional(),
   sortOrder: z.number().int().min(0).optional(),
 });
 
@@ -58,6 +64,8 @@ export const updateLocationSchema = z.object({
     .nullable(),
   isEnabled: z.boolean().optional(),
   isDefault: z.boolean().optional(),
+  supportsBrowser: z.boolean().optional(),
+  supportsK6: z.boolean().optional(),
   sortOrder: z.number().int().min(0).optional(),
 });
 // Note: `code` is intentionally NOT in updateLocationSchema — it's immutable.

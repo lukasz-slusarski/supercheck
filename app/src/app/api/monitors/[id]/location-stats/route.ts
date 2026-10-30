@@ -1,3 +1,4 @@
+import { isUuid } from "@/lib/uuid";
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/utils/db";
 import {
@@ -14,6 +15,7 @@ import type {
   MonitorResultStatus,
   MonitoringLocation,
 } from "@/db/schema";
+import { excludeSupersededSyntheticResults } from "@/lib/monitor-result-filters";
 
 const logger = createLogger({ module: "monitor-location-stats-api" }) as {
   debug: (data: unknown, msg?: string) => void;
@@ -72,15 +74,20 @@ export async function GET(
   }
 
   try {
-    const { userId } = await requireUserAuthContext();
+    const { userId, projectId: tokenProjectId, isCliAuth } = await requireUserAuthContext();
 
     // First, find the monitor to check permissions
+    if (!isUuid((await context.params).id)) return NextResponse.json({ error: "Monitor not found" }, { status: 404 });
     const monitor = await db.query.monitors.findFirst({
       where: eq(monitors.id, id),
     });
 
     if (!monitor) {
       return NextResponse.json({ error: "Monitor not found" }, { status: 404 });
+    }
+
+    if (isCliAuth && tokenProjectId !== monitor.projectId) {
+      return NextResponse.json({ error: "CLI token does not authorize this project" }, { status: 403 });
     }
 
     // Check if user has permission to view this monitor
@@ -116,7 +123,8 @@ export async function GET(
         .where(
           and(
             eq(monitorResults.monitorId, id),
-            gte(monitorResults.checkedAt, startDate)
+            gte(monitorResults.checkedAt, startDate),
+            excludeSupersededSyntheticResults
           )
         )
         .groupBy(monitorResults.location),

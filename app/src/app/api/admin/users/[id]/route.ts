@@ -1,3 +1,4 @@
+import { isUuid } from "@/lib/uuid";
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/utils/db';
 import {
@@ -12,8 +13,9 @@ import { requireAdmin } from '@/lib/admin';
 import { getCurrentUser } from '@/lib/session';
 import { auth } from '@/utils/auth';
 import { headers } from 'next/headers';
-import { eq } from 'drizzle-orm';
-import { logImpersonationEvent } from '@/lib/audit-logger';
+import { eq, sql } from 'drizzle-orm';
+import { z } from 'zod';
+import { logAdminEvent, logImpersonationEvent } from '@/lib/audit-logger';
 import { checkAdminRateLimit } from '@/lib/session-security';
 
 
@@ -22,6 +24,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
   try {
     await requireAdmin();
     
+    if (!isUuid((await params).id)) return NextResponse.json({ error: "User not found" }, { status: 404 });
     const [userData] = await db
       .select()
       .from(user)
@@ -48,25 +51,56 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
   }
 }
 
+// Mirrors user_role_canonical_check: global roles are super_admin or project_viewer.
+const updateUserSchema = z
+  .object({
+    name: z.string().trim().min(1).max(255).optional(),
+    email: z.string().trim().toLowerCase().email().max(320).optional(),
+    role: z.enum(['super_admin', 'project_viewer']).nullable().optional(),
+  })
+  .strict()
+  .refine((value) => Object.keys(value).length > 0, 'No fields to update');
+
 export async function PUT(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const resolvedParams = await params;
   try {
     await requireAdmin();
-    
-    const body = await request.json();
-    const { name, email, role } = body;
-    
+    const currentAdmin = await getCurrentUser();
+    if (!currentAdmin) throw new Error('Authentication required');
+
+    const parsed = updateUserSchema.safeParse(await request.json().catch(() => null));
+    if (!parsed.success) {
+      return NextResponse.json(
+        { success: false, error: 'Invalid user update' },
+        { status: 400 }
+      );
+    }
+    const changes = parsed.data;
+
+    if (
+      resolvedParams.id === currentAdmin.id &&
+      changes.role !== undefined &&
+      changes.role !== 'super_admin'
+    ) {
+      return NextResponse.json(
+        { success: false, error: 'Cannot remove your own super admin role' },
+        { status: 400 }
+      );
+    }
+
+    if (!isUuid((await params).id)) return NextResponse.json({ error: "User not found" }, { status: 404 });
+    const [before] = await db
+      .select({ name: user.name, email: user.email, role: user.role })
+      .from(user)
+      .where(eq(user.id, resolvedParams.id))
+      .limit(1);
+
     const [updatedUser] = await db
       .update(user)
-      .set({
-        name,
-        email,
-        role,
-        updatedAt: new Date()
-      })
+      .set({ ...changes, updatedAt: new Date() })
       .where(eq(user.id, resolvedParams.id))
       .returning();
-    
+
     if (!updatedUser) {
       return NextResponse.json(
         { success: false, error: 'User not found' },
@@ -74,6 +108,16 @@ export async function PUT(request: NextRequest, { params }: { params: Promise<{ 
       );
     }
     
+    // A demoted super admin must not keep acting through live impersonation sessions.
+    if (before?.role === 'super_admin' && updatedUser.role !== 'super_admin') {
+      await db.delete(session).where(eq(session.impersonatedBy, resolvedParams.id));
+    }
+
+    await logAdminEvent(currentAdmin.id, 'user_updated', resolvedParams.id, 'user', resolvedParams.id, {
+      changedFields: Object.keys(changes),
+      previousRole: before?.role ?? null,
+      newRole: updatedUser.role ?? null,
+    });
     return NextResponse.json({
       success: true,
       data: updatedUser
@@ -82,7 +126,7 @@ export async function PUT(request: NextRequest, { params }: { params: Promise<{ 
     console.error('Admin user PUT error:', error);
     return NextResponse.json(
       { success: false, error: 'Failed to update user' },
-      { status: 500 }
+      { status: error instanceof Error && error.message === 'Admin privileges required' ? 403 : 500 }
     );
   }
 }
@@ -94,7 +138,8 @@ export async function DELETE(_request: NextRequest, { params }: { params: Promis
 
     // Prevent self-deletion
     const currentAdmin = await getCurrentUser();
-    if (currentAdmin && resolvedParams.id === currentAdmin.id) {
+    if (!currentAdmin) throw new Error('Authentication required');
+    if (resolvedParams.id === currentAdmin.id) {
       return NextResponse.json(
         { success: false, error: 'Cannot delete your own account' },
         { status: 400 }
@@ -102,8 +147,9 @@ export async function DELETE(_request: NextRequest, { params }: { params: Promis
     }
 
     // Verify user exists before attempting deletion
+    if (!isUuid((await params).id)) return NextResponse.json({ error: "User not found" }, { status: 404 });
     const [targetUser] = await db
-      .select({ id: user.id })
+      .select({ id: user.id, email: user.email })
       .from(user)
       .where(eq(user.id, resolvedParams.id))
       .limit(1);
@@ -140,13 +186,21 @@ export async function DELETE(_request: NextRequest, { params }: { params: Promis
       await tx.update(postmortems).set({ createdByUserId: null }).where(eq(postmortems.createdByUserId, userId));
       await tx.update(projectVariables).set({ createdByUserId: null }).where(eq(projectVariables.createdByUserId, userId));
 
-      // 3. Delete notifications and audit logs owned by the user
+      // 3. Preserve audit history while removing its user foreign key
       await tx.delete(notifications).where(eq(notifications.userId, userId));
-      await tx.delete(auditLogs).where(eq(auditLogs.userId, userId));
+      await tx.update(auditLogs).set({
+        userId: null,
+        details: sql`coalesce(${auditLogs.details}, '{}'::jsonb) || jsonb_build_object('deletedUserId', ${userId}::text)`,
+      }).where(eq(auditLogs.userId, userId));
 
       // 4. Delete user — CASCADE handles: session, account, member,
       //    project_members, invitation.inviterId
       await tx.delete(user).where(eq(user.id, userId));
+
+      // Same transaction as the deletion: both commit or neither does.
+      await logAdminEvent(currentAdmin.id, 'user_deleted', userId, 'user', userId, {
+        targetEmail: targetUser.email,
+      }, tx);
     });
     
     return NextResponse.json({
@@ -205,6 +259,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       }
 
       // Verify target user exists
+      if (!isUuid((await params).id)) return NextResponse.json({ error: "User not found" }, { status: 404 });
       const [targetUser] = await db
         .select()
         .from(user)

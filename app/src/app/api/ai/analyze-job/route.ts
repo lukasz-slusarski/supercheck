@@ -1,3 +1,4 @@
+import { getClientIP } from "@/lib/session-security";
 import { NextRequest, NextResponse } from "next/server";
 import { AIStreamingService } from "@/lib/ai/ai-streaming-service";
 import { AuthService } from "@/lib/ai/ai-security";
@@ -63,10 +64,7 @@ export async function POST(request: NextRequest) {
 
     // Step 3: Rate limiting check
     const headersList = await headers();
-    const clientIp =
-      headersList.get("x-forwarded-for")?.split(",")[0]?.trim() ||
-      headersList.get("x-real-ip") ||
-      "unknown";
+    const clientIp = getClientIP(headersList);
 
     await AuthService.checkRateLimit({
       userId: session.user.id,
@@ -221,6 +219,10 @@ export async function POST(request: NextRequest) {
 
     // Step 9: Generate streaming AI response
     const aiResponse = await AIStreamingService.generateStreamingResponse({
+      signal: request.signal,
+      userId: session.user.id,
+      orgId: activeOrg.id,
+      tier: session.tier,
       prompt,
       maxTokens: 4000,
       temperature: 0.2,

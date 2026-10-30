@@ -1,3 +1,4 @@
+import { isCredentialOwnerActive } from "@/lib/security/credential-owner";
 /**
  * Unified Authentication Context
  *
@@ -16,7 +17,7 @@
 import { headers } from "next/headers";
 import { defaultKeyHasher } from "@better-auth/api-key";
 import { db } from "@/utils/db";
-import { apikey, projects, member, projectMembers, organization } from "@/db/schema";
+import { apikey, projects, member, projectMembers, organization, user } from "@/db/schema";
 import { eq, and, isNull, or, gt } from "drizzle-orm";
 import { hashApiKey, isCliToken } from "@/lib/security/api-key-hash";
 import { Role } from "@/lib/rbac/permissions-client";
@@ -51,10 +52,19 @@ export interface AuthContext {
  * Allows catch blocks to distinguish auth errors (401) from server errors (500).
  */
 export class AuthError extends Error {
-  constructor(message: string) {
+  /** 401 when unauthenticated, 403 when authenticated but not permitted. */
+  readonly status: 401 | 403;
+
+  constructor(message: string, status: 401 | 403 = 401) {
     super(message);
     this.name = "AuthError";
+    this.status = status;
   }
+}
+
+/** HTTP status for an auth failure: 403 for scope denials, otherwise 401. */
+export function authErrorStatus(error: unknown): 401 | 403 {
+  return error instanceof AuthError ? error.status : 401;
 }
 
 /**
@@ -115,6 +125,8 @@ async function getBearerToken(): Promise<string | null> {
  * and the organization — exactly matching the shape from requireProjectContext().
  */
 async function authenticateCliToken(token: string): Promise<AuthContext | null> {
+  // The token itself is valid in the cases below that throw: its owner just no longer has access. That is
+  // a 403 ("authenticated, not permitted"), so clients stop telling the user to log in again.
   // Verify by exact hash lookup instead of the display-only `start` column.
   // This supports old SHA-256 keys and Better Auth api-key hashes while avoiding
   // brittle auth failures when manually inserted keys have a stale display prefix.
@@ -132,8 +144,12 @@ async function authenticateCliToken(token: string): Promise<AuthContext | null> 
       projectId: apikey.projectId,
       enabled: apikey.enabled,
       expiresAt: apikey.expiresAt,
+      permissions: apikey.permissions,
+      banned: user.banned,
+      banExpires: user.banExpires,
     })
     .from(apikey)
+    .innerJoin(user, eq(user.id, apikey.referenceId))
     .where(
       and(
         eq(apikey.enabled, true),
@@ -146,12 +162,23 @@ async function authenticateCliToken(token: string): Promise<AuthContext | null> 
     .limit(1);
 
   const matchedKey = candidateKeys[0] ?? null;
-  if (!matchedKey) {
+  if (!isCredentialOwnerActive(matchedKey)) {
     logger.warn(
       { keyPrefix: token.substring(0, 12) },
       "Invalid CLI token attempted"
     );
     return null;
+  }
+
+  // Legacy keys may predate capability markers; explicit scopes must allow CLI access.
+  if (matchedKey.permissions != null) {
+    try {
+      const permissions: unknown = typeof matchedKey.permissions === "string"
+        ? JSON.parse(matchedKey.permissions) : matchedKey.permissions;
+      if (!Array.isArray(permissions) || !permissions.includes("cli:full")) return null;
+    } catch {
+      return null;
+    }
   }
 
   // CLI tokens must be project-scoped
@@ -216,7 +243,7 @@ async function authenticateCliToken(token: string): Promise<AuthContext | null> 
       { keyId: matchedKey.id, userId: matchedKey.userId, projectId: matchedKey.projectId },
       "CLI token owner has no org or project membership — access denied"
     );
-    return null;
+    throw new AuthError("The token's owner no longer has access to this project", 403);
   }
 
   const orgRole = ctx.orgRole ? normalizeRole(ctx.orgRole) : null;
@@ -243,7 +270,7 @@ async function authenticateCliToken(token: string): Promise<AuthContext | null> 
       { keyId: matchedKey.id, userId: matchedKey.userId, projectId: matchedKey.projectId, orgRole: ctx.orgRole, projectRole: ctx.projectRole },
       "CLI token owner has no valid role for project — access denied"
     );
-    return null;
+    throw new AuthError("The token's owner no longer has a role in this project", 403);
   }
 
   // Update last request timestamp (best-effort, non-blocking for auth flow)
@@ -325,6 +352,7 @@ export async function requireAuthContext(): Promise<AuthContext> {
  */
 export interface UserAuthContext {
   userId: string;
+  projectId: string | null;
   /** Organization ID — from CLI token's project scope, or session's active org */
   organizationId: string | null;
   /** Whether this request was authenticated via CLI token (vs session cookie) */
@@ -348,7 +376,7 @@ export interface UserAuthContext {
  * }
  * ```
  */
-export async function requireUserAuthContext(): Promise<UserAuthContext> {
+export async function requireUserAuthContext(targetProjectId?: string): Promise<UserAuthContext> {
   // 1. Check for Bearer token first (CLI auth)
   const bearerToken = await getBearerToken();
 
@@ -365,9 +393,14 @@ export async function requireUserAuthContext(): Promise<UserAuthContext> {
       throw new AuthError("Invalid or expired CLI token");
     }
 
+    if (targetProjectId && targetProjectId !== cliContext.project.id) {
+      throw new AuthError("CLI token does not authorize this project", 403);
+    }
+
     return {
       userId: cliContext.userId,
       organizationId: cliContext.organizationId,
+      projectId: cliContext.project.id,
       isCliAuth: true,
     };
   }
@@ -379,6 +412,7 @@ export async function requireUserAuthContext(): Promise<UserAuthContext> {
   return {
     userId,
     organizationId: activeOrg?.id ?? null,
+    projectId: null,
     isCliAuth: false,
   };
 }

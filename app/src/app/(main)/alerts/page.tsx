@@ -1,13 +1,7 @@
 "use client";
 
 import React, { useState, useEffect, Suspense } from "react";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -34,6 +28,7 @@ import { DataTable } from "@/components/alerts/data-table";
 import { columns } from "@/components/alerts/columns";
 
 import { PageBreadcrumbs } from "@/components/page-breadcrumbs";
+import { PageHeader } from "@/components/shared/page-header";
 import { toast } from "sonner";
 import { NotificationChannelsComponent } from "@/components/alerts/notification-channels-component";
 import { NotificationChannel } from "@/components/alerts/notification-channels-schema";
@@ -265,48 +260,45 @@ function AlertsPage() {
       <div className="">
         <Card className="shadow-sm hover:shadow-md transition-shadow duration-200 m-4">
           <CardContent className="p-6">
+            {/* Tabs sit beside the title, as on Runs, so the table keeps the page height. */}
             <Tabs value={activeTab} className="space-y-4" onValueChange={handleTabChange}>
-              <TabsList>
-                <TabsTrigger value="signals">
-                  <Siren className="h-4 w-4 mr-2" />
-                  Signals
-                </TabsTrigger>
-                <TabsTrigger value="history">
-                  <BellRing className="h-4 w-4 mr-2" />
-                  History
-                </TabsTrigger>
-                <TabsTrigger value="channels">
-                  <Mail className="h-4 w-4 mr-2" />
-                  Channels
-                </TabsTrigger>
-              </TabsList>
+              <PageHeader
+                title="Alerts"
+                description="Review alert signals, delivery history and notification channels"
+                actions={
+                  <>
+                    <TabsList>
+                      <TabsTrigger value="signals">
+                        <Siren className="h-4 w-4 mr-2" />
+                        Signals
+                      </TabsTrigger>
+                      <TabsTrigger value="history">
+                        <BellRing className="h-4 w-4 mr-2" />
+                        History
+                      </TabsTrigger>
+                      <TabsTrigger value="channels">
+                        <Mail className="h-4 w-4 mr-2" />
+                        Channels
+                      </TabsTrigger>
+                    </TabsList>
+                    {activeTab === "channels" && (providers.length > 0 || providersLoading) ? (
+                      <Button onClick={() => openCreateDialog()} disabled={!canCreate}>
+                        <Plus className="h-4 w-4 mr-2" />
+                        Add Channel
+                      </Button>
+                    ) : null}
+                  </>
+                }
+              />
 
               <TabsContent value="signals" className="space-y-4">
                 <SreAlertsView alerts={alertHistory} isLoading={historyLoading} />
               </TabsContent>
 
               <TabsContent value="channels" className="space-y-4">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <CardTitle className="text-2xl font-semibold">
-                      Notification Channels
-                    </CardTitle>
-                    <CardDescription>
-                      Configure how you want to receive alerts
-                    </CardDescription>
-                  </div>
-                  <Button
-                    onClick={() => openCreateDialog()}
-                    disabled={!canCreate}
-                  >
-                    <Plus className="h-4 w-4 mr-2" />
-                    Add Channel
-                  </Button>
-                </div>
-
                 {providers.length === 0 && !providersLoading ? (
                   <DashboardEmptyState
-                    className="min-h-[60vh]"
+                    className="min-h-[360px]"
                     title="No notification channels"
                     description="Add your first notification channel to start receiving alerts"
                     icon={<BellRing className="h-12 w-12" />}
@@ -343,7 +335,7 @@ function AlertsPage() {
                 <div className="h-full flex-1 flex-col md:flex">
                   {(alertHistory.length === 0 && !historyLoading) ? (
                     <DashboardEmptyState
-                      className="min-h-[60vh]"
+                      className="min-h-[360px]"
                       title="No alerts found"
                       description="Alerts will appear here when your monitors or jobs trigger notifications"
                       icon={<BellRing className="h-12 w-12" />}

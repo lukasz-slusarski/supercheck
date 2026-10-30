@@ -1,7 +1,18 @@
 /** @jest-environment node */
 
 import { NextRequest } from "next/server";
+import { getExecutionPolicy } from "@/lib/execution/execution-policy";
 import { ExecutionQueueError } from "@/lib/execution-errors";
+
+jest.mock("@/lib/execution/execution-policy", () => ({
+  ...jest.requireActual("@/lib/execution/execution-policy"),
+  getExecutionPolicy: jest.fn(async (organizationId: string) => {
+    const { subscriptionService } = jest.requireMock("@/lib/services/subscription-service");
+    await subscriptionService.blockUntilSubscribed(organizationId);
+    await subscriptionService.requireValidPolarCustomer(organizationId);
+    return { tier: "paid", priority: 0, runningCapacity: 5, queuedCapacity: 50 };
+  }),
+}));
 
 jest.mock("@/utils/db", () => ({
   db: {
@@ -76,6 +87,7 @@ jest.mock("@/lib/api-key-rate-limiter", () => ({
 }));
 
 jest.mock("@/lib/services/subscription-service", () => ({
+  SubscriptionAccessDeniedError: class extends Error { constructor(message: string, readonly reason: string) { super(message); } },
   subscriptionService: {
     blockUntilSubscribed: jest.fn(),
     requireValidPolarCustomer: jest.fn(),
@@ -97,6 +109,7 @@ jest.mock("@/lib/services/polar-usage.service", () => ({
 jest.mock("@/lib/location-registry", () => ({
   normalizeK6Location: jest.fn().mockResolvedValue("local"),
   resolveProjectK6Location: jest.fn().mockResolvedValue("local"),
+  assertProjectSupportsBrowser: jest.fn().mockResolvedValue(undefined),
   getAllEnabledLocationCodes: jest.fn().mockResolvedValue(["local"]),
   getFirstDefaultLocationCode: jest.fn().mockResolvedValue("local"),
 }));
@@ -133,9 +146,11 @@ const { checkPermissionWithContext: mockCheckPermissionWithContext } =
 
 const {
   addTestToQueue: mockAddTestToQueue,
+  addK6TestToQueue: mockAddK6TestToQueue,
   addJobToQueue: mockAddJobToQueue,
 } = jest.requireMock("@/lib/queue") as {
   addTestToQueue: jest.Mock;
+  addK6TestToQueue: jest.Mock;
   addJobToQueue: jest.Mock;
 };
 
@@ -200,6 +215,34 @@ const { checkExecutionRateLimit: mockCheckExecutionRateLimit } =
     checkExecutionRateLimit: jest.Mock;
   };
 
+// The trigger route joins the key to its owner's current ban state.
+function triggerKeySelect(jobId: string, owner: { banned?: boolean | null; banExpires?: Date | null } = {}) {
+  return {
+    from: jest.fn().mockReturnValue({
+      innerJoin: jest.fn().mockReturnValue({
+        where: jest.fn().mockReturnValue({
+          limit: jest.fn().mockResolvedValue([{
+            id: "apikey-1",
+            name: "key-1",
+            key: "hashed-key",
+            enabled: true,
+            expiresAt: null,
+            jobId,
+            userId: "user-1",
+            lastRequest: null,
+            requestCount: 0,
+            rateLimitEnabled: true,
+            rateLimitTimeWindow: 60,
+            rateLimitMax: 10,
+            banned: owner.banned ?? false,
+            banExpires: owner.banExpires ?? null,
+          }]),
+        }),
+      }),
+    }),
+  };
+}
+
 describe("Execution route regressions", () => {
   const authCtx = {
     userId: "user-1",
@@ -233,7 +276,7 @@ describe("Execution route regressions", () => {
     });
     mockExtractVariableNames.mockReturnValue([]);
     mockPrepareJobTestScripts.mockResolvedValue({
-      testScripts: [{ id: "test-1", name: "Test 1", script: "console.log('ok')", type: "playwright" }],
+      testScripts: [{ id: "b6c7d749-56f1-509f-96c4-8234bc8c0244", name: "Test 1", script: "console.log('ok')", type: "playwright" }],
       variableResolution: { variables: {}, secrets: {} },
     });
 
@@ -292,7 +335,7 @@ describe("Execution route regressions", () => {
       }),
     );
     const savedTestResponse = await executeSingleTest(
-      new NextRequest("http://localhost/api/tests/test-1/execute", {
+      new NextRequest("http://localhost/api/tests/b6c7d749-56f1-509f-96c4-8234bc8c0244/execute", {
         method: "POST",
         body: JSON.stringify({}),
         headers: {
@@ -300,7 +343,7 @@ describe("Execution route regressions", () => {
           origin: "https://attacker.example",
         },
       }),
-      { params: Promise.resolve({ id: "test-1" }) },
+      { params: Promise.resolve({ id: "b6c7d749-56f1-509f-96c4-8234bc8c0244" }) },
     );
     const jobResponse = await executeJob(
       new NextRequest("http://localhost/api/jobs/run", {
@@ -339,6 +382,32 @@ describe("Execution route regressions", () => {
     });
   });
 
+  it("rejects unsubscribed Playground execution before queue admission", async () => {
+    const { SubscriptionAccessDeniedError } = jest.requireMock("@/lib/services/subscription-service");
+    jest.mocked(getExecutionPolicy).mockRejectedValueOnce(new SubscriptionAccessDeniedError("Subscription required", "subscription_required"));
+    const response = await executePlaygroundTest(new NextRequest("http://localhost/api/test", { method: "POST", headers: { origin: "http://localhost", "content-type": "application/json" }, body: JSON.stringify({ script: "test('x', () => {})" }) }));
+    expect(response.status).toBe(402);
+    expect(mockAddTestToQueue).not.toHaveBeenCalled();
+    expect(mockAddK6TestToQueue).not.toHaveBeenCalled();
+  });
+
+  it("reports a failed policy lookup as a generic 500 without leaking the error", async () => {
+    const log = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    jest.mocked(getExecutionPolicy).mockRejectedValueOnce(new Error('relation "execution_entitlements" does not exist'));
+    const response = await executePlaygroundTest(new NextRequest("http://localhost/api/test", { method: "POST", headers: { origin: "http://localhost", "content-type": "application/json" }, body: JSON.stringify({ script: "test('x', () => {})" }) }));
+    expect(response.status).toBe(500);
+    expect(JSON.stringify(await response.json())).not.toContain("execution_entitlements");
+    expect(mockAddTestToQueue).not.toHaveBeenCalled();
+    log.mockRestore();
+  });
+
+  it("admits an active trial without the provider usage probe", async () => {
+    jest.mocked(getExecutionPolicy).mockResolvedValueOnce({ tier: "trial", priority: 1, runningCapacity: 1, queuedCapacity: 10, expiresAt: new Date(Date.now() + 60_000), k6MaxVus: 5, k6RemainingVuMs: 9_000_000, playwrightRemainingMs: 1000 });
+    const response = await executePlaygroundTest(new NextRequest("http://localhost/api/test", { method: "POST", headers: { origin: "http://localhost", "content-type": "application/json" }, body: JSON.stringify({ script: { invalid: true } }) }));
+    expect(response.status).toBe(400);
+    expect(mockPolarUsageService.shouldBlockUsage).not.toHaveBeenCalled();
+  });
+
   it("rejects a non-string playground script before validation", async () => {
     const response = await executePlaygroundTest(
       new NextRequest("http://localhost/api/test", {
@@ -355,9 +424,10 @@ describe("Execution route regressions", () => {
     expect(mockPlaywrightValidationService.validateCode).not.toHaveBeenCalled();
   });
 
-	  it("POST /api/tests/[id]/execute persists and returns queue status", async () => {
+	  it.each(["paid", "trial"] as const)("POST /api/tests/[id]/execute persists and returns queue status for %s access", async (tier) => {
+    if (tier === "trial") jest.mocked(getExecutionPolicy).mockResolvedValueOnce({ tier, priority: 1, runningCapacity: 1, queuedCapacity: 10, expiresAt: new Date(Date.now() + 60_000), k6MaxVus: 5, k6RemainingVuMs: 9_000_000, playwrightRemainingMs: 1000 });
     mockDb.query.tests.findFirst.mockResolvedValue({
-      id: "test-1",
+      id: "b6c7d749-56f1-509f-96c4-8234bc8c0244",
       type: "playwright",
       script: Buffer.from("test('smoke', async () => {})").toString("base64"),
       projectId: "project-1",
@@ -376,7 +446,7 @@ describe("Execution route regressions", () => {
 
     mockAddTestToQueue.mockResolvedValue({ runId: "run-1", status: "queued", position: 2 });
 
-    const request = new NextRequest("http://localhost/api/tests/test-1/execute", {
+    const request = new NextRequest("http://localhost/api/tests/b6c7d749-56f1-509f-96c4-8234bc8c0244/execute", {
       method: "POST",
       body: JSON.stringify({}),
       headers: {
@@ -386,13 +456,14 @@ describe("Execution route regressions", () => {
     });
 
     const response = await executeSingleTest(request, {
-      params: Promise.resolve({ id: "test-1" }),
+      params: Promise.resolve({ id: "b6c7d749-56f1-509f-96c4-8234bc8c0244" }),
     });
 
     const json = await response.json();
 
     expect(response.status).toBe(200);
     expect(json.status).toBe("queued");
+    if (tier === "trial") expect(mockPolarUsageService.shouldBlockUsage).not.toHaveBeenCalled();
     expect(insertValues).toHaveBeenCalledWith(
       expect.objectContaining({ status: "queued" }),
     );
@@ -402,7 +473,7 @@ describe("Execution route regressions", () => {
   it("POST /api/tests/[id]/execute accepts CLI bearer auth without an Origin header", async () => {
     mockRequireAuthContext.mockResolvedValue({ ...authCtx, isCliAuth: true });
     mockDb.query.tests.findFirst.mockResolvedValue({
-      id: "test-1",
+      id: "b6c7d749-56f1-509f-96c4-8234bc8c0244",
       type: "playwright",
       script: Buffer.from("test('smoke', async () => {})").toString("base64"),
       projectId: "project-1",
@@ -419,12 +490,12 @@ describe("Execution route regressions", () => {
     mockAddTestToQueue.mockResolvedValue({ status: "queued", position: 1 });
 
     const response = await executeSingleTest(
-      new NextRequest("http://localhost/api/tests/test-1/execute", {
+      new NextRequest("http://localhost/api/tests/b6c7d749-56f1-509f-96c4-8234bc8c0244/execute", {
         method: "POST",
         body: JSON.stringify({}),
         headers: { "content-type": "application/json" },
       }),
-      { params: Promise.resolve({ id: "test-1" }) },
+      { params: Promise.resolve({ id: "b6c7d749-56f1-509f-96c4-8234bc8c0244" }) },
     );
 
     expect(response.status).toBe(200);
@@ -437,7 +508,7 @@ describe("Execution route regressions", () => {
 	      reason: "Monthly spending limit of $320.00 reached. Current spending: $320.76.",
 	    });
 
-	    const request = new NextRequest("http://localhost/api/tests/test-1/execute", {
+	    const request = new NextRequest("http://localhost/api/tests/b6c7d749-56f1-509f-96c4-8234bc8c0244/execute", {
 	      method: "POST",
 	      body: JSON.stringify({}),
 	      headers: {
@@ -447,7 +518,7 @@ describe("Execution route regressions", () => {
 	    });
 
 	    const response = await executeSingleTest(request, {
-	      params: Promise.resolve({ id: "test-1" }),
+	      params: Promise.resolve({ id: "b6c7d749-56f1-509f-96c4-8234bc8c0244" }),
 	    });
 
 	    const json = await response.json();
@@ -470,7 +541,7 @@ describe("Execution route regressions", () => {
     });
 
     const response = await executeSingleTest(
-      new NextRequest("http://localhost/api/tests/test-1/execute", {
+      new NextRequest("http://localhost/api/tests/b6c7d749-56f1-509f-96c4-8234bc8c0244/execute", {
         method: "POST",
         body: JSON.stringify({}),
         headers: {
@@ -478,7 +549,7 @@ describe("Execution route regressions", () => {
           origin: "http://localhost",
         },
       }),
-      { params: Promise.resolve({ id: "test-1" }) },
+      { params: Promise.resolve({ id: "b6c7d749-56f1-509f-96c4-8234bc8c0244" }) },
     );
 
     expect(response.status).toBe(503);
@@ -592,7 +663,7 @@ describe("Execution route regressions", () => {
 
   it("POST /api/tests/[id]/execute finalizes the run when queue admission fails", async () => {
     mockDb.query.tests.findFirst.mockResolvedValue({
-      id: "test-1",
+      id: "b6c7d749-56f1-509f-96c4-8234bc8c0244",
       type: "playwright",
       script: Buffer.from("test('smoke', async () => {})").toString("base64"),
       projectId: "project-1",
@@ -616,7 +687,7 @@ describe("Execution route regressions", () => {
     );
 
     const response = await executeSingleTest(
-      new NextRequest("http://localhost/api/tests/test-1/execute", {
+      new NextRequest("http://localhost/api/tests/b6c7d749-56f1-509f-96c4-8234bc8c0244/execute", {
         method: "POST",
         body: JSON.stringify({}),
         headers: {
@@ -624,7 +695,7 @@ describe("Execution route regressions", () => {
           origin: "http://localhost",
         },
       }),
-      { params: Promise.resolve({ id: "test-1" }) },
+      { params: Promise.resolve({ id: "b6c7d749-56f1-509f-96c4-8234bc8c0244" }) },
     );
 
     expect(response.status).toBe(503);
@@ -639,26 +710,7 @@ describe("Execution route regressions", () => {
   it("POST /api/jobs/[id]/trigger starts queued and updates status from queue result", async () => {
     const jobId = "00000000-0000-4000-8000-000000000010";
 
-    const apiKeySelect = {
-      from: jest.fn().mockReturnValue({
-        where: jest.fn().mockReturnValue({
-          limit: jest.fn().mockResolvedValue([{
-            id: "apikey-1",
-            name: "key-1",
-            key: "hashed-key",
-            enabled: true,
-            expiresAt: null,
-            jobId,
-            userId: "user-1",
-            lastRequest: null,
-            requestCount: 0,
-            rateLimitEnabled: true,
-            rateLimitTimeWindow: 60,
-            rateLimitMax: 10,
-          }]),
-        }),
-      }),
-    };
+    const apiKeySelect = triggerKeySelect(jobId);
 
     const jobSelect = {
       from: jest.fn().mockReturnValue({
@@ -713,5 +765,26 @@ describe("Execution route regressions", () => {
       expect.objectContaining({ status: "queued", jobId }),
     );
     expect(updateSet).toHaveBeenCalledWith({ status: "queued" });
+  });
+
+  it.each([
+    ["banned with no expiry", { banned: true, banExpires: null }],
+    ["banned until a future date", { banned: true, banExpires: new Date(Date.now() + 3_600_000) }],
+  ])("POST /api/jobs/[id]/trigger rejects a key whose owner is %s", async (_label, owner) => {
+    const jobId = "00000000-0000-4000-8000-000000000011";
+    mockDb.select.mockReturnValueOnce(triggerKeySelect(jobId, owner));
+
+    const response = await postTrigger(
+      new NextRequest(`http://localhost/api/jobs/${jobId}/trigger`, {
+        method: "POST",
+        headers: { authorization: "Bearer supercheck_api_key_123456789", "content-type": "application/json" },
+        body: JSON.stringify({}),
+      }),
+      { params: Promise.resolve({ id: jobId }) },
+    );
+
+    expect(response.status).toBe(401);
+    expect(await response.json()).toMatchObject({ error: "Invalid API key" });
+    expect(mockAddJobToQueue).not.toHaveBeenCalled();
   });
 });

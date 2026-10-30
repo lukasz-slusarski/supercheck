@@ -11,6 +11,9 @@ export * from "./types";
 export * from "./auth";
 export { apikey as apiKey } from "./auth";
 
+// OAuth 2.1 / MCP authorization server tables
+export * from "./oauth";
+
 // Organization and project tables
 export * from "./organization";
 
@@ -31,6 +34,7 @@ export * from "./monitor";
 
 // Monitor aggregates for long-term metrics
 export * from "./monitor-aggregates";
+export * from "./monitor-cycles";
 
 // Notification and alert tables
 export * from "./notification";
@@ -58,3 +62,9 @@ export * from "./locations";
 
 // AI SRE service topology, incidents, evidence, connectors, and chat
 export * from "./sre";
+
+// Device authorization grants for CLI login
+export * from "./deviceAuthorization";
+
+export * from "./execution-entitlements";
+export * from './run-callback';

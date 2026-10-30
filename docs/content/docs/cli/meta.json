@@ -4,9 +4,11 @@
   "root": true,
   "icon": "Terminal",
   "pages": [
+    "index",
     "---Getting Started---",
     "installation",
     "authentication",
+    "agent-quickstart",
     "configuration",
     "---Reference---",
     "commands",

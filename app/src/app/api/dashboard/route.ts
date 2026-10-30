@@ -9,14 +9,16 @@ import {
   auditLogs,
   reports,
   k6PerformanceRuns,
-  requirements,
-  requirementCoverageSnapshots,
 } from "@/db/schema";
-import { eq, desc, gte, and, count, sql, sum } from "drizzle-orm";
+import { eq, desc, gte, and, count, sql, sum, inArray } from "drizzle-orm";
 import { subDays, subHours } from "date-fns";
 import { getQueueStats } from "@/lib/queue-stats";
 import { checkPermissionWithContext } from '@/lib/rbac/middleware';
 import { requireAuthContext, isAuthError } from '@/lib/auth-context';
+import { excludeSupersededSyntheticResults, excludeSyntheticResults } from "@/lib/monitor-result-filters";
+import { buildSystemIssues } from "@/lib/dashboard/system-health";
+import { FAILED_RUN_STATUSES } from "@/lib/dashboard/run-outcomes";
+import { RECENT_FAILURES_LIMIT } from "@/lib/dashboard/recent-failures";
 
 export async function GET() {
   try {
@@ -41,7 +43,7 @@ export async function GET() {
     const last30Days = subDays(now, 30);
 
     // Get queue statistics
-    const queueStats = await getQueueStats();
+    const queueStats = await getQueueStats(context.organizationId);
 
     // Monitor Statistics - scoped to project
     // OPTIMIZED: Consolidated 4 separate count queries into 1 using PostgreSQL FILTER clause
@@ -63,6 +65,10 @@ export async function GET() {
         active: sql<number>`COALESCE(count(*) filter (where ${monitors.enabled} = true), 0)`,
         up: sql<number>`COALESCE(count(*) filter (where ${monitors.status} = 'up'), 0)`,
         down: sql<number>`COALESCE(count(*) filter (where ${monitors.status} = 'down'), 0)`,
+        paused: sql<number>`COALESCE(count(*) filter (where ${monitors.status} = 'paused'), 0)`,
+        pending: sql<number>`COALESCE(count(*) filter (where ${monitors.status} = 'pending'), 0)`,
+        maintenance: sql<number>`COALESCE(count(*) filter (where ${monitors.status} = 'maintenance'), 0)`,
+        error: sql<number>`COALESCE(count(*) filter (where ${monitors.status} = 'error'), 0)`,
       }).from(monitors)
         .where(monitorBaseCondition),
       
@@ -73,7 +79,8 @@ export async function GET() {
         .where(and(
           gte(monitorResults.checkedAt, last24Hours),
           eq(monitors.projectId, targetProjectId),
-          eq(monitors.organizationId, context.organizationId)
+          eq(monitors.organizationId, context.organizationId),
+          excludeSupersededSyntheticResults
         )),
       
       // Monitor count by type
@@ -108,18 +115,25 @@ export async function GET() {
       recentRuns,
       runCounts24h,
       jobsByStatus,
-      recentJobRuns,
+      recentFailedRuns,
+      jobTriggerTrend,
       executionTimeData
     ] = await Promise.all([
       // OPTIMIZED: Single query for total and active job counts
       dbInstance.select({
         total: count(),
         active: sql<number>`count(*) filter (where ${jobs.status} = 'running')`,
+        // Jobs with a cron schedule configured (what the dashboard calls "scheduled")
+        scheduled: sql<number>`count(*) filter (where ${jobs.cronSchedule} is not null and ${jobs.cronSchedule} <> '')`,
       }).from(jobs)
         .where(jobBaseCondition),
       
       // Recent runs (last 30 days) - only for jobs in this project
-      dbInstance.select({ count: count() })
+      dbInstance.select({
+        count: count(),
+        passed: sql<number>`count(*) filter (where ${runs.status} = 'passed')`,
+        failed: sql<number>`count(*) filter (where ${runs.status} in ('failed', 'error'))`,
+      })
         .from(runs)
         .innerJoin(jobs, eq(runs.jobId, jobs.id))
         .where(and(
@@ -132,7 +146,8 @@ export async function GET() {
       dbInstance.select({
         total: count(),
         passed: sql<number>`count(*) filter (where ${runs.status} = 'passed')`,
-        failed: sql<number>`count(*) filter (where ${runs.status} = 'failed')`,
+        // `error` is a failure too (see lib/dashboard/run-outcomes.ts)
+        failed: sql<number>`count(*) filter (where ${runs.status} in ('failed', 'error'))`,
       })
         .from(runs)
         .innerJoin(jobs, eq(runs.jobId, jobs.id))
@@ -150,25 +165,37 @@ export async function GET() {
         .where(jobBaseCondition)
         .groupBy(jobs.status),
       
-      // Recent job runs with details (last 30 days for chart data)
-      // Last 30 days only - already limited by time filter
+      // Newest failed runs for the Needs attention card; its count comes from failedRuns30d
       dbInstance.select({
         id: runs.id,
         jobId: runs.jobId,
         jobName: jobs.name,
         status: runs.status,
         startedAt: runs.startedAt,
-        durationMs: runs.durationMs,
         trigger: runs.trigger
       }).from(runs)
-        .leftJoin(jobs, eq(runs.jobId, jobs.id))
+        .innerJoin(jobs, eq(runs.jobId, jobs.id))
         .where(and(
           gte(runs.startedAt, last30Days),
-          eq(jobs.projectId, targetProjectId),
-          eq(jobs.organizationId, context.organizationId)
+          inArray(runs.status, [...FAILED_RUN_STATUSES]),
+          jobBaseCondition
         ))
-        .orderBy(desc(runs.startedAt)),
-      
+        .orderBy(desc(runs.startedAt), desc(runs.id))
+        .limit(RECENT_FAILURES_LIMIT),
+
+      // Daily job runs by trigger (last 30 days); unknown triggers count as manual
+      dbInstance.select({
+        // Text, not a DATE the driver parses into a local-midnight Date that can shift the day
+        date: sql<string>`to_char(DATE(${runs.startedAt}), 'YYYY-MM-DD')`,
+        total: count(),
+        scheduled: sql<number>`count(*) filter (where ${runs.trigger} = 'schedule')`,
+        remote: sql<number>`count(*) filter (where ${runs.trigger} = 'remote')`,
+      }).from(runs)
+        .innerJoin(jobs, eq(runs.jobId, jobs.id))
+        .where(and(gte(runs.startedAt, last30Days), jobBaseCondition))
+        .groupBy(sql`DATE(${runs.startedAt})`)
+        .orderBy(sql`DATE(${runs.startedAt})`),
+
       // OPTIMIZED: Total execution time using SQL aggregation instead of fetching all rows
       // Now returns aggregated stats directly rather than raw data
       dbInstance.select({
@@ -195,7 +222,6 @@ export async function GET() {
       testsByType,
       playgroundExecutions30d,
       k6Stats,
-      requirementsMetrics,
     ] = await Promise.all([
       // Total tests
       dbInstance.select({ count: count() }).from(tests)
@@ -236,30 +262,6 @@ export async function GET() {
           sql`${k6PerformanceRuns.completedAt} IS NOT NULL`
         )),
 
-      // Requirements coverage (for dashboard Requirements card)
-      dbInstance
-        .select({
-          totalRequirements: count(),
-          coveredRequirements: sql<number>`COUNT(*) FILTER (WHERE ${requirementCoverageSnapshots.status} = 'covered')`,
-          atRiskRequirements: sql<number>`COUNT(*) FILTER (
-            WHERE ${requirements.priority} IN ('high', 'medium')
-            AND (
-              ${requirementCoverageSnapshots.status} IN ('failing', 'missing')
-              OR ${requirementCoverageSnapshots.status} IS NULL
-            )
-          )`,
-        })
-        .from(requirements)
-        .leftJoin(
-          requirementCoverageSnapshots,
-          eq(requirementCoverageSnapshots.requirementId, requirements.id)
-        )
-        .where(
-          and(
-            eq(requirements.projectId, targetProjectId),
-            eq(requirements.organizationId, context.organizationId)
-          )
-        ),
     ]);
 
     // PERFORMANCE: Run all remaining queries in parallel instead of sequential awaits
@@ -284,7 +286,8 @@ export async function GET() {
           gte(monitorResults.checkedAt, last30Days),
           eq(monitors.projectId, targetProjectId),
           eq(monitors.organizationId, context.organizationId),
-          eq(monitors.type, 'synthetic_test')
+          eq(monitors.type, 'synthetic_test'),
+          excludeSyntheticResults
         )),
 
       // OPTIMIZED: Playground test executions - SQL aggregation instead of fetching all rows
@@ -326,7 +329,8 @@ export async function GET() {
         .where(and(
           gte(monitorResults.checkedAt, last24Hours),
           eq(monitors.projectId, targetProjectId),
-          eq(monitors.organizationId, context.organizationId)
+          eq(monitors.organizationId, context.organizationId),
+          excludeSupersededSyntheticResults
         )),
 
       // Monitor availability trend (last 30 days) - only for monitors in this project
@@ -339,7 +343,8 @@ export async function GET() {
         .where(and(
           gte(monitorResults.checkedAt, last30Days),
           eq(monitors.projectId, targetProjectId),
-          eq(monitors.organizationId, context.organizationId)
+          eq(monitors.organizationId, context.organizationId),
+          excludeSupersededSyntheticResults
         ))
         .groupBy(sql`DATE(${monitorResults.checkedAt})`)
         .orderBy(sql`DATE(${monitorResults.checkedAt})`),
@@ -377,13 +382,6 @@ export async function GET() {
     const totalChecks = uptimeResult[0]?.totalChecks ?? 0;
     const successfulChecks = uptimeResult[0]?.successfulChecks ?? 0;
     const overallUptime = totalChecks > 0 ? (successfulChecks / totalChecks) * 100 : 100;
-
-    const totalRequirements = Number(requirementsMetrics[0]?.totalRequirements) || 0;
-    const coveredRequirements = Number(requirementsMetrics[0]?.coveredRequirements) || 0;
-    const atRiskRequirements = Number(requirementsMetrics[0]?.atRiskRequirements) || 0;
-    const coveragePercentage = totalRequirements > 0
-      ? Math.round((coveredRequirements / totalRequirements) * 10000) / 100
-      : 0;
 
     // OPTIMIZED: Calculate total execution time using pre-aggregated SQL data
     // This eliminates CPU spikes from looping over 5000+ records in JavaScript
@@ -441,6 +439,10 @@ export async function GET() {
         active: monitorCounts[0].active,
         up: monitorCounts[0].up,
         down: monitorCounts[0].down,
+        paused: monitorCounts[0].paused,
+        pending: monitorCounts[0].pending,
+        maintenance: monitorCounts[0].maintenance,
+        error: monitorCounts[0].error,
         uptime: Math.round(overallUptime * 100) / 100,
         recentChecks24h: recentMonitorResults[0].count,
         byType: monitorsByType,
@@ -460,19 +462,27 @@ export async function GET() {
       jobs: {
         total: jobCounts[0].total,
         active: jobCounts[0].active,
+        scheduled: jobCounts[0].scheduled,
         recentRuns30d: recentRuns[0].count,
+        passedRuns30d: Number(recentRuns[0].passed) || 0,
+        failedRuns30d: Number(recentRuns[0].failed) || 0,
         successfulRuns24h: runCounts24h[0].passed,
         failedRuns24h: runCounts24h[0].failed,
         byStatus: jobsByStatus,
-        recentRuns: recentJobRuns.map(run => ({
+        recentFailures: recentFailedRuns.map(run => ({
           id: run.id,
           jobId: run.jobId,
           jobName: run.jobName,
           status: run.status,
           startedAt: run.startedAt?.toISOString(),
-          durationMs: run.durationMs,
           trigger: run.trigger
         })),
+        triggerTrend: jobTriggerTrend.map(day => {
+          const total = Number(day.total) || 0;
+          const scheduled = Number(day.scheduled) || 0;
+          const remote = Number(day.remote) || 0;
+          return { date: day.date, manual: Math.max(0, total - scheduled - remote), scheduled, remote };
+        }),
         // Execution time data
         executionTime: {
           totalMs: totalExecutionTimeCalculation.totalMs,
@@ -493,14 +503,6 @@ export async function GET() {
         playgroundExecutionsTrend: playgroundExecutionsTrend
       },
 
-      // Requirements coverage statistics
-      requirements: {
-        total: totalRequirements,
-        covered: coveredRequirements,
-        atRisk: atRiskRequirements,
-        coveragePercentage,
-      },
-
       // K6 Performance Test Statistics (VU-minutes = VUs * duration)
       k6: {
         totalRuns: k6Stats[0]?.totalRuns || 0,
@@ -512,57 +514,18 @@ export async function GET() {
         period: 'last 30 days'
       },
 
-      // System Health - Build issues array with actual details
+      // System Health - computed server-side so the client never rebuilds (and drops) issues
       system: (() => {
-        const issues: Array<{ type: 'monitor' | 'job' | 'queue'; message: string; severity: 'low' | 'medium' | 'high' | 'critical' }> = [];
-        
-        // Check for down monitors
-        if (monitorCounts[0].down > 0) {
-          const downCount = monitorCounts[0].down;
-          issues.push({
-            type: 'monitor',
-            message: `${downCount} monitor${downCount > 1 ? 's' : ''} currently down`,
-            severity: downCount >= 3 ? 'critical' : downCount >= 2 ? 'high' : 'medium'
-          });
-          
-          // Add specific monitor names if we have critical alerts
-          criticalAlerts.slice(0, 3).forEach(alert => {
-            issues.push({
-              type: 'monitor',
-              message: `${alert.name} (${alert.type}) is down`,
-              severity: 'high'
-            });
-          });
-        }
-        
-        // Check for queue capacity issues
-        if (queueStats.running >= queueStats.runningCapacity) {
-          issues.push({
-            type: 'queue',
-            message: `Execution queue at capacity (${queueStats.running}/${queueStats.runningCapacity} running)`,
-            severity: 'high'
-          });
-        } else if (queueStats.running >= queueStats.runningCapacity * 0.8) {
-          issues.push({
-            type: 'queue',
-            message: `Execution queue nearing capacity (${queueStats.running}/${queueStats.runningCapacity} running)`,
-            severity: 'medium'
-          });
-        }
-        
-        // Check for high queue backlog
-        if (queueStats.queued > 10) {
-          issues.push({
-            type: 'queue',
-            message: `${queueStats.queued} jobs queued waiting for execution`,
-            severity: queueStats.queued > 20 ? 'high' : 'medium'
-          });
-        }
-        
+        const issues = buildSystemIssues({
+          monitorsDown: Number(monitorCounts[0].down) || 0,
+          downMonitors: criticalAlerts.map((a) => ({ name: a.name, type: a.type })),
+          failedRuns24h: Number(runCounts24h[0].failed) || 0,
+          queue: queueStats,
+        });
         return {
           timestamp: now.toISOString(),
           healthy: issues.length === 0,
-          issues
+          issues,
         };
       })()
     });

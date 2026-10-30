@@ -1,23 +1,29 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { isSelfHostedEnvironment } from '../common/runtime-mode';
 import { HttpService } from '@nestjs/axios'; // Import HttpService
 import { AxiosError, AxiosRequestConfig, Method } from 'axios'; // Import Method from axios
 import * as tls from 'tls';
+import { randomUUID } from 'node:crypto';
 import { firstValueFrom } from 'rxjs'; // To convert Observable to Promise
 import { MonitorJobDataDto } from './dto/monitor-job.dto';
 import { MonitorExecutionResult } from './types/monitor-result.type';
 import { DbService } from '../db/db.service';
 import { ExecutionService } from '../execution/services/execution.service';
+import {
+  ExecutionCapacityError,
+  ExecutionEntitlementError,
+} from '../execution/services/execution-admission.service';
 import { UsageTrackerService } from '../execution/services/usage-tracker.service';
+import { RedisService } from '../execution/services/redis.service';
 import * as schema from '../db/schema'; // Assuming your schema is here and WILL contain monitorResults
 import type {
   MonitorConfig,
   MonitorResultStatus,
   MonitorResultDetails,
-  monitorsSelectSchema,
   monitorResultsSelectSchema,
 } from '../db/schema';
 import type { z } from 'zod';
-import { and, desc, eq } from 'drizzle-orm';
+import { and, desc, eq, sql } from 'drizzle-orm';
 import { MonitorAlertService } from './services/monitor-alert.service';
 import { ValidationService } from '../common/validation/validation.service';
 import {
@@ -53,15 +59,17 @@ import {
   validatePortCheckTarget,
   isExpectedStatus,
   sanitizeResponseBody,
+  sanitizeResponseHeaders,
   getErrorMessage,
 } from '../common/validation';
-import { RedisService } from '../execution/services/redis.service';
 import { VariableResolverService } from '../common/services/variable-resolver.service';
 import { requestPinnedMonitorTarget } from '../common/utils/pinned-monitor-request';
+import {
+  MonitorEvaluator,
+  type GroupAlertEvaluation,
+} from './monitor-evaluator';
 
 // Use the Monitor type from schema
-type Monitor = z.infer<typeof monitorsSelectSchema>;
-
 // Use the MonitorResult type from schema
 type MonitorResult = z.infer<typeof monitorResultsSelectSchema>;
 
@@ -84,22 +92,17 @@ function serializeResponseData(value: unknown): string {
   }
 }
 
-// Redis key constants for aggregation coordination
-const REDIS_AGGREGATION_KEY_PREFIX = 'monitor:aggr:';
-const REDIS_AGGREGATION_TTL_SECONDS = 120; // 2 minutes - enough time for all locations to report
-
-type AggregatedAlertState = {
-  consecutiveFailureCount: number;
-  consecutiveSuccessCount: number;
-  alertsSentForFailure: number;
-  alertsSentForRecovery: number;
-};
+export class MonitorAggregationBusyError extends Error {
+  readonly retryAfterMs = 60_000;
+  constructor() {
+    super('Monitor aggregation lease is busy or no longer owned');
+  }
+}
 
 @Injectable()
 export class MonitorService {
   private readonly logger = new Logger(MonitorService.name);
-  private static readonly AGGREGATION_MAX_RETRIES = 3;
-  private static readonly AGGREGATION_RETRY_DELAY_MS = 200; // Reduced from 500ms since Redis is fast
+  private readonly evaluator: MonitorEvaluator;
 
   constructor(
     private readonly dbService: DbService,
@@ -115,7 +118,9 @@ export class MonitorService {
     private readonly usageTrackerService: UsageTrackerService,
     private readonly redisService: RedisService,
     private readonly variableResolverService: VariableResolverService,
-  ) {}
+  ) {
+    this.evaluator = new MonitorEvaluator(dbService, monitorAlertService);
+  }
 
   async executeMonitor(
     jobData: MonitorJobDataDto,
@@ -151,9 +156,19 @@ export class MonitorService {
         // Return null instead of a failed result - paused monitors shouldn't create results
         return null;
       }
+      if (!monitor.organizationId && !isSelfHostedEnvironment()) {
+        // A cloud monitor with no organization can never be authorized, so it would be skipped silently
+        // forever and look healthy. Make that visible.
+        this.logger.error(
+          `Monitor ${jobData.monitorId} has no organization and cannot run; fix or remove it`,
+        );
+      }
       const billing = await this.usageTrackerService.shouldBlockExecution(
         monitor.organizationId ?? '',
-        { checkSpendingLimit: jobData.type === 'synthetic_test' },
+        {
+          checkSpendingLimit: jobData.type === 'synthetic_test',
+          monitorId: jobData.monitorId,
+        },
       );
       if (billing.blocked) {
         // Billing holds are not probe failures and must not trigger downtime
@@ -240,16 +255,14 @@ export class MonitorService {
 
                 // Merge SSL certificate info into the website check details
                 if (sslResult.details?.sslCertificate) {
-                  details.sslCertificate = sslResult.details
-                    .sslCertificate as MonitorResultDetails['sslCertificate'];
+                  details.sslCertificate = sslResult.details.sslCertificate;
                 }
 
                 // Handle SSL check results more intelligently
                 if (!sslResult.isUp) {
                   if (sslResult.details?.warningMessage) {
                     // SSL warning (e.g., certificate expiring soon) - don't fail the website check
-                    details.sslWarning = sslResult.details
-                      .warningMessage as string;
+                    details.sslWarning = sslResult.details.warningMessage;
                   } else {
                     // SSL critical failure (e.g., expired certificate, invalid certificate)
                     // This should fail the overall website check as it affects security
@@ -267,7 +280,7 @@ export class MonitorService {
                     } else {
                       // Website was already down - just add SSL info
                       details.sslError =
-                        (sslResult.details?.errorMessage as string) ||
+                        sslResult.details?.errorMessage ||
                         'SSL certificate check failed';
                     }
                   }
@@ -288,21 +301,11 @@ export class MonitorService {
         }
         case 'ping_host':
           ({ status, details, responseTimeMs, isUp } =
-            await this.executePingHost(jobData.target, jobData.config)) as {
-            status: MonitorResultStatus;
-            details: MonitorResultDetails;
-            responseTimeMs?: number;
-            isUp: boolean;
-          };
+            await this.executePingHost(jobData.target, jobData.config));
           break;
         case 'port_check':
           ({ status, details, responseTimeMs, isUp } =
-            await this.executePortCheck(jobData.target, jobData.config)) as {
-            status: MonitorResultStatus;
-            details: MonitorResultDetails;
-            responseTimeMs?: number;
-            isUp: boolean;
-          };
+            await this.executePortCheck(jobData.target, jobData.config));
           break;
 
         case 'synthetic_test': {
@@ -331,6 +334,17 @@ export class MonitorService {
         }
       }
     } catch (error) {
+      // A busy organization slot is not a target failure; let the processor
+      // defer the check instead of recording a false down result.
+      if (error instanceof ExecutionCapacityError) throw error;
+      if (error instanceof ExecutionEntitlementError) {
+        // No entitlement or allowance is not a target failure: skip the check
+        // like a billing hold instead of recording a false down result.
+        this.logger.warn(
+          `Skipping monitor ${jobData.monitorId}: ${error.message}`,
+        );
+        return null;
+      }
       this.logger.error(
         `Error executing monitor ${jobData.monitorId}: ${getErrorMessage(error)}`,
         error instanceof Error ? error.stack : undefined,
@@ -402,7 +416,17 @@ export class MonitorService {
       `Executing monitor ${jobData.monitorId} from ${locations.length} location(s): ${locations.join(', ')}`,
     );
 
-    // Execute from all locations in parallel
+    // Synthetic locations share the organization's execution capacity in legacy mode.
+    if (resolvedJobData.type === 'synthetic_test') {
+      const results: MonitorExecutionResult[] = [];
+      for (const location of locations) {
+        const result = await this.executeMonitor(resolvedJobData, location);
+        if (result) results.push(result);
+      }
+      return results;
+    }
+
+    // Lightweight checks do not acquire an execution slot.
     const results = await Promise.all(
       locations.map((location) =>
         this.executeMonitor(resolvedJobData, location),
@@ -418,7 +442,7 @@ export class MonitorService {
    */
   async saveMonitorResults(
     results: MonitorExecutionResult[],
-    options?: { persisted?: boolean },
+    options?: { persisted?: boolean; executionGroupId?: string },
   ): Promise<void> {
     if (results.length === 0) {
       this.logger.warn('No results to save');
@@ -426,7 +450,7 @@ export class MonitorService {
     }
 
     const monitorId = results[0].monitorId;
-    const monitor = await this.getMonitorById(monitorId);
+    let monitor = await this.getMonitorById(monitorId);
 
     if (!monitor) {
       this.logger.warn(`Monitor ${monitorId} not found, skipping save`);
@@ -477,22 +501,47 @@ export class MonitorService {
     }
 
     // Update monitor status with aggregated result
-    const previousStatus = monitor.status;
+    let previousStatus = monitor.status;
     const checkedAt = results[0].checkedAt;
-
-    await this.updateMonitorStatus(monitorId, overallStatus, checkedAt);
+    let groupEvaluation:
+      (GroupAlertEvaluation & { resultId: string }) | undefined;
+    if (options?.executionGroupId) {
+      const prepared = await this.prepareGroupEvaluation(
+        monitorId,
+        options.executionGroupId,
+        overallStatus,
+        checkedAt,
+        results.length,
+      );
+      if (!prepared) return;
+      monitor = prepared.monitor;
+      previousStatus = prepared.evaluation.previousStatus;
+      overallStatus = prepared.evaluation.currentStatus;
+      groupEvaluation = { ...prepared.evaluation, resultId: prepared.resultId };
+    } else {
+      await this.updateMonitorStatus(monitorId, overallStatus, checkedAt);
+    }
 
     // Handle alerts based on aggregated status using consolidated alert logic
     // Always evaluate alerts (not just on status change) so threshold counting works correctly
     const currentStatus = overallStatus;
 
     // Calculate location summary for alert reason
-    const downCount = results.filter((r) => !r.isUp).length;
-    const upCount = results.length - downCount;
+    const configuredLocations =
+      locationConfig?.enabled && locationConfig.locations?.length
+        ? Array.from(new Set(locationConfig.locations))
+        : Object.keys(locationStatuses);
+    const missingLocations = configuredLocations.filter(
+      (location) => !(location in locationStatuses),
+    );
+    const upCount = configuredLocations.filter(
+      (location) => locationStatuses[location] === true,
+    ).length;
+    const downCount = configuredLocations.length - upCount;
     const reason =
       currentStatus === 'down'
-        ? `Monitor is down in ${downCount}/${results.length} locations`
-        : `Monitor has recovered (${upCount}/${results.length} locations up)`;
+        ? `Monitor is down in ${downCount}/${configuredLocations.length} locations${missingLocations.length ? ` (no results from ${missingLocations.join(', ')})` : ''}`
+        : `Monitor has recovered (${upCount}/${configuredLocations.length} locations up)`;
 
     const avgResponseTime =
       results.reduce((sum, r) => sum + (r.responseTimeMs || 0), 0) /
@@ -511,6 +560,7 @@ export class MonitorService {
       previousStatus,
       currentStatus,
       reason,
+      preparedAlertState: groupEvaluation?.alertState,
       metadata: {
         responseTime: avgResponseTime,
         locationResults: results.map((r) => ({
@@ -520,6 +570,102 @@ export class MonitorService {
         })),
       },
     });
+    for (const result of results) {
+      await this.checkSslExpirationAlert(result, monitor);
+    }
+    if (groupEvaluation) {
+      await this.dbService.db
+        .update(schema.monitorResults)
+        .set({
+          details: sql`jsonb_set(coalesce(${schema.monitorResults.details}, '{}'::jsonb), '{aggregationNotificationProcessed}', 'true'::jsonb)`,
+        })
+        .where(eq(schema.monitorResults.id, groupEvaluation.resultId));
+    }
+  }
+
+  private isMultiLocationEvaluation(
+    ...args: Parameters<MonitorEvaluator['isMultiLocationEvaluation']>
+  ) {
+    return this.evaluator.isMultiLocationEvaluation(...args);
+  }
+
+  private prepareGroupEvaluation(
+    ...args: Parameters<MonitorEvaluator['prepareGroupEvaluation']>
+  ) {
+    return this.evaluator.prepareGroupEvaluation(...args);
+  }
+
+  /**
+   * Closes an open monitor cycle without a verdict. Used when a check was skipped for a reason that
+   * says nothing about the target (no execution slot, no entitlement), so the cycle deadline does
+   * not turn the silent region into a failed result and an alert.
+   */
+  async abortMonitorCycle(cycleId: string): Promise<void> {
+    const now = new Date();
+    await this.dbService.db
+      .update(schema.monitorCycles)
+      .set({ status: 'aborted', closedAt: now, notifiedAt: now })
+      .where(
+        and(
+          eq(schema.monitorCycles.id, cycleId),
+          eq(schema.monitorCycles.status, 'open'),
+        ),
+      );
+  }
+
+  /** A skipped expected check cannot establish uptime or downtime for the group. */
+  async skipDistributedMonitorGroup(
+    monitorId: string,
+    executionGroupId: string,
+    monitorCycle = false,
+  ): Promise<void> {
+    try {
+      if (monitorCycle) {
+        const [cycle] = await this.dbService.db
+          .select({
+            monitorId: schema.monitorCycles.monitorId,
+            status: schema.monitorCycles.status,
+          })
+          .from(schema.monitorCycles)
+          .where(eq(schema.monitorCycles.id, executionGroupId))
+          .limit(1);
+        if (cycle) {
+          if (cycle.monitorId !== monitorId || cycle.status !== 'open') return;
+          const now = new Date();
+          await this.dbService.db
+            .update(schema.monitorCycles)
+            .set({ status: 'aborted', closedAt: now, notifiedAt: now })
+            .where(
+              and(
+                eq(schema.monitorCycles.id, executionGroupId),
+                eq(schema.monitorCycles.monitorId, monitorId),
+                eq(schema.monitorCycles.status, 'open'),
+              ),
+            );
+          return;
+        }
+      }
+      const redis = this.redisService.getClient();
+      await this.withAggregationLease(monitorId, async (assertOwned) => {
+        if (await redis.get(`monitor:aggr:completed:${executionGroupId}`))
+          return;
+        await assertOwned();
+        await redis.set(
+          `monitor:aggr:aborted:${executionGroupId}`,
+          '1',
+          'EX',
+          7 * 86400,
+        );
+      });
+    } catch (error) {
+      this.logger.warn(
+        `Unable to close skipped group ${executionGroupId}: ${getErrorMessage(error)}`,
+      );
+      // Only a busy lease is worth waiting for. Any other failure (a database or Redis outage) keeps its own
+      // cause, so the caller's job fails and retries within its attempts and the real reason is not lost behind
+      // an endless "busy" retry.
+      throw error;
+    }
   }
 
   async saveDistributedMonitorResult(
@@ -527,6 +673,8 @@ export class MonitorService {
     options: {
       executionGroupId?: string;
       expectedLocations?: MonitoringLocation[];
+      persisted?: boolean;
+      monitorCycle?: boolean;
     },
   ): Promise<void> {
     const executionGroupId = options.executionGroupId;
@@ -547,12 +695,23 @@ export class MonitorService {
           }
         : result;
 
-    await this.saveMonitorResultToDb(persistedResult);
+    if (!options.persisted) await this.saveMonitorResultToDb(persistedResult);
 
     if (!executionGroupId) {
       await this.saveMonitorResults([persistedResult], { persisted: true });
       return;
     }
+
+    // Control-plane cycle: the result row is saved; hand evaluation to the control plane.
+    if (
+      options.monitorCycle &&
+      (await this.recordCycleArrival(
+        executionGroupId,
+        result.monitorId,
+        result.location,
+      ))
+    )
+      return;
 
     const monitor = await this.getMonitorById(result.monitorId);
     if (!monitor) {
@@ -566,33 +725,11 @@ export class MonitorService {
         ? expectedLocations
         : this.locationService.getEffectiveLocations(locationConfig);
 
-    // Use Redis for aggregation coordination instead of polling the database
-    // This is much more efficient: O(1) Redis ops vs expensive JSON field queries
-    const redisKey = `${REDIS_AGGREGATION_KEY_PREFIX}${executionGroupId}`;
     const redis = this.redisService.getClient();
-
-    // Add current location to the Redis set for this execution group
-    await redis.sadd(redisKey, result.location);
-    await redis.expire(redisKey, REDIS_AGGREGATION_TTL_SECONDS);
-
-    // Check if all locations have reported using Redis (O(1) operation)
-    const reportedCount = await redis.scard(redisKey);
-
-    if (reportedCount < expected.length) {
-      // Not all locations have reported yet - let the last worker handle aggregation
-      this.logger.debug(
-        `Location ${result.location} reported for monitor ${result.monitorId}. ` +
-          `Waiting for others: ${reportedCount}/${expected.length}. ` +
-          `ExecutionGroupId: ${executionGroupId}`,
-      );
+    const completedKey = `monitor:aggr:completed:${executionGroupId}`;
+    const abortedKey = `monitor:aggr:aborted:${executionGroupId}`;
+    if ((await redis.get(completedKey)) || (await redis.get(abortedKey)))
       return;
-    }
-
-    // All locations reported! This worker will aggregate.
-    // Brief pause to ensure all DB writes have committed before querying
-    await new Promise((resolve) =>
-      setTimeout(resolve, MonitorService.AGGREGATION_RETRY_DELAY_MS),
-    );
 
     // Define the type for the rows we're selecting
     type MonitorResultRow = {
@@ -607,7 +744,7 @@ export class MonitorService {
       testReportS3Url: string | null;
     };
 
-    // Now fetch results from DB (single query, not in a loop)
+    // The indexed, persisted group survives slow checks, retries, and Redis expiry.
     const groupRows = await this.dbService.db
       .select({
         monitorId: schema.monitorResults.monitorId,
@@ -634,16 +771,13 @@ export class MonitorService {
     for (const row of groupRows) {
       const rowLocation = row.location;
       if (!latestByLocation.has(rowLocation)) {
-        latestByLocation.set(rowLocation, row as MonitorResultRow);
+        latestByLocation.set(rowLocation, row);
       }
     }
 
-    // Clean up Redis key now that we've aggregated
-    await redis.del(redisKey);
-
-    if (latestByLocation.size < expected.length) {
-      this.logger.warn(
-        `Redis reported all locations but DB query found fewer. ` +
+    if (expected.some((location) => !latestByLocation.has(location))) {
+      this.logger.debug(
+        `Waiting for persisted location results. ` +
           `Expected: ${expected.join(', ')}. ` +
           `Got: ${Array.from(latestByLocation.keys()).join(', ')}. ` +
           `ExecutionGroupId: ${executionGroupId}`,
@@ -683,10 +817,122 @@ export class MonitorService {
     this.logger.log(
       `Calling saveMonitorResults for monitor ${result.monitorId} with ${aggregatedResults.length} results`,
     );
-    await this.saveMonitorResults(aggregatedResults, { persisted: true });
+    await this.withAggregationLease(result.monitorId, async (assertOwned) => {
+      if ((await redis.get(completedKey)) || (await redis.get(abortedKey)))
+        return;
+      await assertOwned();
+      await this.saveMonitorResults(aggregatedResults, {
+        persisted: true,
+        executionGroupId,
+      });
+      await assertOwned();
+      await redis
+        .set(completedKey, '1', 'EX', 7 * 24 * 60 * 60)
+        .catch((error: unknown) =>
+          this.logger.warn(
+            `Unable to mark aggregated group ${executionGroupId} complete: ${getErrorMessage(error)}`,
+          ),
+        );
+    });
     this.logger.log(
       `Successfully aggregated and saved results for monitor ${result.monitorId}`,
     );
+  }
+
+  /**
+   * Records a wake-up hint for the control plane. Returns false when no cycle row exists
+   * for this monitor (legacy evaluation continues). The cycle row, not worker env, decides
+   * the mode; a result for a closed or aborted cycle stays diagnostic and never re-evaluates
+   * it. A cycle owned by another monitor is treated as absent so a result cannot re-arm it.
+   */
+  private async recordCycleArrival(
+    cycleId: string,
+    monitorId: string,
+    location: string,
+  ): Promise<boolean> {
+    try {
+      const [cycle] = await this.dbService.db
+        .select({
+          status: schema.monitorCycles.status,
+          monitorId: schema.monitorCycles.monitorId,
+        })
+        .from(schema.monitorCycles)
+        .where(eq(schema.monitorCycles.id, cycleId))
+        .limit(1);
+      if (!cycle) return false;
+      if (cycle.monitorId !== monitorId) {
+        this.logger.warn(
+          `Ignoring cycle ${cycleId}: it belongs to monitor ${cycle.monitorId}, not ${monitorId}`,
+        );
+        return false;
+      }
+      if (cycle.status !== 'open') return true;
+      await this.dbService.db
+        .insert(schema.monitorCycleArrivals)
+        .values({ cycleId, location })
+        .onConflictDoUpdate({
+          target: [
+            schema.monitorCycleArrivals.cycleId,
+            schema.monitorCycleArrivals.location,
+          ],
+          // A retried region may report a different outcome; re-arm the hint.
+          set: { processedAt: null },
+        });
+    } catch (error) {
+      // The result is already saved; retry the hint without re-executing the check.
+      this.logger.warn(
+        `Unable to record cycle arrival ${cycleId}/${location}: ${getErrorMessage(error)}`,
+      );
+      throw new MonitorAggregationBusyError();
+    }
+    return true;
+  }
+
+  private async withAggregationLease(
+    monitorId: string,
+    aggregate: (assertOwned: () => Promise<void>) => Promise<void>,
+  ): Promise<void> {
+    const redis = this.redisService.getClient();
+    const lockKey = `monitor:aggr:lock:${monitorId}`;
+    const token = randomUUID();
+    const leaseMs = 60_000;
+    if ((await redis.set(lockKey, token, 'PX', leaseMs, 'NX')) !== 'OK') {
+      throw new MonitorAggregationBusyError();
+    }
+    const renewScript =
+      'if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("PEXPIRE", KEYS[1], ARGV[2]) end return 0';
+    const assertOwned = async () => {
+      if ((await redis.eval(renewScript, 1, lockKey, token, leaseMs)) !== 1) {
+        throw new MonitorAggregationBusyError();
+      }
+    };
+    let renewal: Promise<void> = Promise.resolve();
+    const timer = setInterval(() => {
+      renewal = renewal.then(assertOwned).catch((error: unknown) => {
+        this.logger.warn(
+          `Unable to renew monitor aggregation lease ${monitorId}: ${getErrorMessage(error)}`,
+        );
+      });
+    }, leaseMs / 3);
+    timer.unref();
+    try {
+      await aggregate(assertOwned);
+    } finally {
+      clearInterval(timer);
+      await renewal;
+      await redis
+        .eval(
+          'if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("DEL", KEYS[1]) end return 0',
+          1,
+          lockKey,
+          token,
+        )
+        .catch((error: unknown) =>
+          this.logger.warn(
+            `Unable to release monitor aggregation lease ${monitorId}: ${getErrorMessage(error)}`,
+          ),
+        );
+    }
   }
 
   async saveMonitorResult(resultData: MonitorExecutionResult): Promise<void> {
@@ -777,34 +1023,20 @@ export class MonitorService {
                 expectedAlerts >= alertsSentForFailure &&
                 failuresAfterThreshold % subsequentInterval === 0;
             }
-          } else if (currentStatus === 'up' && previousStatus === 'down') {
+          } else if (
+            currentStatus === 'up' &&
+            (previousStatus === 'down' ||
+              latestResult?.details?.recoverySequence === true)
+          ) {
             // Recovery alert logic:
             // Only send recovery alert when consecutive successes reach the recovery threshold
             // This ensures the monitor is truly stable before alerting recovery
             const recoveryThreshold = alertConfig?.recoveryThreshold || 1;
 
-            if (consecutiveSuccessCount === recoveryThreshold) {
-              // First recovery alert: threshold just reached
-              shouldSendRecoveryAlert =
-                (alertConfig?.alertOnRecovery || false) &&
-                alertsSentForRecovery === 0;
-            } else if (
-              consecutiveSuccessCount > recoveryThreshold &&
-              alertsSentForRecovery < 3
-            ) {
-              // Subsequent recovery alerts use exponential intervals to prevent alert flood
-              const subsequentInterval = Math.max(5, recoveryThreshold * 2);
-              const successesAfterThreshold =
-                consecutiveSuccessCount - recoveryThreshold;
-              const expectedAlerts = Math.floor(
-                successesAfterThreshold / subsequentInterval,
-              );
-              // Only alert if we've passed a new interval checkpoint
-              shouldSendRecoveryAlert =
-                (alertConfig?.alertOnRecovery || false) &&
-                expectedAlerts >= alertsSentForRecovery &&
-                successesAfterThreshold % subsequentInterval === 0;
-            }
+            shouldSendRecoveryAlert =
+              consecutiveSuccessCount >= recoveryThreshold &&
+              alertsSentForRecovery === 0 &&
+              (alertConfig?.alertOnRecovery || false);
           }
 
           this.logger.debug(
@@ -827,32 +1059,42 @@ export class MonitorService {
               isStatusChange: isStatusChange,
             };
 
-            await this.monitorAlertService.sendNotification(
-              resultData.monitorId,
-              type,
-              reason,
-              metadata,
-            );
+            const notification =
+              await this.monitorAlertService.sendNotification(
+                resultData.monitorId,
+                type,
+                reason,
+                metadata,
+              );
+
+            // Maintenance suppression skips only counters and logging; the
+            // independent SSL expiration check below must still run.
+            const suppressed =
+              notification?.suppressed === true ||
+              notification?.delivered === false;
 
             // Update alert counter for the appropriate alert type
-            if (shouldSendFailureAlert && latestResult) {
+            if (!suppressed && shouldSendFailureAlert && latestResult) {
               await this.dbService.db
                 .update(schema.monitorResults)
                 .set({ alertsSentForFailure: alertsSentForFailure + 1 })
                 .where(eq(schema.monitorResults.id, latestResult.id));
             }
 
-            if (shouldSendRecoveryAlert && latestResult) {
+            if (!suppressed && shouldSendRecoveryAlert && latestResult) {
               await this.dbService.db
                 .update(schema.monitorResults)
                 .set({
                   alertsSentForRecovery: alertsSentForRecovery + 1,
-                } as Partial<typeof schema.monitorResults.$inferInsert>)
+                })
                 .where(eq(schema.monitorResults.id, latestResult.id));
             }
 
             // Only log important alert events
-            if (type === 'recovery' || alertsSentForFailure < 2) {
+            if (
+              !suppressed &&
+              (type === 'recovery' || alertsSentForFailure < 2)
+            ) {
               this.logger.log(
                 `Sent ${type} notification for monitor ${resultData.monitorId}`,
               );
@@ -861,15 +1103,19 @@ export class MonitorService {
             this.logger.debug(
               `[ALERT_DEBUG] Skipping failure alert for monitor ${resultData.monitorId} - already sent 3 alerts for this failure sequence`,
             );
-          } else if (currentStatus === 'up' && previousStatus === 'down') {
+          } else if (
+            currentStatus === 'up' &&
+            (previousStatus === 'down' ||
+              latestResult?.details?.recoverySequence === true)
+          ) {
             const recoveryThreshold = alertConfig?.recoveryThreshold || 1;
             if (consecutiveSuccessCount < recoveryThreshold) {
               this.logger.debug(
                 `[ALERT_DEBUG] Skipping recovery alert for monitor ${resultData.monitorId} - waiting for ${recoveryThreshold - consecutiveSuccessCount} more consecutive successes (${consecutiveSuccessCount}/${recoveryThreshold})`,
               );
-            } else if (alertsSentForRecovery >= 3) {
+            } else if (alertsSentForRecovery >= 1) {
               this.logger.debug(
-                `[ALERT_DEBUG] Skipping recovery alert for monitor ${resultData.monitorId} - already sent 3 alerts for this recovery sequence`,
+                `[ALERT_DEBUG] Skipping recovery alert for monitor ${resultData.monitorId} - already sent one alert for this recovery sequence`,
               );
             }
           }
@@ -1194,7 +1440,8 @@ export class MonitorService {
       details = {
         statusCode: response.status,
         statusText: response.statusText,
-        responseHeaders: response.headers as Record<string, string>,
+        // Session material (Set-Cookie, tokens) must not be persisted or shown to viewers
+        responseHeaders: sanitizeResponseHeaders(response.headers),
         responseSize: response.data ? JSON.stringify(response.data).length : 0,
       };
 
@@ -1697,7 +1944,8 @@ export class MonitorService {
     const timeout =
       (config?.timeoutSeconds ?? TIMEOUTS_SECONDS.SSL_CHECK_DEFAULT) * 1000;
     const daysUntilExpirationWarning =
-      config?.daysUntilExpirationWarning ?? SECURITY.SSL_DEFAULT_WARNING_DAYS;
+      config?.sslDaysUntilExpirationWarning ??
+      SECURITY.SSL_DEFAULT_WARNING_DAYS;
 
     this.logger.debug(
       `SSL Check: ${target}, Timeout: ${timeout}ms, Warning threshold: ${daysUntilExpirationWarning} days`,
@@ -1844,6 +2092,16 @@ export class MonitorService {
             sslCertificate,
             responseTimeMs,
           };
+        } else if (!certificateInfo.authorized) {
+          status = 'down';
+          isUp = false;
+          details = {
+            errorMessage:
+              certificateInfo.authorizationError?.message ||
+              'Certificate trust or hostname verification failed',
+            sslCertificate,
+            responseTimeMs,
+          };
         } else if (daysRemaining <= daysUntilExpirationWarning) {
           status = 'up'; // Still up but warning
           isUp = true;
@@ -1924,10 +2182,10 @@ export class MonitorService {
     return { status, details, responseTimeMs, isUp };
   }
 
-  async getMonitorById(monitorId: string): Promise<Monitor | undefined> {
-    return this.dbService.db.query.monitors.findFirst({
-      where: eq(schema.monitors.id, monitorId),
-    }) as Promise<Monitor | undefined>;
+  private getMonitorById(
+    ...args: Parameters<MonitorEvaluator['getMonitorById']>
+  ) {
+    return this.evaluator.getMonitorById(...args);
   }
 
   /**
@@ -1970,8 +2228,7 @@ export class MonitorService {
 
       // Check if we have SSL certificate info to determine smart frequency
       const sslCertificate = monitorConfig.sslCertificate as
-        | Record<string, unknown>
-        | undefined;
+        Record<string, unknown> | undefined;
       const daysRemaining =
         sslCertificate?.daysRemaining != null
           ? Number(sslCertificate.daysRemaining)
@@ -2013,7 +2270,7 @@ export class MonitorService {
       }
 
       const updatedConfig = {
-        ...((monitor.config as Record<string, unknown>) || {}),
+        ...(monitor.config || {}),
         sslLastCheckedAt: new Date().toISOString(),
       } as typeof monitor.config;
 
@@ -2029,147 +2286,16 @@ export class MonitorService {
     }
   }
 
-  /**
-   * Checks for SSL expiration warnings and sends alerts independently of status changes
-   */
-  private async checkSslExpirationAlert(
-    resultData: MonitorExecutionResult,
-    monitor: Monitor | null,
-  ): Promise<void> {
-    try {
-      // Removed debug log
-
-      // Check if SSL certificate info is available and has warning
-      const sslCertificate = resultData.details?.sslCertificate;
-      const sslWarning =
-        resultData.details?.sslWarning || resultData.details?.warningMessage;
-
-      // Removed debug logs
-
-      if (!sslCertificate && !sslWarning) {
-        return; // No SSL info to check
-      }
-
-      let shouldAlert = false;
-      let alertReason = '';
-
-      // Check for SSL expiration warning
-      if (sslCertificate?.daysRemaining !== undefined) {
-        const daysUntilExpiration = sslCertificate.daysRemaining;
-        const warningThreshold =
-          ((monitor?.config as Record<string, unknown> | undefined)
-            ?.sslDaysUntilExpirationWarning as number | undefined) ??
-          SECURITY.SSL_DEFAULT_WARNING_DAYS;
-
-        // Removed debug logs
-
-        if (
-          daysUntilExpiration <= warningThreshold &&
-          daysUntilExpiration > 0
-        ) {
-          shouldAlert = true;
-          alertReason = `SSL certificate expires in ${daysUntilExpiration} days`;
-        } else if (daysUntilExpiration <= 0) {
-          shouldAlert = true;
-          alertReason = 'SSL certificate has expired';
-        }
-      }
-
-      // Check for SSL warning messages
-      if (sslWarning && typeof sslWarning === 'string') {
-        shouldAlert = true;
-        alertReason = alertReason || sslWarning;
-      }
-
-      if (shouldAlert) {
-        // Check if we've already sent an SSL alert recently to avoid spam
-        const lastSslAlert = await this.getLastSslAlert(resultData.monitorId);
-        const now = new Date();
-        const hoursSinceLastAlert = lastSslAlert
-          ? (now.getTime() - lastSslAlert.getTime()) / (1000 * 60 * 60)
-          : Infinity;
-
-        // Only send SSL alerts once per day to avoid spam
-        if (hoursSinceLastAlert >= 24) {
-          await this.monitorAlertService.sendSslExpirationNotification(
-            resultData.monitorId,
-            alertReason,
-            {
-              sslCertificate,
-              daysRemaining: sslCertificate?.daysRemaining,
-              responseTime: resultData.responseTimeMs,
-            },
-          );
-
-          // Record that we sent an SSL alert
-          await this.recordSslAlert(resultData.monitorId);
-
-          // Only log important SSL alerts
-          this.logger.log(
-            `Sent SSL expiration alert for monitor ${resultData.monitorId}: ${alertReason}`,
-          );
-        }
-        // Removed debug log for skipped alerts
-      }
-    } catch (error) {
-      this.logger.error(
-        `Error checking SSL expiration alert for monitor ${resultData.monitorId}:`,
-        error,
-      );
-    }
+  private checkSslExpirationAlert(
+    ...args: Parameters<MonitorEvaluator['checkSslExpirationAlert']>
+  ) {
+    return this.evaluator.checkSslExpirationAlert(...args);
   }
 
-  /**
-   * Gets the timestamp of the last SSL alert sent for a monitor
-   */
-  private async getLastSslAlert(monitorId: string): Promise<Date | null> {
-    try {
-      const lastAlert = await this.dbService.db.query.alertHistory.findFirst({
-        where: and(
-          eq(schema.alertHistory.monitorId, monitorId),
-          eq(schema.alertHistory.type, 'ssl_expiring'),
-        ),
-        orderBy: [desc(schema.alertHistory.sentAt)],
-      });
-
-      return lastAlert?.sentAt ? new Date(lastAlert.sentAt) : null;
-    } catch (error) {
-      this.logger.error(
-        `Error getting last SSL alert for monitor ${monitorId}:`,
-        error,
-      );
-      return null;
-    }
-  }
-
-  /**
-   * Records that an SSL alert was sent for a monitor
-   */
-  private async recordSslAlert(monitorId: string): Promise<void> {
-    try {
-      const monitor = await this.dbService.db.query.monitors.findFirst({
-        where: eq(schema.monitors.id, monitorId),
-      });
-
-      if (!monitor) {
-        return;
-      }
-
-      const updatedConfig = {
-        ...((monitor.config as Record<string, unknown>) || {}),
-        lastSslAlertSentAt: new Date().toISOString(),
-      } as typeof monitor.config;
-
-      await this.dbService.db
-        .update(schema.monitors)
-        .set({ config: updatedConfig })
-        .where(eq(schema.monitors.id, monitorId));
-    } catch (error) {
-      this.logger.error(
-        `Error recording SSL alert for monitor ${monitorId}:`,
-        error,
-      );
-    }
+  private getLastSslAlert(
+    ...args: Parameters<MonitorEvaluator['getLastSslAlert']>
+  ) {
+    return this.evaluator.getLastSslAlert(...args);
   }
 
   private async saveMonitorResultToDb(
@@ -2177,9 +2303,14 @@ export class MonitorService {
   ): Promise<void> {
     try {
       // Get the last monitor result to track consecutive failures and successes
+      // Counters are tracked per location: another region's latest result must
+      // not reset or advance this location's failure/recovery sequence.
       const lastResult = await this.dbService.db.query.monitorResults.findFirst(
         {
-          where: eq(schema.monitorResults.monitorId, resultData.monitorId),
+          where: and(
+            eq(schema.monitorResults.monitorId, resultData.monitorId),
+            eq(schema.monitorResults.location, resultData.location),
+          ),
           orderBy: [desc(schema.monitorResults.checkedAt)],
         },
       );
@@ -2240,7 +2371,13 @@ export class MonitorService {
         checkedAt: resultData.checkedAt,
         status: resultData.status,
         responseTimeMs: resultData.responseTimeMs,
-        details: resultData.details,
+        details: {
+          ...resultData.details,
+          recoverySequence:
+            resultData.isUp &&
+            (lastResult?.isUp === false ||
+              lastResult?.details?.recoverySequence === true),
+        },
         isUp: resultData.isUp,
         isStatusChange: isStatusChange,
         consecutiveFailureCount: consecutiveFailureCount,
@@ -2262,375 +2399,34 @@ export class MonitorService {
     }
   }
 
-  private async updateMonitorStatus(
-    monitorId: string,
-    status: 'up' | 'down',
-    checkedAt: Date,
-  ): Promise<void> {
-    try {
-      // Get current monitor status before update to detect status changes
-      const currentMonitor = await this.getMonitorById(monitorId);
-      const previousStatus = currentMonitor?.status;
-
-      // Determine if this is a status change
-      const isStatusChange = previousStatus && previousStatus !== status;
-
-      await this.dbService.db
-        .update(schema.monitors)
-        .set({
-          status: status,
-          lastCheckAt: checkedAt,
-          lastStatusChangeAt: isStatusChange ? checkedAt : undefined,
-        })
-        .where(eq(schema.monitors.id, monitorId));
-
-      this.logger.log(
-        `Updated monitor ${monitorId} status: ${previousStatus || 'unknown'} -> ${status}`,
-      );
-    } catch (error) {
-      this.logger.error(
-        `Failed to update monitor status for ${monitorId}: ${getErrorMessage(error)}`,
-        error instanceof Error ? error.stack : undefined,
-      );
-    }
+  private updateMonitorStatus(
+    ...args: Parameters<MonitorEvaluator['updateMonitorStatus']>
+  ) {
+    return this.evaluator.updateMonitorStatus(...args);
   }
 
   private readAggregatedAlertState(
-    monitorConfig: MonitorConfig | null | undefined,
-  ): AggregatedAlertState {
-    const rawAlertState = (
-      monitorConfig as { aggregatedAlertState?: Record<string, unknown> } | null
-    )?.aggregatedAlertState;
-
-    const toSafeCounter = (value: unknown): number =>
-      typeof value === 'number' && Number.isFinite(value) && value >= 0
-        ? Math.floor(value)
-        : 0;
-
-    return {
-      consecutiveFailureCount: toSafeCounter(
-        rawAlertState?.consecutiveFailureCount,
-      ),
-      consecutiveSuccessCount: toSafeCounter(
-        rawAlertState?.consecutiveSuccessCount,
-      ),
-      alertsSentForFailure: toSafeCounter(rawAlertState?.alertsSentForFailure),
-      alertsSentForRecovery: toSafeCounter(
-        rawAlertState?.alertsSentForRecovery,
-      ),
-    };
+    ...args: Parameters<MonitorEvaluator['readAggregatedAlertState']>
+  ) {
+    return this.evaluator.readAggregatedAlertState(...args);
   }
 
   private getNextAggregatedAlertState(
-    previousState: AggregatedAlertState,
-    previousStatus: string,
-    currentStatus: 'up' | 'down',
-  ): AggregatedAlertState {
-    if (currentStatus === 'down') {
-      const continuingFailureSequence = previousStatus === 'down';
-
-      return {
-        consecutiveFailureCount: continuingFailureSequence
-          ? previousState.consecutiveFailureCount + 1
-          : 1,
-        consecutiveSuccessCount: 0,
-        alertsSentForFailure: continuingFailureSequence
-          ? previousState.alertsSentForFailure
-          : 0,
-        alertsSentForRecovery: 0,
-      };
-    }
-
-    const continuingRecoverySequence = previousStatus === 'up';
-
-    return {
-      consecutiveFailureCount: 0,
-      consecutiveSuccessCount: continuingRecoverySequence
-        ? previousState.consecutiveSuccessCount + 1
-        : 1,
-      alertsSentForFailure: 0,
-      alertsSentForRecovery: continuingRecoverySequence
-        ? previousState.alertsSentForRecovery
-        : 0,
-    };
+    ...args: Parameters<MonitorEvaluator['getNextAggregatedAlertState']>
+  ) {
+    return this.evaluator.getNextAggregatedAlertState(...args);
   }
 
-  private async persistAggregatedAlertState(
-    monitorId: string,
-    monitorConfig: MonitorConfig | null | undefined,
-    aggregatedAlertState: AggregatedAlertState,
-  ): Promise<void> {
-    try {
-      const nextConfig: MonitorConfig = {
-        ...(monitorConfig ?? {}),
-        aggregatedAlertState,
-      };
-
-      await this.dbService.db
-        .update(schema.monitors)
-        .set({ config: nextConfig })
-        .where(eq(schema.monitors.id, monitorId));
-    } catch (error) {
-      this.logger.error(
-        `Failed to persist aggregated alert state for monitor ${monitorId}: ${getErrorMessage(error)}`,
-      );
-    }
+  private persistAggregatedAlertState(
+    ...args: Parameters<MonitorEvaluator['persistAggregatedAlertState']>
+  ) {
+    return this.evaluator.persistAggregatedAlertState(...args);
   }
 
-  /**
-   * Evaluate and send alerts based on status transitions with threshold support.
-   * Consolidated alert logic for both single and multi-location monitors.
-   * Prevents unnecessary alerts on initial monitor creation (pending → any status).
-   *
-   * Threshold behavior (aligned with single-location saveMonitorResult path):
-   * - failureThreshold: Number of consecutive failures before first alert (default: 1)
-   * - recoveryThreshold: Number of consecutive successes before recovery alert (default: 1)
-   * - Max 3 alerts per failure/recovery sequence with exponential intervals
-   *
-   * @returns Alert action metadata { alertSent: boolean, alertType?: string }
-   */
-  private async evaluateAndSendAlert(options: {
-    monitorId: string;
-    monitor: Monitor | undefined;
-    previousStatus: string;
-    currentStatus: 'up' | 'down';
-    reason: string;
-    metadata: Record<string, unknown>;
-  }): Promise<{ alertSent: boolean; alertType?: string }> {
-    const { monitorId, previousStatus, currentStatus, reason, metadata } =
-      options;
-
-    const monitor = options.monitor;
-
-    // Don't send alerts if alerts are disabled
-    const monitorAlertConfig = (monitor as Record<string, unknown> | null)
-      ?.alertConfig as Record<string, unknown> | undefined;
-    if (!monitorAlertConfig?.enabled) {
-      return { alertSent: false };
-    }
-
-    // Don't send alerts for state transitions from 'pending' or 'paused'
-    // These are initial states and should not trigger notifications
-    if (previousStatus === 'pending' || previousStatus === 'paused') {
-      this.logger.debug(
-        `[ALERT] Skipping alert for monitor ${monitorId}: transitioning from ${previousStatus} status (not a real state change)`,
-      );
-      return { alertSent: false };
-    }
-
-    const monitorConfig = (monitor as Monitor | null)?.config;
-    const locationResults = Array.isArray(
-      (metadata as { locationResults?: unknown }).locationResults,
-    )
-      ? ((metadata as { locationResults?: unknown[] }).locationResults ?? [])
-      : [];
-    const isMultiLocationEvaluation = locationResults.length > 1;
-
-    let latestResult: MonitorResult | undefined;
-    let aggregatedAlertState: AggregatedAlertState | null = null;
-
-    if (isMultiLocationEvaluation) {
-      aggregatedAlertState = this.getNextAggregatedAlertState(
-        this.readAggregatedAlertState(monitorConfig),
-        previousStatus,
-        currentStatus,
-      );
-    } else {
-      // Keep existing row-based logic for single-location evaluations
-      latestResult = await this.dbService.db.query.monitorResults.findFirst({
-        where: eq(schema.monitorResults.monitorId, monitorId),
-        orderBy: [desc(schema.monitorResults.checkedAt)],
-      });
-    }
-
-    const consecutiveFailureCount = isMultiLocationEvaluation
-      ? (aggregatedAlertState?.consecutiveFailureCount ?? 0)
-      : (latestResult?.consecutiveFailureCount ?? 0);
-    const consecutiveSuccessCount = isMultiLocationEvaluation
-      ? (aggregatedAlertState?.consecutiveSuccessCount ?? 0)
-      : (latestResult?.consecutiveSuccessCount ?? 0);
-    const alertsSentForFailure = isMultiLocationEvaluation
-      ? (aggregatedAlertState?.alertsSentForFailure ?? 0)
-      : (latestResult?.alertsSentForFailure ?? 0);
-    const alertsSentForRecovery = isMultiLocationEvaluation
-      ? (aggregatedAlertState?.alertsSentForRecovery ?? 0)
-      : (latestResult?.alertsSentForRecovery ?? 0);
-
-    // Determine alert type and whether thresholds are met
-    let shouldSendAlert = false;
-    let alertType: 'recovery' | 'failure' | null = null;
-
-    if (currentStatus === 'down') {
-      alertType = 'failure';
-      const failureThreshold =
-        (monitorAlertConfig?.failureThreshold as number) || 1;
-
-      if (
-        consecutiveFailureCount === failureThreshold &&
-        alertsSentForFailure === 0
-      ) {
-        // First alert: threshold just reached
-        shouldSendAlert =
-          (monitorAlertConfig?.alertOnFailure as boolean) || false;
-      } else if (
-        consecutiveFailureCount > failureThreshold &&
-        alertsSentForFailure < 3
-      ) {
-        // Subsequent alerts: exponential intervals (max 3 total)
-        const subsequentInterval = Math.max(5, failureThreshold * 2);
-        const failuresAfterThreshold =
-          consecutiveFailureCount - failureThreshold;
-        const expectedAlerts = Math.floor(
-          failuresAfterThreshold / subsequentInterval,
-        );
-        shouldSendAlert =
-          (monitorAlertConfig?.alertOnFailure as boolean) &&
-          expectedAlerts >= alertsSentForFailure &&
-          failuresAfterThreshold % subsequentInterval === 0;
-      }
-
-      if (!shouldSendAlert) {
-        if (consecutiveFailureCount > 0 && alertsSentForFailure >= 3) {
-          this.logger.debug(
-            `[ALERT] Skipping failure alert for monitor ${monitorId} - already sent 3 alerts for this failure sequence`,
-          );
-        } else {
-          this.logger.debug(
-            `[ALERT] Failure threshold not yet met for monitor ${monitorId}: ${consecutiveFailureCount}/${failureThreshold}`,
-          );
-        }
-      }
-    } else if (currentStatus === 'up' && previousStatus === 'down') {
-      alertType = 'recovery';
-      const recoveryThreshold =
-        (monitorAlertConfig?.recoveryThreshold as number) || 1;
-
-      if (
-        consecutiveSuccessCount === recoveryThreshold &&
-        alertsSentForRecovery === 0
-      ) {
-        // First recovery alert: threshold just reached
-        shouldSendAlert =
-          (monitorAlertConfig?.alertOnRecovery as boolean) || false;
-      } else if (
-        consecutiveSuccessCount > recoveryThreshold &&
-        alertsSentForRecovery < 3
-      ) {
-        // Subsequent recovery alerts: exponential intervals (max 3 total)
-        const subsequentInterval = Math.max(5, recoveryThreshold * 2);
-        const successesAfterThreshold =
-          consecutiveSuccessCount - recoveryThreshold;
-        const expectedAlerts = Math.floor(
-          successesAfterThreshold / subsequentInterval,
-        );
-        shouldSendAlert =
-          (monitorAlertConfig?.alertOnRecovery as boolean) &&
-          expectedAlerts >= alertsSentForRecovery &&
-          successesAfterThreshold % subsequentInterval === 0;
-      }
-
-      if (!shouldSendAlert) {
-        if (
-          consecutiveSuccessCount <
-          ((monitorAlertConfig?.recoveryThreshold as number) || 1)
-        ) {
-          this.logger.debug(
-            `[ALERT] Recovery threshold not yet met for monitor ${monitorId}: ${consecutiveSuccessCount}/${(monitorAlertConfig?.recoveryThreshold as number) || 1}`,
-          );
-        } else if (alertsSentForRecovery >= 3) {
-          this.logger.debug(
-            `[ALERT] Skipping recovery alert for monitor ${monitorId} - already sent 3 alerts for this recovery sequence`,
-          );
-        }
-      }
-    }
-
-    if (!shouldSendAlert || !alertType) {
-      if (isMultiLocationEvaluation && aggregatedAlertState) {
-        await this.persistAggregatedAlertState(
-          monitorId,
-          monitorConfig,
-          aggregatedAlertState,
-        );
-      }
-
-      return { alertSent: false };
-    }
-
-    try {
-      this.logger.log(
-        `Sending ${alertType} notification for monitor ${monitorId}`,
-      );
-
-      const alertMetadata = {
-        ...metadata,
-        consecutiveFailureCount,
-        consecutiveSuccessCount,
-        alertsSentForFailure,
-        alertsSentForRecovery,
-      };
-
-      await this.monitorAlertService.sendNotification(
-        monitorId,
-        alertType,
-        reason,
-        alertMetadata,
-      );
-
-      if (isMultiLocationEvaluation && aggregatedAlertState) {
-        const updatedAggregatedAlertState =
-          alertType === 'failure'
-            ? {
-                ...aggregatedAlertState,
-                alertsSentForFailure:
-                  aggregatedAlertState.alertsSentForFailure + 1,
-              }
-            : {
-                ...aggregatedAlertState,
-                alertsSentForRecovery:
-                  aggregatedAlertState.alertsSentForRecovery + 1,
-              };
-
-        await this.persistAggregatedAlertState(
-          monitorId,
-          monitorConfig,
-          updatedAggregatedAlertState,
-        );
-      }
-
-      // Preserve existing single-location behavior
-      if (!isMultiLocationEvaluation && latestResult) {
-        if (alertType === 'failure') {
-          await this.dbService.db
-            .update(schema.monitorResults)
-            .set({ alertsSentForFailure: alertsSentForFailure + 1 })
-            .where(eq(schema.monitorResults.id, latestResult.id));
-        } else if (alertType === 'recovery') {
-          await this.dbService.db
-            .update(schema.monitorResults)
-            .set({
-              alertsSentForRecovery: alertsSentForRecovery + 1,
-            } as Partial<typeof schema.monitorResults.$inferInsert>)
-            .where(eq(schema.monitorResults.id, latestResult.id));
-        }
-      }
-
-      return { alertSent: true, alertType };
-    } catch (error) {
-      if (isMultiLocationEvaluation && aggregatedAlertState) {
-        await this.persistAggregatedAlertState(
-          monitorId,
-          monitorConfig,
-          aggregatedAlertState,
-        );
-      }
-
-      this.logger.error(
-        `Failed to send ${alertType} alert for monitor ${monitorId}: ${getErrorMessage(error)}`,
-        error instanceof Error ? error.stack : undefined,
-      );
-      return { alertSent: false };
-    }
+  private evaluateAndSendAlert(
+    ...args: Parameters<MonitorEvaluator['evaluateAndSendAlert']>
+  ) {
+    return this.evaluator.evaluateAndSendAlert(...args);
   }
 
   /**
@@ -2646,7 +2442,7 @@ export class MonitorService {
         orderBy: [desc(schema.monitorResults.checkedAt)],
         limit: limit,
       });
-      return (results || []) as MonitorResult[];
+      return results || [];
     } catch (error) {
       this.logger.error(
         `Failed to get recent monitor results: ${getErrorMessage(error)}`,
@@ -2799,6 +2595,7 @@ export class MonitorService {
       const testResult = await this.executionService.runSingleTest(
         {
           testId: test.id,
+          organizationId: test.organizationId ?? undefined,
           code: decodedScript,
           variables: resolvedVariables,
           secrets: resolvedSecrets,
@@ -2817,7 +2614,11 @@ export class MonitorService {
         where: eq(schema.monitors.id, monitorId),
       });
 
-      if (monitor?.organizationId) {
+      // Meter container run time evidenced by Kubernetes, not the wall-clock
+      // response time, which includes scheduling and image pulls. A check whose
+      // container never started is not billed.
+      const billableMs = testResult.billableMs ?? 0;
+      if (monitor?.organizationId && billableMs > 0) {
         // Persist exact usage before returning a completed synthetic result.
         // The execution ID is unique per check, including each location.
         await this.usageTrackerService
@@ -2826,7 +2627,7 @@ export class MonitorService {
               organizationId: monitor.organizationId,
               runId: testResult.testId,
               eventType: 'playwright_execution',
-              durationMs: responseTimeMs,
+              durationMs: billableMs,
               metadata: {
                 monitorId,
                 testId: test.id,
@@ -2843,7 +2644,7 @@ export class MonitorService {
             );
           });
         await this.usageTrackerService
-          .trackPlaywrightExecution(monitor.organizationId, responseTimeMs, {
+          .trackPlaywrightExecution(monitor.organizationId, billableMs, {
             runId: testResult.testId,
             monitorId,
             testId: test.id,
@@ -2905,6 +2706,11 @@ export class MonitorService {
         };
       }
     } catch (error) {
+      if (
+        error instanceof ExecutionCapacityError ||
+        error instanceof ExecutionEntitlementError
+      )
+        throw error;
       const responseTimeMs = Date.now() - startTime;
 
       this.logger.error(

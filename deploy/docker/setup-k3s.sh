@@ -39,6 +39,33 @@ warn()  { echo -e "${YELLOW}[!]${NC} $*"; }
 error() { echo -e "${RED}[✗]${NC} $*" >&2; }
 info()  { echo -e "${BLUE}[i]${NC} $*"; }
 
+# Upgrade the mode saved by older runs, so restarts cannot expose admin credentials.
+secure_kubeconfig() {
+  local service_file="$1"
+  local kubeconfig="$2"
+  if [[ -f "$service_file" ]]; then
+    local service_tmp
+    service_tmp="$(mktemp)"
+    awk '
+      mode_arg { sub(/[0-7]+/, "600"); mode_arg = 0 }
+      /--write-kubeconfig-mode/ {
+        if (match($0, /--write-kubeconfig-mode[\047"]?[= ]+[\047"]?[0-7]+/)) {
+          option = substr($0, RSTART, RLENGTH)
+          sub(/[0-7]+$/, "600", option)
+          $0 = substr($0, 1, RSTART - 1) option substr($0, RSTART + RLENGTH)
+        } else mode_arg = 1
+      }
+      { print }
+    ''' "$service_file" >"$service_tmp"
+    if ! cmp -s "$service_file" "$service_tmp"; then
+      install -m 644 "$service_tmp" "$service_file"
+      systemctl daemon-reload
+    fi
+    rm -f "$service_tmp"
+  fi
+  if [[ -f "$kubeconfig" ]]; then chmod 600 "$kubeconfig"; fi
+}
+
 # ─── Preflight checks ────────────────────────────────────────────────────────
 
 if [[ $EUID -ne 0 ]]; then
@@ -66,8 +93,24 @@ elif [[ "$ARCH" == "aarch64" ]]; then
   GVISOR_ARCH="aarch64"
 fi
 
+if command -v k3s &>/dev/null; then
+  secure_kubeconfig /etc/systemd/system/k3s.service /etc/rancher/k3s/k3s.yaml
+fi
+
 if ! command -v sha512sum &>/dev/null; then
   error "sha512sum is required to verify gVisor downloads"
+  exit 1
+fi
+
+# The gVisor release archive is .tar.bz2 and "tar -xjf" shells out to bzip2.
+# Minimal Ubuntu/Debian images (including every current Ubuntu cloud image) ship
+# tar, gzip and xz but not bzip2, so this fails with a misleading
+# "tar (child): bzip2: Cannot exec: No such file or directory" after the
+# download and checksum have already succeeded.
+if ! command -v bzip2 &>/dev/null; then
+  error "bzip2 is required to extract the gVisor release archive"
+  error "Install it first, then re-run this script:"
+  error "  apt-get install -y bzip2"
   exit 1
 fi
 
@@ -85,9 +128,13 @@ info "Starting Supercheck K3s + gVisor setup..."
 
 # Pin K3s to a vetted version and use the official gVisor release channel format.
 K3S_VERSION="v1.32.10+k3s1"
-GVISOR_RELEASE="${GVISOR_RELEASE:-latest}"
+# gVisor is pinned for the same reason as K3s: the release archive's contents are
+# part of the contract (runsc plus the gvisor-bin/ sidecar tree), and an upstream
+# packaging change has already broken installs twice. Override with GVISOR_RELEASE.
+GVISOR_RELEASE="${GVISOR_RELEASE:-20261005.0}"
 TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT
+WORKER_KUBECONFIG_TMP=""
+trap 'rm -rf "$TMP_DIR"; if [[ -n "${WORKER_KUBECONFIG_TMP:-}" ]]; then rm -f "$WORKER_KUBECONFIG_TMP"; fi' EXIT
 
 # ─── Step 1: Install K3s (containerd, no Docker) ─────────────────────────────
 
@@ -98,7 +145,7 @@ else
   curl -fsSL https://get.k3s.io -o "${TMP_DIR}/install-k3s.sh"
   chmod 0755 "${TMP_DIR}/install-k3s.sh"
   INSTALL_K3S_VERSION="${K3S_VERSION}" sh "${TMP_DIR}/install-k3s.sh" \
-    --write-kubeconfig-mode 644 \
+    --write-kubeconfig-mode 600 \
     --tls-san "${HOST_IP}" \
     --disable traefik
 
@@ -123,7 +170,11 @@ export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 
 # ─── Step 2: Install gVisor (runsc) ──────────────────────────────────────────
 
-if command -v runsc &>/dev/null; then
+# A runsc installed by an earlier version of this script, or by an interrupted
+# run, has no gvisor-bin/gvisor_sentry sidecar, so it is reinstalled
+# (idempotent) rather than skipped. Check the file, not the directory: the
+# directory is created before its contents are copied.
+if command -v runsc &>/dev/null && [[ -x /usr/local/bin/gvisor-bin/gvisor_sentry ]]; then
   warn "gVisor (runsc) is already installed: $(runsc --version 2>&1 | head -1)"
 else
   log "Installing gVisor (runsc) release ${GVISOR_RELEASE}..."
@@ -152,6 +203,27 @@ else
 
   install -m 0755 "${TMP_DIR}/runsc" /usr/local/bin/runsc
   install -m 0755 "${TMP_DIR}/containerd-shim-runsc-v1" /usr/local/bin/containerd-shim-runsc-v1
+
+  # Current releases ship the sandbox "sentry" sidecar in a gvisor-bin/
+  # directory inside the same archive. runsc resolves it relative to its own
+  # binary and defaults to --sidecar-usage-policy=strict, so the whole directory
+  # has to be installed next to runsc; copying only the two binaries above
+  # leaves every sandbox pod stuck on
+  #   sidecar "gvisor_sentry" not usable
+  #   (stat /usr/local/bin/gvisor-bin/gvisor_sentry: no such file or directory).
+  # Guarded so older archives without gvisor-bin/ keep working.
+  if [[ -d "${TMP_DIR}/gvisor-bin" ]]; then
+    install -d -m 0755 /usr/local/bin/gvisor-bin
+    # Regular files only, so a subdirectory in a future archive cannot abort the copy.
+    for sidecar in "${TMP_DIR}"/gvisor-bin/*; do
+      [[ -f "$sidecar" ]] || continue
+      install -m 0755 "$sidecar" /usr/local/bin/gvisor-bin/
+    done
+    if [[ ! -x /usr/local/bin/gvisor-bin/gvisor_sentry ]]; then
+      error "gVisor archive did not contain gvisor-bin/gvisor_sentry"
+      exit 1
+    fi
+  fi
 
   log "gVisor installed: $(runsc --version 2>&1 | head -1)"
 fi
@@ -193,6 +265,7 @@ fi
 # ─── Step 4: Restart K3s to pick up containerd changes ───────────────────────
 
 log "Restarting K3s to apply containerd configuration..."
+secure_kubeconfig /etc/systemd/system/k3s.service /etc/rancher/k3s/k3s.yaml
 systemctl restart k3s
 
 # Wait for K3s to be ready after restart
@@ -208,6 +281,7 @@ if ! k3s kubectl get nodes 2>/dev/null | grep -q " Ready"; then
   error "K3s failed to become ready after restart"
   exit 1
 fi
+chmod 600 /etc/rancher/k3s/k3s.yaml
 log "K3s restarted successfully"
 
 # ─── Step 5: Create gVisor RuntimeClass ───────────────────────────────────────
@@ -322,6 +396,7 @@ spec:
             except:
               - 169.254.169.254/32
               - 100.100.100.200/32
+              - 100.64.0.0/10
               - 169.254.0.0/16
               - 10.0.0.0/8
               - 172.16.0.0/12
@@ -426,7 +501,8 @@ if [[ -z "$TOKEN" ]]; then
   exit 1
 fi
 
-cat > "$WORKER_KUBECONFIG" <<EOF
+WORKER_KUBECONFIG_TMP="$(mktemp "${WORKER_KUBECONFIG}.XXXXXX")"
+cat > "$WORKER_KUBECONFIG_TMP" <<EOF
 apiVersion: v1
 kind: Config
 clusters:
@@ -451,8 +527,9 @@ EOF
 # compose runs it as "pwuser:pwuser" with NO supplemental groups, and docker
 # --user does not apply the host's group database). The kubeconfig is
 # bind-mounted read-only, so the file must be group-readable by gid 1001.
-chgrp 1001 "$WORKER_KUBECONFIG"
-chmod 0440 "$WORKER_KUBECONFIG"
+chgrp 1001 "$WORKER_KUBECONFIG_TMP"
+chmod 0440 "$WORKER_KUBECONFIG_TMP"
+mv -f "$WORKER_KUBECONFIG_TMP" "$WORKER_KUBECONFIG"
 log "Restricted worker kubeconfig written to $WORKER_KUBECONFIG (group-readable by GID 1001 / pwuser)"
 
 # ─── Step 8: Label the node for gVisor scheduling ────────────────────────────
@@ -531,6 +608,6 @@ info "  2. Or run Docker Compose with K3s-backed execution using:"
 info "     Set COMPOSE_PROFILES=https, APP_DOMAIN and ACME_EMAIL in .env for HTTPS."
 info "     KUBECONFIG_FILE=${WORKER_KUBECONFIG} docker compose up -d"
 info ""
-info "Admin kubeconfig:   export KUBECONFIG=/etc/rancher/k3s/k3s.yaml"
+info "Admin access:       sudo k3s kubectl get nodes (admin kubeconfig is root-only)"
 info "Worker kubeconfig:  ${WORKER_KUBECONFIG}"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

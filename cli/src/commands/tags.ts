@@ -2,7 +2,7 @@ import { CLIError, ExitCode } from '../utils/errors.js'
 import { Command } from 'commander'
 import { createAuthenticatedClient } from '../api/authenticated-client.js'
 import { logger } from '../utils/logger.js'
-import { output, outputDetail } from '../output/formatter.js'
+import { output, outputDetail, outputMutation } from '../output/formatter.js'
 import { withSpinner } from '../utils/spinner.js'
 
 export const tagCommand = new Command('tag')
@@ -51,13 +51,10 @@ tagCommand
   .description('Delete a tag')
   .option('--force', 'Skip confirmation')
   .action(async (id: string, options: { force?: boolean }) => {
+    if (!id.trim()) throw new CLIError('A tag ID is required.', ExitCode.ConfigError)
     if (!options.force) {
       const { confirmPrompt } = await import('../utils/prompt.js')
-      const confirmed = await confirmPrompt(`Delete tag ${id}?`, { default: false })
-      if (!confirmed) {
-        logger.info('Aborted')
-        return
-      }
+      await confirmPrompt(`Delete tag ${id}?`, { default: false })
     }
 
     const client = createAuthenticatedClient()
@@ -66,4 +63,5 @@ tagCommand
       () => client.delete(`/api/tags/${id}`),
     )
     logger.success(`Tag ${id} deleted`)
+    outputMutation({ id, deleted: true })
   })

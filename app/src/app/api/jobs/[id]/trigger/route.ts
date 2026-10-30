@@ -1,8 +1,9 @@
+import { getExecutionPolicy, ExecutionWorkloadError, type ExecutionPolicy } from "@/lib/execution/execution-policy";
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/utils/db";
-import { jobs, apikey, runs, JobTrigger } from "@/db/schema";
+import { jobs, apikey, runs, JobTrigger, user } from "@/db/schema";
 import type { JobType, K6Location } from "@/db/schema";
-import { eq, sql, and } from "drizzle-orm";
+import { eq, sql, and, inArray } from "drizzle-orm";
 import crypto from "crypto";
 import {
   addJobToQueue,
@@ -12,7 +13,7 @@ import {
 } from "@/lib/queue";
 import { prepareJobTestScripts } from "@/lib/job-execution-utils";
 import { validateK6Script } from "@/lib/k6-validator";
-import { subscriptionService, SubscriptionAccessDeniedError } from "@/lib/services/subscription-service";
+import { SubscriptionAccessDeniedError } from "@/lib/services/subscription-service";
 import { polarUsageService } from "@/lib/services/polar-usage.service";
 import {
   apiKeyRateLimiter,
@@ -20,13 +21,19 @@ import {
   createRateLimitHeaders,
 } from "@/lib/api-key-rate-limiter";
 import { hashApiKey } from "@/lib/security/api-key-hash";
+import { isCredentialOwnerActive } from "@/lib/security/credential-owner";
 import { requireAuthContext, isAuthError } from "@/lib/auth-context";
 import { checkPermissionWithContext } from "@/lib/rbac/middleware";
-import { resolveProjectK6Location } from "@/lib/location-registry";
+import {
+  assertProjectSupportsBrowser,
+  LocationWorkloadUnavailableError,
+  resolveProjectK6Location,
+} from "@/lib/location-registry";
 import { buildBillingBlockedResponse } from "@/lib/billing-errors";
 import {
   buildExecutionQueueErrorResponse,
   getSafeExecutionQueueErrorDetails,
+  buildExecutionPolicyFailureResponse,
 } from "@/lib/execution-api-responses";
 
 // POST /api/jobs/[id]/trigger - Trigger job remotely via API key
@@ -102,8 +109,11 @@ export async function POST(
         rateLimitEnabled: apikey.rateLimitEnabled,
         rateLimitTimeWindow: apikey.rateLimitTimeWindow,
         rateLimitMax: apikey.rateLimitMax,
+        banned: user.banned,
+        banExpires: user.banExpires,
       })
       .from(apikey)
+      .innerJoin(user, eq(user.id, apikey.referenceId))
       .where(and(
         eq(apikey.jobId, jobId),
         eq(apikey.enabled, true),
@@ -113,7 +123,9 @@ export async function POST(
 
     const matchedKey = apiKeysForJob[0] ?? null;
 
-    if (!matchedKey) {
+    // A banned owner's key stops working like every other owner-bound credential. Same answer
+    // as an unknown key, so a response never reveals that the owner is banned.
+    if (!matchedKey || !isCredentialOwnerActive(matchedKey)) {
       console.warn(
         `Invalid API key attempted: ${apiKeyUsed}... for job ${jobId}`
       );
@@ -240,56 +252,15 @@ export async function POST(
       );
     }
 
-    // SECURITY: Validate active subscription before allowing test execution
+    let executionPolicy: ExecutionPolicy;
     try {
-      await subscriptionService.blockUntilSubscribed(job.organizationId);
+      executionPolicy = await getExecutionPolicy(job.organizationId);
     } catch (error) {
-      const errorMessage = error instanceof SubscriptionAccessDeniedError
-        ? error.message
-        : "Subscription validation failed";
-      console.warn(
-        `[Job Trigger] Subscription validation failed for org ${job.organizationId.substring(0, 8)}...`
-      );
-      return NextResponse.json({ error: errorMessage }, { status: 402 });
+      return buildExecutionPolicyFailureResponse(error);
     }
-
-    // Validate Polar customer exists (blocks deleted customers)
-    try {
-      await subscriptionService.requireValidPolarCustomer(job.organizationId);
-    } catch (error) {
-      const errorMessage = error instanceof SubscriptionAccessDeniedError
-        ? error.message
-        : "Polar customer validation failed";
-      console.warn(
-        `[Job Trigger] Polar customer validation failed for org ${job.organizationId.substring(0, 8)}...`
-      );
-      return NextResponse.json({ error: errorMessage }, { status: 402 });
-    }
-
-    // BILLING: Check spending limit hard-stop before allowing execution
-    const spendingBlock = await polarUsageService.shouldBlockUsage(job.organizationId);
+    const spendingBlock = executionPolicy.tier === "paid" ? await polarUsageService.shouldBlockUsage(job.organizationId) : { blocked: false };
     if (spendingBlock.blocked) {
-      console.warn(
-        `[Job Trigger] Spending limit reached for org ${job.organizationId.substring(0, 8)}...`
-      );
       return NextResponse.json(buildBillingBlockedResponse(spendingBlock.reason), { status: 402 });
-    }
-
-    // Check subscription plan limits
-    try {
-      await subscriptionService.getOrganizationPlan(job.organizationId);
-    } catch (error) {
-      if (!(error instanceof SubscriptionAccessDeniedError)) {
-        console.error("[Job Trigger] Subscription validation failed:", error);
-      }
-      return NextResponse.json(
-        {
-          error: error instanceof SubscriptionAccessDeniedError
-            ? error.message
-            : "Subscription validation failed. Please try again later.",
-        },
-        { status: error instanceof SubscriptionAccessDeniedError ? 402 : 500 }
-      );
     }
 
     // Additional validation: ensure job is not in an error state that prevents triggering
@@ -325,6 +296,18 @@ export async function POST(
           },
           { status: 400 }
         );
+      }
+    }
+
+
+    if (!isPerformanceJob) {
+      try {
+        await assertProjectSupportsBrowser(job.projectId!);
+      } catch (error) {
+        // Only the expected error is user-facing; anything else (e.g. a database
+        // failure) must not leak details and is handled by the route's outer catch.
+        if (!(error instanceof LocationWorkloadUnavailableError)) throw error;
+        return NextResponse.json({ error: error.message }, { status: 400 });
       }
     }
 
@@ -412,7 +395,7 @@ export async function POST(
               completedAt: new Date(),
               errorDetails: "Unable to prepare k6 script for execution",
             })
-            .where(eq(runs.id, runId));
+            .where(and(eq(runs.id, runId), inArray(runs.status, ['queued', 'running'])));
 
           return NextResponse.json(
             { error: "Unable to prepare k6 script for execution" },
@@ -428,7 +411,7 @@ export async function POST(
               completedAt: new Date(),
               errorDetails: "k6 jobs require performance tests",
             })
-            .where(eq(runs.id, runId));
+            .where(and(eq(runs.id, runId), inArray(runs.status, ['queued', 'running'])));
 
           return NextResponse.json(
             { error: "k6 jobs require performance tests" },
@@ -446,7 +429,7 @@ export async function POST(
                 completedAt: new Date(),
                 errorDetails: validation.errors?.[0] || "Invalid k6 script",
               })
-              .where(eq(runs.id, runId));
+              .where(and(eq(runs.id, runId), inArray(runs.status, ['queued', 'running'])));
 
             return NextResponse.json(
               {
@@ -469,7 +452,7 @@ export async function POST(
               completedAt: new Date(),
               errorDetails: "Failed to validate k6 script",
             })
-            .where(eq(runs.id, runId));
+            .where(and(eq(runs.id, runId), inArray(runs.status, ['queued', 'running'])));
 
           return NextResponse.json(
             { error: "Failed to validate k6 script" },
@@ -503,7 +486,7 @@ export async function POST(
           await db
             .update(runs)
             .set({ status: queueResult.status })
-            .where(eq(runs.id, runId));
+            .where(and(eq(runs.id, runId), eq(runs.status, 'queued')));
         } catch (statusError) {
           console.error(
             `[${jobId}/${runId}] Failed to persist admitted K6 run status:`,
@@ -536,7 +519,7 @@ export async function POST(
           await db
             .update(runs)
             .set({ status: queueResult.status })
-            .where(eq(runs.id, runId));
+            .where(and(eq(runs.id, runId), eq(runs.status, 'queued')));
         } catch (statusError) {
           console.error(
             `[${jobId}/${runId}] Failed to persist admitted Playwright run status:`,
@@ -557,7 +540,7 @@ export async function POST(
               completedAt: new Date(),
               errorDetails: getSafeExecutionQueueErrorDetails(error),
             })
-            .where(eq(runs.id, runId));
+            .where(and(eq(runs.id, runId), inArray(runs.status, ['queued', 'running'])));
         } catch (statusError) {
           console.error(
             `[Job Trigger API] Failed to finalize rejected run ${runId}:`,
@@ -603,7 +586,7 @@ export async function POST(
             completedAt: new Date(),
             errorDetails: getSafeExecutionQueueErrorDetails(error),
           })
-          .where(eq(runs.id, createdRunId));
+          .where(and(eq(runs.id, createdRunId), inArray(runs.status, ['queued', 'running'])));
       } catch (statusError) {
         console.error(
           `[Job Trigger API] Failed to finalize rejected run ${createdRunId}:`,

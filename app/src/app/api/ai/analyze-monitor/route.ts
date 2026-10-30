@@ -1,8 +1,11 @@
+import { getClientIP } from "@/lib/session-security";
 import { NextRequest, NextResponse } from "next/server";
 import { AIStreamingService } from "@/lib/ai/ai-streaming-service";
 import { AuthService } from "@/lib/ai/ai-security";
 import { AIPromptBuilder } from "@/lib/ai/ai-prompts";
 import { getActiveOrganization } from "@/lib/session";
+import { hasPermissionForUser, requireAuth } from "@/lib/rbac/middleware";
+import { monitorConfigForRead, monitorTargetForRead } from "@/lib/monitor-read-config";
 import { usageTracker } from "@/lib/services/usage-tracker";
 import { headers } from "next/headers";
 import { logAuditEvent } from "@/lib/audit-logger";
@@ -10,6 +13,7 @@ import { db } from "@/utils/db";
 import { monitors, monitorResults } from "@/db/schema";
 import { eq, desc, and, gte } from "drizzle-orm";
 import { getS3FileContentFromUrl, getS3FileContent } from "@/lib/s3-proxy";
+import { excludeSupersededSyntheticResults } from "@/lib/monitor-result-filters";
 
 
 interface AnalyzeMonitorRequest {
@@ -61,10 +65,7 @@ export async function POST(request: NextRequest) {
 
     // Step 3: Rate limiting check
     const headersList = await headers();
-    const clientIp =
-      headersList.get("x-forwarded-for")?.split(",")[0]?.trim() ||
-      headersList.get("x-real-ip") ||
-      "unknown";
+    const clientIp = getClientIP(headersList);
 
     await AuthService.checkRateLimit({
       userId: session.user.id,
@@ -128,6 +129,24 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    // Step 5c: Require view access on the monitor's own project (not just org
+    // membership), before any credit is spent or monitor data reaches the model.
+    // Use the effective (impersonation-aware) user id, as the monitor pages do.
+    const { userId: effectiveUserId } = await requireAuth();
+    const canViewMonitor =
+      !!monitor.organizationId &&
+      !!monitor.projectId &&
+      (await hasPermissionForUser(effectiveUserId, "monitor", "view", {
+        organizationId: monitor.organizationId,
+        projectId: monitor.projectId,
+      }));
+    if (!canViewMonitor) {
+      return NextResponse.json(
+        { success: false, message: "Monitor not found" },
+        { status: 404 }
+      );
+    }
+
     // Atomically consume AI credit
     const creditResult = await usageTracker.consumeAICredit(activeOrg.id, "ai_analyze");
     if (!creditResult.allowed) {
@@ -167,7 +186,8 @@ export async function POST(request: NextRequest) {
       .where(
         and(
           eq(monitorResults.monitorId, monitorId),
-          gte(monitorResults.checkedAt, twentyFourHoursAgo)
+          gte(monitorResults.checkedAt, twentyFourHoursAgo),
+          excludeSupersededSyntheticResults
         )
       );
 
@@ -177,7 +197,8 @@ export async function POST(request: NextRequest) {
       .where(
         and(
           eq(monitorResults.monitorId, monitorId),
-          gte(monitorResults.checkedAt, sevenDaysAgo)
+          gte(monitorResults.checkedAt, sevenDaysAgo),
+          excludeSupersededSyntheticResults
         )
       );
 
@@ -231,9 +252,10 @@ export async function POST(request: NextRequest) {
         id: monitor.id,
         name: monitor.name,
         type: monitor.type,
-        url: monitor.target || "",
+        // Keep embedded URL credentials and request secrets out of the model prompt
+        url: monitorTargetForRead(monitor.target, false) || "",
         status: monitor.status as "up" | "down" | "paused",
-        config: monitor.config as Record<string, unknown> | null,
+        config: monitorConfigForRead(monitor.config, false) as Record<string, unknown> | null,
       },
 
       stats24h,
@@ -252,6 +274,10 @@ export async function POST(request: NextRequest) {
 
     // Step 10: Generate streaming AI response
     const aiResponse = await AIStreamingService.generateStreamingResponse({
+      signal: request.signal,
+      userId: session.user.id,
+      orgId: activeOrg.id,
+      tier: session.tier,
       prompt,
       maxTokens: 4000,
       temperature: 0.2,

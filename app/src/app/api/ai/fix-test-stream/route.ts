@@ -1,3 +1,4 @@
+import { getClientIP } from "@/lib/session-security";
 import { NextRequest, NextResponse } from "next/server";
 import { AIStreamingService } from "@/lib/ai/ai-streaming-service";
 import { AISecurityService, AuthService } from "@/lib/ai/ai-security";
@@ -18,6 +19,9 @@ import { getActiveOrganization } from "@/lib/session";
 import { usageTracker } from "@/lib/services/usage-tracker";
 import { headers } from "next/headers";
 import { logAuditEvent } from "@/lib/audit-logger";
+import { db } from "@/utils/db";
+import { runs } from "@/db/schema";
+import { desc, eq, or, sql } from "drizzle-orm";
 
 // Minimum stack trace length to consider as useful for error analysis
 const MINIMUM_USEFUL_STACKTRACE_LENGTH = 50;
@@ -42,13 +46,13 @@ export async function POST(request: NextRequest) {
 
     // Step 2: Authentication and authorization
     const session = await AuthService.validateUserAccess(request, testId);
+    if (!(await AuthService.canAccessTestReport(session, testId, testType))) {
+      return NextResponse.json({ error: "Test report not found" }, { status: 404 });
+    }
 
     // Step 3: Rate limiting check (with user/org context)
     const headersList = await headers();
-    const clientIp =
-      headersList.get("x-forwarded-for")?.split(",")[0]?.trim() ||
-      headersList.get("x-real-ip") ||
-      "unknown";
+    const clientIp = getClientIP(headersList);
 
     await AuthService.checkRateLimit({
       userId: session.user.id,
@@ -84,27 +88,6 @@ export async function POST(request: NextRequest) {
             guidance: "Please subscribe to a plan at /billing to use AI Fix",
           },
           { status: 402 }
-        );
-      }
-
-      // Atomically consume AI credit (prevents race conditions)
-      // This increments first, then checks limit, and rolls back if exceeded
-      const creditResult = await usageTracker.consumeAICredit(activeOrg.id, "ai_fix");
-      if (!creditResult.allowed) {
-        return NextResponse.json(
-          {
-            success: false,
-            reason: creditResult.status === 503 ? "billing_unavailable" : "ai_credits_exhausted",
-            message: creditResult.reason,
-            guidance: creditResult.status === 503
-              ? "Billing is temporarily unavailable. Please try again shortly."
-              : "Upgrade your plan for more AI credits or wait until your next billing cycle.",
-            usage: {
-              used: creditResult.used,
-              limit: creditResult.limit,
-            },
-          },
-          { status: creditResult.status ?? 429 }
         );
       }
     }
@@ -269,8 +252,32 @@ export async function POST(request: NextRequest) {
       }
     }
 
+    // Charge only after report and prompt prerequisites succeed.
+    const creditResult = await usageTracker.consumeAICredit(activeOrg.id, "ai_fix");
+    if (!creditResult.allowed) {
+      return NextResponse.json(
+        {
+          success: false,
+          reason: creditResult.status === 503 ? "billing_unavailable" : "ai_credits_exhausted",
+          message: creditResult.reason,
+          guidance: creditResult.status === 503
+            ? "Billing is temporarily unavailable. Please try again shortly."
+            : "Upgrade your plan for more AI credits or wait until your next billing cycle.",
+          usage: {
+            used: creditResult.used,
+            limit: creditResult.limit,
+          },
+        },
+        { status: creditResult.status ?? 429 }
+      );
+    }
+
     // Step 4: Generate streaming AI response
     const aiResponse = await AIStreamingService.generateStreamingResponse({
+      signal: request.signal,
+      userId: session.user.id,
+      orgId: activeOrg.id,
+      tier: session.tier,
       prompt,
       maxTokens: 4000,
       temperature: 0.1,
@@ -381,11 +388,17 @@ async function getK6TestResults(runId: string): Promise<{
   summaryJSON: string | null;
 }> {
   try {
-    const testBucketName =
-      process.env.S3_TEST_BUCKET_NAME || "playwright-test-artifacts";
-
-    const consolePath = `${runId}/console.log`;
-    const summaryPath = `${runId}/summary.json`;
+    const run = await db.query.runs.findFirst({
+      where: or(eq(runs.id, runId), sql`${runs.metadata}->>'testId' = ${runId}`),
+      orderBy: [desc(sql`${runs.id} = ${runId}`), desc(runs.createdAt)],
+      columns: { id: true, jobId: true },
+    });
+    const artifactId = run?.id ?? runId;
+    const testBucketName = run?.jobId
+      ? process.env.S3_K6_JOB_BUCKET_NAME || "k6-job-artifacts"
+      : process.env.S3_K6_TEST_BUCKET_NAME || "k6-test-artifacts";
+    const consolePath = `${artifactId}/report/console.log`;
+    const summaryPath = `${artifactId}/report/summary.json`;
 
     const [consoleLog, summaryJSON] = await Promise.all([
       getS3FileContent(testBucketName, consolePath),

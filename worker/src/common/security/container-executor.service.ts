@@ -1,3 +1,4 @@
+import { isIsolationPoolBlocked } from './isolation-canary';
 /**
  * Secure Script Execution Service
  *
@@ -9,6 +10,7 @@
  *   long-lived worker control plane.
  */
 
+import { isSelfHostedEnvironment } from '../runtime-mode';
 import {
   Injectable,
   Logger,
@@ -41,6 +43,8 @@ export interface ContainerExecutionOptions {
    * Timeout in milliseconds.
    */
   timeoutMs?: number;
+  hardDeadlineMs?: number;
+  expiresAtMs?: number;
 
   /**
    * Memory limit in megabytes (validated but advisory — actual enforcement
@@ -125,8 +129,48 @@ export interface ContainerExecutionResult {
   stdout: string;
   stderr: string;
   duration: number;
+  /**
+   * Wall-clock time the execution container actually ran, from the container
+   * status reported by Kubernetes. Zero when there is no evidence the container
+   * started (preflight/validation failures, scheduling or image-pull timeouts,
+   * cancellation while pending). Billing and usage metering must use this, not
+   * `duration`.
+   */
+  billableMs?: number;
   timedOut: boolean;
+  cancelled?: boolean;
   error?: string;
+}
+
+/** Last container-start evidence observed while polling an execution pod. */
+interface ContainerStartEvidence {
+  startedAtMs: number | null;
+  finishedAtMs: number | null;
+}
+
+/** Billable time for a container: zero unless Kubernetes reported it started. */
+/** Kubernetes reports the zero time (epoch) for containers that never started. */
+const MIN_PLAUSIBLE_START_MS = Date.UTC(2000, 0, 1);
+/** Job activeDeadline is the timeout plus 120s; allow the same grace here. */
+const BILLABLE_DEADLINE_GRACE_MS = 150_000;
+
+export function computeBillableMs(
+  evidence: ContainerStartEvidence,
+  timeoutMs?: number,
+): number {
+  if (
+    evidence.startedAtMs === null ||
+    evidence.startedAtMs < MIN_PLAUSIBLE_START_MS
+  ) {
+    return 0;
+  }
+  const end = evidence.finishedAtMs ?? Date.now();
+  const elapsed = Math.max(0, end - evidence.startedAtMs);
+  // A container cannot outlive its Job's deadline, so never bill past it
+  // (guards against clock skew or malformed timestamps).
+  return timeoutMs === undefined
+    ? elapsed
+    : Math.min(elapsed, timeoutMs + BILLABLE_DEADLINE_GRACE_MS);
 }
 
 /** Internal validated resource limits */
@@ -157,6 +201,8 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
       { name: 'attempts', value: '3' },
     ]);
   private static readonly SLOW_POD_STARTUP_WARN_MS = 5_000;
+  /** Consecutive unverifiable activity checks (10s apart) before failing loudly. */
+  private static readonly MAX_UNCERTAIN_EXECUTION_CHECKS = 30;
   private static readonly OUTCOME_POLL_FAST_UNTIL_MS = 15_000;
   private static readonly OUTCOME_POLL_MEDIUM_UNTIL_MS = 120_000;
   private static readonly OUTCOME_POLL_FAST_MS = 1_000;
@@ -166,6 +212,7 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
 
   /** Max combined stdout+stderr size in bytes (10 MB) */
   private static readonly MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
+  private static readonly LOG_SNAPSHOT_HEADROOM_BYTES = 64 * 1024;
   private static readonly EXEC_SOCKET_TIMEOUT_MS = 30_000;
   private static readonly DEFAULT_ARTIFACT_SOCKET_TIMEOUT_MS = 5 * 60_000;
   private static readonly PAYLOAD_CHUNK_BYTES = 700 * 1024;
@@ -222,6 +269,7 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
   private logClient: k8s.Log | null = null;
   private execClient: k8s.Exec | null = null;
   private readonly runningJobs: Map<string, string> = new Map();
+  private readonly uncertainExecutionChecks: Map<string, number> = new Map();
   /** Track pods that have already logged an exec failure at warn level to avoid log spam. */
   private readonly execFailureLogged: Set<string> = new Set();
 
@@ -249,8 +297,7 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
       .get<string>('WORKER_IMAGE')
       ?.trim();
     const isCloudProduction =
-      process.env.NODE_ENV === 'production' &&
-      process.env.SELF_HOSTED?.toLowerCase() !== 'true';
+      process.env.NODE_ENV === 'production' && !isSelfHostedEnvironment();
     if (isCloudProduction && !configuredImage) {
       throw new Error(
         'WORKER_IMAGE must be explicitly configured in cloud production',
@@ -295,11 +342,35 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
         'EXECUTION_RUNTIME_CLASS_NAME=gvisor is required in cloud production',
       );
     }
+    // Placement decides where execution pods physically run (e.g. EU-only).
+    // In cloud production a malformed value must stop the worker instead of
+    // silently running with no pinning.
+    // SELF_HOSTED=1 is a supported spelling of self-hosted mode.
+    const strictPlacement = isCloudProduction && !isSelfHostedEnvironment();
     this.executionNodeSelector = this.parseExecutionNodeSelector(
       this.configService.get<string>('EXECUTION_NODE_SELECTOR'),
+      strictPlacement,
     );
+    const workerLocation = (
+      this.configService.get<string>('WORKER_LOCATION') ?? ''
+    )
+      .trim()
+      .toLowerCase();
+    const selectedRegion = this.executionNodeSelector?.region?.toLowerCase();
+    if (
+      strictPlacement &&
+      selectedRegion &&
+      workerLocation &&
+      workerLocation !== 'local' &&
+      selectedRegion !== workerLocation
+    ) {
+      throw new Error(
+        `EXECUTION_NODE_SELECTOR region "${selectedRegion}" does not match WORKER_LOCATION "${workerLocation}"`,
+      );
+    }
     this.executionTolerations = this.parseExecutionTolerations(
       this.configService.get<string>('EXECUTION_TOLERATIONS_JSON'),
+      strictPlacement,
     );
     this.executionDnsNameservers = this.parseExecutionDnsNameservers(
       this.configService.get<string>('EXECUTION_DNS_NAMESERVERS'),
@@ -325,7 +396,7 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
       'EXECUTION_ARTIFACT_SOCKET_TIMEOUT_MS',
       ContainerExecutorService.DEFAULT_ARTIFACT_SOCKET_TIMEOUT_MS,
     );
-    // These defaults match deploy/k8s/base/execution-limitrange.yaml. Memory
+    // These defaults match the execution LimitRange applied to the cluster. Memory
     // excludes the fixed 662 MiB gVisor + /dev/shm overhead added to every Job.
     this.maxExecutionMemoryLimitMb = this.resolvePositiveInteger(
       'EXECUTION_MAX_MEMORY_LIMIT_MB',
@@ -392,7 +463,16 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
     this.runningJobs.clear();
   }
 
-  async hasActiveExecution(runId: string): Promise<boolean> {
+  /**
+   * Whether a live execution Job exists for the run. When Kubernetes cannot be
+   * queried the answer is "assume active" so a live run is never duplicated or
+   * marked terminal. Queue processors pass `boundUncertainty` so a prolonged API
+   * outage fails loudly instead of re-delaying the run forever.
+   */
+  async hasActiveExecution(
+    runId: string,
+    options: { boundUncertainty?: boolean } = {},
+  ): Promise<boolean> {
     if (this.runningJobs.has(runId)) return true;
 
     try {
@@ -401,18 +481,30 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
         namespace: this.executionNamespace,
         labelSelector: `supercheck.io/run-id=${this.buildLabelValue(runId)}`,
       });
+      this.uncertainExecutionChecks.delete(runId);
       return jobs.items.some(
         (job) =>
-          (job.status?.active ?? 0) > 0 &&
+          (job.status?.succeeded ?? 0) === 0 &&
           !job.status?.completionTime &&
           (job.status?.failed ?? 0) === 0,
       );
     } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
       this.logger.warn(
-        `Unable to verify Kubernetes execution state for ${runId}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        `Unable to verify Kubernetes execution state for ${runId}: ${reason}`,
       );
+      if (options.boundUncertainty) {
+        const uncertain = (this.uncertainExecutionChecks.get(runId) ?? 0) + 1;
+        if (
+          uncertain > ContainerExecutorService.MAX_UNCERTAIN_EXECUTION_CHECKS
+        ) {
+          this.uncertainExecutionChecks.delete(runId);
+          throw new Error(
+            `Unable to verify Kubernetes execution state for ${runId} after ${ContainerExecutorService.MAX_UNCERTAIN_EXECUTION_CHECKS} attempts: ${reason}`,
+          );
+        }
+        this.uncertainExecutionChecks.set(runId, uncertain);
+      }
       // Fail safe: uncertainty must not cause a live run to be marked terminal.
       return true;
     }
@@ -450,7 +542,7 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Executes a script as a child process inside the worker container.
+   * Executes a script in a separate ephemeral Kubernetes Job.
    *
    * All callers (execution.service.ts, k6-execution.service.ts) pass the
    * same arguments — gVisor isolation is transparent at the runtime level.
@@ -619,6 +711,14 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
       normalizedOptions.extractFromContainer = normalizedExtractPath.normalized;
     }
 
+    if (
+      options.hardDeadlineMs !== undefined &&
+      (!Number.isSafeInteger(options.hardDeadlineMs) ||
+        options.hardDeadlineMs < 1000)
+    ) {
+      throw new Error('Execution allowance must provide at least one second');
+    }
+
     // Default options
     const { timeoutMs = 300000, memoryLimitMb = 512, cpuLimit = 0.5 } = options;
 
@@ -698,6 +798,49 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
       .join(ContainerExecutorService.CONTAINER_WORKER_DIR);
   }
 
+  private async checkIsolationCanaryAdmission(): Promise<void> {
+    if (
+      this.configService.get<string>('ISOLATION_CANARY_GATE_ENABLED') !== 'true'
+    )
+      return;
+    const pool = this.executionNodeSelector?.region;
+    if (!pool) return;
+    let health: string | undefined;
+    const controller = new AbortController();
+    const deadline = setTimeout(() => controller.abort(), 2000);
+    try {
+      const { Observable } = this.k8sModule!;
+      const config = await this.coreApi!.readNamespacedConfigMap(
+        {
+          namespace: this.executionNamespace,
+          name: 'isolation-pool-health',
+        },
+        {
+          middleware: [
+            {
+              pre: (request) => {
+                request.setSignal(controller.signal);
+                return new Observable(Promise.resolve(request));
+              },
+              post: (response) => new Observable(Promise.resolve(response)),
+            },
+          ],
+        },
+      );
+      health = config.data?.[pool];
+    } catch {
+      // Missing ConfigMap, timeout or unavailable API must not stop a healthy pool.
+      return;
+    } finally {
+      clearTimeout(deadline);
+    }
+    if (isIsolationPoolBlocked(health)) {
+      throw new Error(
+        `Execution admission blocked: isolation canary failed for pool ${pool}`,
+      );
+    }
+  }
+
   private async executeInKubernetes(
     command: string[],
     options: ContainerExecutionOptions,
@@ -760,10 +903,17 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
     let combinedLogs = '';
     let podStartupDurationMs = 0;
     let artifactExtractionDurationMs = 0;
+    let artifactsExtracted = false;
+    let artifactExtractionAttempted = false;
+    const startEvidence: ContainerStartEvidence = {
+      startedAtMs: null,
+      finishedAtMs: null,
+    };
     const logCollector = this.createLogCollector(options);
 
     try {
       await this.ensureKubernetesClients();
+      await this.checkIsolationCanaryAdmission();
 
       const job = this.buildExecutionJob({
         jobName,
@@ -847,58 +997,68 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
         podName,
         workspace,
         limits.timeoutMs,
+        startEvidence,
+        async () => {
+          if (options.extractFromContainer && options.extractToHost) {
+            const extractSource = this.rewriteTmpPath(
+              options.extractFromContainer,
+              workspace,
+            );
+            const extractionStartedAt = Date.now();
+            try {
+              await this.extractPodArtifacts(
+                podName!,
+                extractSource,
+                options.extractToHost,
+                workspace,
+              );
+              artifactsExtracted = true;
+              artifactExtractionDurationMs = Date.now() - extractionStartedAt;
+              this.logger.debug(
+                `[${jobName}] Extracted artifacts from ${podName} in ${artifactExtractionDurationMs}ms`,
+              );
+            } catch (extractError) {
+              artifactExtractionDurationMs = Date.now() - extractionStartedAt;
+              this.logger.error(
+                `Failed to extract pod artifacts after ${artifactExtractionDurationMs}ms: ${
+                  extractError instanceof Error
+                    ? extractError.message
+                    : String(extractError)
+                }`,
+              );
+              // The test outcome comes from the exit code file, not the artifacts.
+              // Failing the run here used to hide the real test result behind a
+              // tar error, so a missing report is logged and the run continues.
+              artifactExtractionAttempted = true;
+            }
+          }
+
+          if (podName) {
+            await this.signalExecutionExit(podName, workspace).catch(
+              (signalError) => {
+                this.logger.debug(
+                  `Failed to signal execution pod exit for ${podName}: ${
+                    signalError instanceof Error
+                      ? signalError.message
+                      : String(signalError)
+                  }`,
+                );
+              },
+            );
+          }
+        },
       );
       timedOut = outcome.timedOut;
       killed = killed || outcome.cancelled;
-
       if (
+        outcome.exitCode === 0 &&
         options.extractFromContainer &&
         options.extractToHost &&
-        !timedOut &&
-        !killed
+        !artifactsExtracted &&
+        !artifactExtractionAttempted
       ) {
-        const extractSource = this.rewriteTmpPath(
-          options.extractFromContainer,
-          workspace,
-        );
-        const extractionStartedAt = Date.now();
-        try {
-          await this.extractPodArtifacts(
-            podName,
-            extractSource,
-            options.extractToHost,
-            workspace,
-          );
-          artifactExtractionDurationMs = Date.now() - extractionStartedAt;
-          this.logger.debug(
-            `[${jobName}] Extracted artifacts from ${podName} in ${artifactExtractionDurationMs}ms`,
-          );
-        } catch (extractError) {
-          artifactExtractionDurationMs = Date.now() - extractionStartedAt;
-          // The test outcome comes from the exit code file, not the artifacts.
-          // Failing the run here used to hide the real test result behind a
-          // tar error, so a missing report is logged and the run continues.
-          this.logger.error(
-            `Failed to extract pod artifacts after ${artifactExtractionDurationMs}ms: ${
-              extractError instanceof Error
-                ? extractError.message
-                : String(extractError)
-            }`,
-          );
-        }
-      }
-
-      if (!timedOut && !killed && podName) {
-        await this.signalExecutionExit(podName, workspace).catch(
-          (signalError) => {
-            this.logger.debug(
-              `Failed to signal execution pod exit for ${podName}: ${
-                signalError instanceof Error
-                  ? signalError.message
-                  : String(signalError)
-              }`,
-            );
-          },
+        throw new Error(
+          'Execution pod terminated before requested artifacts could be collected',
         );
       }
 
@@ -925,7 +1085,9 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
         stdout: combinedLogs,
         stderr: '',
         duration,
+        billableMs: computeBillableMs(startEvidence, limits.timeoutMs),
         timedOut,
+        cancelled: killed,
         error: timedOut
           ? `Execution timed out after ${limits.timeoutMs}ms`
           : killed
@@ -941,6 +1103,7 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
         stdout: logCollector.getOutput(),
         stderr: error instanceof Error ? error.message : String(error),
         duration: Date.now() - startTime,
+        billableMs: computeBillableMs(startEvidence, limits.timeoutMs),
         timedOut,
         error: error instanceof Error ? error.message : String(error),
       };
@@ -987,7 +1150,20 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
     delete publicEnv.SUPERCHECK_SECRETS_B64;
     const envVars = this.buildKubernetesEnv(publicEnv, workspace);
     const dnsSettings = this.buildExecutionPodDnsSettings();
-    const deadlineSeconds = Math.ceil((limits.timeoutMs + 120_000) / 1000);
+    const deadlineSeconds =
+      options.hardDeadlineMs === undefined
+        ? Math.ceil((limits.timeoutMs + 120_000) / 1000)
+        : Math.floor(
+            Math.min(
+              limits.timeoutMs,
+              options.hardDeadlineMs,
+              options.expiresAtMs === undefined
+                ? Infinity
+                : options.expiresAtMs - Date.now(),
+            ) / 1000,
+          );
+    if (!Number.isSafeInteger(deadlineSeconds) || deadlineSeconds < 1)
+      throw new Error('Execution entitlement has expired');
     const resourceCpuLimit = `${Math.max(100, Math.round(limits.cpuLimit * 1000))}m`;
     const resourceCpuRequest = `${Math.max(100, Math.round(limits.cpuLimit * 500))}m`;
     // Add overhead for /dev/shm tmpfs (counts against cgroup in K8s) and gVisor Sentry
@@ -1494,8 +1670,8 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
    * off (duplicates are harmless — the collector appends to the same
    * buffer and the final snapshot replaces it anyway).
    *
-   * Completion is determined by `waitForExecutionOutcome()` (exit-code
-   * file polling), NOT by the log stream lifecycle.
+   * Completion is determined by Kubernetes container termination status,
+   * not by the log stream lifecycle or tenant-writable files.
    *
    * On reconnect, `sinceSeconds: 5` replays the last few seconds to
    * avoid gaps. The collector's live-forwarding is suppressed during
@@ -1634,11 +1810,21 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
 
   private async fetchPodLogsSnapshot(podName: string): Promise<string> {
     const chunks: Buffer[] = [];
+    let bytes = 0;
+    let truncated = false;
     const sink = new Writable({
       write: (chunk, _encoding, callback) => {
-        chunks.push(
-          Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)),
-        );
+        const buffer = Buffer.isBuffer(chunk)
+          ? chunk
+          : Buffer.from(String(chunk));
+        const remaining = ContainerExecutorService.MAX_OUTPUT_BYTES - bytes;
+        if (buffer.length > remaining) truncated = true;
+        if (remaining > 0) {
+          // Copy the retained bytes so a large incoming chunk is not kept alive.
+          const retained = Buffer.from(buffer.subarray(0, remaining));
+          chunks.push(retained);
+          bytes += retained.length;
+        }
         callback();
       },
     });
@@ -1648,17 +1834,30 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
       podName,
       'execution',
       sink,
-      { follow: false, timestamps: false },
+      {
+        follow: false,
+        timestamps: false,
+        // Kubernetes may return slightly fewer bytes than limitBytes, so ask for
+        // headroom and treat anything beyond MAX_OUTPUT_BYTES as overflow.
+        limitBytes:
+          ContainerExecutorService.MAX_OUTPUT_BYTES +
+          ContainerExecutorService.LOG_SNAPSHOT_HEADROOM_BYTES,
+      },
     );
     await finished(sink);
 
-    return Buffer.concat(chunks).toString('utf8');
+    const output = Buffer.concat(chunks, bytes).toString('utf8');
+    return truncated
+      ? `${output}\n[Supercheck output truncated at 10 MiB]`
+      : output;
   }
 
   private async waitForExecutionOutcome(
     podName: string,
     workspace: string,
     timeoutMs: number,
+    startEvidence: ContainerStartEvidence,
+    collectArtifacts: () => Promise<void>,
   ): Promise<{
     exitCode: number;
     timedOut: boolean;
@@ -1666,19 +1865,11 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
     message?: string;
   }> {
     const startedAt = Date.now();
-    const timeoutAt = Date.now() + timeoutMs;
+    let timeoutAt = Date.now() + timeoutMs;
     const exitCodeFile = this.getWorkspaceExitCodeFile(workspace);
+    let artifactsCollected = false;
 
     while (Date.now() < timeoutAt) {
-      const exitCode = await this.readExecutionExitCode(podName, exitCodeFile);
-      if (exitCode !== null) {
-        return {
-          exitCode,
-          timedOut: false,
-          cancelled: false,
-        };
-      }
-
       let pod: k8s.V1Pod;
       try {
         pod = await this.coreApi!.readNamespacedPod({
@@ -1699,6 +1890,11 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
           this.logger.warn(
             `Pod ${podName} no longer exists — treating as cancellation`,
           );
+          // Charge only what actually ran; a pod deleted while still pending
+          // has no start evidence and is billed zero.
+          if (startEvidence.startedAtMs !== null) {
+            startEvidence.finishedAtMs ??= Date.now();
+          }
           return {
             exitCode: 137,
             timedOut: false,
@@ -1709,19 +1905,57 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
         throw podError;
       }
 
-      const terminated = pod.status?.containerStatuses?.find(
+      const executionState = pod.status?.containerStatuses?.find(
         (container) => container.name === 'execution',
-      )?.state?.terminated;
+      )?.state;
+      const terminated = executionState?.terminated;
+      const startedAtRaw =
+        executionState?.running?.startedAt ?? terminated?.startedAt;
+      if (startedAtRaw && startEvidence.startedAtMs === null) {
+        const parsed = new Date(startedAtRaw).getTime();
+        if (Number.isFinite(parsed) && parsed >= MIN_PLAUSIBLE_START_MS) {
+          startEvidence.startedAtMs = parsed;
+        }
+      }
       if (terminated) {
+        if (terminated.finishedAt) {
+          const finished = new Date(terminated.finishedAt).getTime();
+          if (Number.isFinite(finished)) startEvidence.finishedAtMs = finished;
+        }
         const timedOut =
           terminated.reason === 'DeadlineExceeded' ||
           terminated.message?.includes('DeadlineExceeded') === true;
         return {
           exitCode: terminated.exitCode ?? (timedOut ? 124 : 1),
           timedOut,
-          cancelled: terminated.exitCode === 137,
-          message: terminated.message || terminated.reason,
+          // Cancellation is recorded by the poller; SIGKILL can also mean OOM.
+          cancelled: false,
+          message:
+            terminated.message ||
+            (terminated.reason === 'Error' ? undefined : terminated.reason),
         };
+      }
+
+      // The tenant-writable marker only signals artifact readiness. Kubernetes
+      // termination status above is the sole source of the execution exit code.
+      if (
+        !artifactsCollected &&
+        (await this.readExecutionExitCode(podName, exitCodeFile)) !== null
+      ) {
+        artifactsCollected = true;
+        const extractionStartedAt = Date.now();
+        await collectArtifacts();
+        // Artifact transfer has its own socket bound. Allow the wrapper's exit
+        // signal to reach kubelet without charging that transfer to script time.
+        // Never extend past the Job's activeDeadlineSeconds (timeout + 120s), or
+        // Kubernetes deletes the pod and the run is misreported as cancelled.
+        timeoutAt = Math.min(
+          Math.max(
+            timeoutAt + Date.now() - extractionStartedAt,
+            Date.now() + 30_000,
+          ),
+          startedAt + timeoutMs + 90_000,
+        );
       }
 
       await this.sleep(
@@ -2098,6 +2332,27 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
     return `'${value.replace(/'/g, "'\\''")}'`;
   }
 
+  /**
+   * Runs this process was asked to stop (a lost reservation). Local to the process on purpose: the shared
+   * cancellation key is per run id, so using it would also cancel a replacement attempt of the same run.
+   * Entries are consumed by the poller within a second and expire so one can never hit a later attempt.
+   */
+  private readonly abortedRuns = new Map<string, number>();
+
+  abortRun(runId: string): void {
+    const now = Date.now();
+    for (const [id, at] of this.abortedRuns)
+      if (now - at > 30_000) this.abortedRuns.delete(id);
+    this.abortedRuns.set(runId, now);
+  }
+
+  private consumeAbort(runId: string): boolean {
+    const at = this.abortedRuns.get(runId);
+    if (at === undefined) return false;
+    this.abortedRuns.delete(runId);
+    return Date.now() - at <= 30_000;
+  }
+
   private startKubernetesCancellationPoller(
     runId: string,
     jobName: string,
@@ -2106,7 +2361,9 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
     const interval = setInterval(() => {
       void (async () => {
         try {
-          const isCancelled = await this.cancellationService.isCancelled(runId);
+          const aborted = this.consumeAbort(runId);
+          const isCancelled =
+            aborted || (await this.cancellationService.isCancelled(runId));
           if (!isCancelled) {
             return;
           }
@@ -2315,11 +2572,21 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
 
   private parseExecutionNodeSelector(
     rawValue?: string,
+    strict = false,
   ): Record<string, string> | undefined {
     const trimmed = rawValue?.trim();
     if (!trimmed) {
       return undefined;
     }
+    const invalid = (message: string): undefined => {
+      if (strict) {
+        throw new Error(`Invalid EXECUTION_NODE_SELECTOR: ${message}`);
+      }
+      this.logger.warn(
+        `Invalid EXECUTION_NODE_SELECTOR value; ignoring custom selector: ${message}`,
+      );
+      return undefined;
+    };
 
     if (trimmed.startsWith('{')) {
       try {
@@ -2328,23 +2595,22 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
           throw new Error('value must be a JSON object');
         }
 
+        const entries = Object.entries(parsed);
         const selector = Object.fromEntries(
-          Object.entries(parsed).flatMap(([key, value]) => {
+          entries.flatMap(([key, value]) => {
             if (!key.trim() || typeof value !== 'string' || !value.trim()) {
               return [];
             }
             return [[key.trim(), value.trim()]];
           }),
         );
+        if (strict && Object.keys(selector).length !== entries.length) {
+          throw new Error('entries must be non-empty string pairs');
+        }
 
         return Object.keys(selector).length > 0 ? selector : undefined;
       } catch (error) {
-        this.logger.warn(
-          `Invalid EXECUTION_NODE_SELECTOR value; ignoring custom selector: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-        return undefined;
+        return invalid(error instanceof Error ? error.message : String(error));
       }
     }
 
@@ -2354,10 +2620,7 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
       const key = rawKey?.trim();
       const value = rawValueParts.join('=').trim();
       if (!key || !value) {
-        this.logger.warn(
-          'Invalid EXECUTION_NODE_SELECTOR value; expected key=value pairs',
-        );
-        return undefined;
+        return invalid('expected key=value pairs');
       }
       selector[key] = value;
     }
@@ -2367,6 +2630,7 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
 
   private parseExecutionTolerations(
     rawValue?: string,
+    strict = false,
   ): k8s.V1Toleration[] | undefined {
     const trimmed = rawValue?.trim();
     if (!trimmed) {
@@ -2384,8 +2648,19 @@ export class ContainerExecutorService implements OnModuleInit, OnModuleDestroy {
           !!item && typeof item === 'object' && !Array.isArray(item),
       );
 
+      if (strict && tolerations.length !== parsed.length) {
+        throw new Error('every toleration must be an object');
+      }
+
       return tolerations.length > 0 ? tolerations : undefined;
     } catch (error) {
+      if (strict) {
+        throw new Error(
+          `Invalid EXECUTION_TOLERATIONS_JSON: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
       this.logger.warn(
         `Invalid EXECUTION_TOLERATIONS_JSON value; ignoring custom tolerations: ${
           error instanceof Error ? error.message : String(error)

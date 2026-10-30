@@ -6,9 +6,9 @@ import { Input } from "@/components/ui/input";
 import { SupercheckLogo } from "@/components/logo/supercheck-logo";
 import { Loader2, Eye, EyeOff } from "lucide-react";
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useEffect, useState, type RefObject } from "react";
 import { SocialAuthButtons } from "./social-auth-buttons";
-import { TurnstileCaptcha } from "./turnstile-captcha";
+import { TurnstileCaptcha, type TurnstileCaptchaRef } from "./turnstile-captcha";
 import { useCaptcha } from "@/hooks/use-captcha";
 import { useAppConfig } from "@/hooks/use-app-config";
 import { useForm } from "react-hook-form";
@@ -28,6 +28,15 @@ import {
   FormMessage,
 } from "@/components/ui/form";
 import { loginFormSchema, type LoginFormData } from "@/lib/validations/auth";
+import { isOAuthResumePath } from "@/lib/auth/safe-next-path";
+
+/** The sign-up link keeps whichever continuation the visitor arrived with. */
+function signUpHref(nextPath: string | null): string {
+  if (!nextPath) return "/sign-up";
+  // An MCP authorization request travels as its own signed query, which the sign-up page re-reads.
+  if (isOAuthResumePath(nextPath)) return `/sign-up?${nextPath.slice(nextPath.indexOf("?") + 1)}`;
+  return `/sign-up?next=${encodeURIComponent(nextPath)}`;
+}
 
 interface InviteData {
   organizationName: string;
@@ -44,8 +53,12 @@ interface LoginFormProps {
   inviteToken: string | null;
   isFromNotification?: boolean;
   emailVerified?: boolean;
+  /** Sanitized local continuation path (already allowlisted by the page). */
+  nextPath?: string | null;
   /** Callback when CAPTCHA token changes (null when expired/failed) */
   onCaptchaToken?: (token: string | null) => void;
+  /** Ref to the TurnstileCaptcha so the page can request a fresh single-use token per attempt */
+  captchaRef?: RefObject<TurnstileCaptchaRef | null>;
 }
 
 export function LoginForm({
@@ -57,7 +70,9 @@ export function LoginForm({
   inviteToken,
   isFromNotification = false,
   emailVerified = false,
+  nextPath = null,
   onCaptchaToken,
+  captchaRef: externalCaptchaRef,
 }: LoginFormProps) {
   const [showPassword, setShowPassword] = useState(false);
   const {
@@ -109,7 +124,7 @@ export function LoginForm({
   return (
     <div className={cn("flex flex-col gap-6", className)} data-testid="login-form">
       <Form {...form}>
-        <form onSubmit={onSubmit} data-testid="login-form-element">
+        <form method="post" onSubmit={onSubmit} data-testid="login-form-element">
           <FieldGroup>
             {/* Header */}
             <div className="flex flex-col items-center gap-3 text-center">
@@ -146,7 +161,7 @@ export function LoginForm({
                   <span className="text-sm text-muted-foreground">
                     Don&apos;t have an account?{" "}
                     <Link
-                      href="/sign-up"
+                      href={signUpHref(nextPath)}
                       className="underline underline-offset-2"
                     >
                       Sign up
@@ -200,7 +215,7 @@ export function LoginForm({
             {shouldShowSocialAuth && (
               <>
                 <SocialAuthButtons
-                  callbackUrl={inviteToken ? `/invite/${inviteToken}` : "/"}
+                  callbackUrl={inviteToken ? `/invite/${inviteToken}` : (nextPath ?? "/")}
                   disabled={isLoading}
                 />
 
@@ -322,7 +337,7 @@ export function LoginForm({
 
       {/* Invisible CAPTCHA - placed outside form to avoid any layout shift */}
       <TurnstileCaptcha
-        ref={captchaRef}
+        ref={externalCaptchaRef ?? captchaRef}
         onSuccess={handleCaptchaSuccess}
         onError={handleCaptchaError}
         onExpire={handleCaptchaExpire}

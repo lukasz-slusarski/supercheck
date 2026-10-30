@@ -7,8 +7,13 @@ import { db } from "@/utils/db";
 import { projects, projectMembers } from "@/db/schema";
 import { logAuditEvent } from "@/lib/audit-logger";
 import { checkProjectLimit } from "@/lib/middleware/plan-enforcement";
+import { insertWithinPlanLimit } from "@/lib/middleware/plan-limit-lock";
 import { eq, sql } from "drizzle-orm";
-import { subscriptionService } from "@/lib/services/subscription-service";
+import { withMemberCounts } from "@/lib/project-member-counts";
+import {
+  subscriptionService,
+  SubscriptionAccessDeniedError,
+} from "@/lib/services/subscription-service";
 
 /**
  * GET /api/projects
@@ -16,19 +21,27 @@ import { subscriptionService } from "@/lib/services/subscription-service";
  */
 export async function GET(request: NextRequest) {
   try {
-    const { userId, organizationId: authOrgId, isCliAuth } = await requireUserAuthContext();
+    const { userId, organizationId: authOrgId, isCliAuth, projectId: tokenProjectId } = await requireUserAuthContext();
 
     // Get organization ID from query params or use auth context organization
     const { searchParams } = new URL(request.url);
+    const includeMemberCounts = searchParams.get("includeMemberCounts") === "1";
+    const decorate = <T extends { id: string; organizationId: string }>(list: T[]) =>
+      includeMemberCounts ? withMemberCounts(list) : list;
     const organizationId = searchParams.get("organizationId");
+
+    if (isCliAuth && organizationId && organizationId !== authOrgId) {
+      return NextResponse.json({ error: "CLI token does not authorize this organization" }, { status: 403 });
+    }
 
     // Browser project selection includes invited teams. CLI enumeration retains
     // its organization scope unless the caller explicitly requests another team.
-    if (!organizationId && !isCliAuth) {
+    // scope=organization (organization admin page) lists only the active organization.
+    if (!organizationId && !isCliAuth && searchParams.get("scope") !== "organization") {
       const [userProjects, currentProject] = await Promise.all([
         getSelectableProjects(userId), getCurrentProjectContext(),
       ]);
-      return NextResponse.json({ success: true, data: userProjects, currentProject });
+      return NextResponse.json({ success: true, data: await decorate(userProjects), currentProject });
     }
 
     let targetOrgId = organizationId;
@@ -59,13 +72,16 @@ export async function GET(request: NextRequest) {
 
     // Get user's projects in the organization
     const userProjects = await getUserProjects(userId, targetOrgId);
+    const scopedProjects = isCliAuth && tokenProjectId
+      ? userProjects.filter((project) => project.id === tokenProjectId)
+      : userProjects;
 
     // Get current project context
     const currentProject = await getCurrentProjectContext();
 
     return NextResponse.json({
       success: true,
-      data: userProjects,
+      data: await decorate(scopedProjects),
       currentProject: currentProject,
     });
   } catch (error) {
@@ -89,7 +105,8 @@ export async function GET(request: NextRequest) {
  */
 export async function POST(request: NextRequest) {
   try {
-    const { userId, organizationId: authOrgId } = await requireUserAuthContext();
+    const { userId, organizationId: authOrgId, isCliAuth } = await requireUserAuthContext();
+    if (isCliAuth) return NextResponse.json({ error: "Organization administration requires an interactive browser session; CLI tokens are project-scoped" }, { status: 403 });
 
     const body = await request.json();
     const { name, slug, description, organizationId } = body;
@@ -97,6 +114,20 @@ export async function POST(request: NextRequest) {
     if (!name) {
       return NextResponse.json(
         { error: "Project name is required" },
+        { status: 400 }
+      );
+    }
+
+    if (
+      typeof name !== "string" ||
+      name.trim().length === 0 ||
+      name.length > 255 ||
+      (slug != null && (typeof slug !== "string" || slug.length > 100)) ||
+      (description != null &&
+        (typeof description !== "string" || description.length > 2000))
+    ) {
+      return NextResponse.json(
+        { error: "Invalid project name, slug or description" },
         { status: 400 }
       );
     }
@@ -130,38 +161,50 @@ export async function POST(request: NextRequest) {
     await subscriptionService.blockUntilSubscribed(targetOrgId);
     await subscriptionService.requireValidPolarCustomer(targetOrgId);
 
-    // Check project limit based on subscription plan
-    // OPTIMIZED: Use SQL count(*) instead of fetching all rows and using .length
-    const projectCountResult = await db
-      .select({ count: sql<number>`count(*)` })
-      .from(projects)
-      .where(eq(projects.organizationId, targetOrgId));
+    // Serialize count -> limit check -> insert per organization so concurrent
+    // requests cannot both pass the plan limit.
+    const created = await insertWithinPlanLimit({
+      organizationId: targetOrgId,
+      resource: "projects",
+      check: checkProjectLimit,
+      countRows: async (tx) => {
+        const [row] = await tx
+          .select({ count: sql<number>`count(*)` })
+          .from(projects)
+          .where(eq(projects.organizationId, targetOrgId));
+        return Number(row?.count || 0);
+      },
+      insert: async (executor) => {
+        const [inserted] = await executor
+          .insert(projects)
+          .values({
+            organizationId: targetOrgId,
+            name,
+            slug: slug || null,
+            description: description || null,
+            isDefault: false,
+            status: "active",
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          })
+          .returning();
+        return inserted;
+      },
+    });
 
-    const limitCheck = await checkProjectLimit(
-      targetOrgId,
-      Number(projectCountResult[0]?.count || 0)
-    );
-    if (!limitCheck.allowed) {
-      console.warn(
-        `Project limit reached for organization ${targetOrgId}: ${limitCheck.error}`
+    if (!created.ok && created.busy) {
+      return NextResponse.json(
+        { error: "Too many concurrent requests. Please retry shortly." },
+        { status: 503, headers: { "Retry-After": "2" } },
       );
-      return NextResponse.json({ error: limitCheck.error }, { status: 403 });
     }
-
-    // Create project
-    const [newProject] = await db
-      .insert(projects)
-      .values({
-        organizationId: targetOrgId,
-        name,
-        slug: slug || null,
-        description: description || null,
-        isDefault: false,
-        status: "active",
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      })
-      .returning();
+    if (!created.ok) {
+      console.warn(
+        `Project limit reached for organization ${targetOrgId}: ${created.check.error}`
+      );
+      return NextResponse.json({ error: created.check.error }, { status: 403 });
+    }
+    const newProject = created.row;
 
     // Add user as project editor (project ownership is handled by org membership in unified RBAC)
     await db.insert(projectMembers).values({
@@ -210,6 +253,12 @@ export async function POST(request: NextRequest) {
       return NextResponse.json(
         { error: error instanceof Error ? error.message : "Authentication required" },
         { status: 401 }
+      );
+    }
+    if (error instanceof SubscriptionAccessDeniedError) {
+      return NextResponse.json(
+        { error: error.message, code: error.reason },
+        { status: 402 }
       );
     }
     console.error("Failed to create project:", error);

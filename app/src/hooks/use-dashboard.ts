@@ -1,5 +1,6 @@
 import { useQuery, useQueryClient, useIsRestoring, keepPreviousData } from "@tanstack/react-query";
 import { useProjectContext } from "./use-project-context";
+import { RECENT_FAILURES_LIMIT } from "@/lib/dashboard/recent-failures";
 
 interface ProjectStats {
   tests: number;
@@ -13,6 +14,10 @@ interface MonitorSummary {
   active: number;
   up: number;
   down: number;
+  paused: number;
+  pending: number;
+  maintenance: number;
+  error: number;
   uptime: number;
   criticalAlerts: Array<{
     id: string;
@@ -35,17 +40,23 @@ interface MonitorSummary {
 
 interface JobSummary {
   total: number;
+  /** Jobs with a cron schedule configured. */
+  scheduled: number;
+  passedRuns30d: number;
+  failedRuns30d: number;
   successfulRuns24h: number;
   failedRuns24h: number;
-  recentRuns: Array<{
+  /** Newest failed/error runs in the last 30 days, at most RECENT_FAILURES_LIMIT. */
+  recentFailures: Array<{
     id: string;
     jobId: string;
     jobName: string;
     status: string;
     startedAt: string;
-    duration: string;
     trigger: string;
   }>;
+  /** Job runs per UTC day (last 30 days) by trigger. */
+  triggerTrend: Array<{ date: string; manual: number; scheduled: number; remote: number }>;
   executionTime: {
     totalMs: number;
     totalSeconds: number;
@@ -107,25 +118,30 @@ export interface DashboardData {
 
 export const DASHBOARD_QUERY_KEY = ["dashboard"] as const;
 
-export const getDashboardQueryKey = (projectId: string | null) => 
-  [...DASHBOARD_QUERY_KEY, projectId] as const;
+// The "v2" version abandons entries written under ["dashboard", projectId] by the
+// old hover prefetch, which stored the raw /api/dashboard payload where the
+// dashboard expects normalized DashboardData. Those entries are persisted to
+// localStorage for 24h and crashed the page on every visit.
+export const getDashboardQueryKey = (projectId: string | null) =>
+  [...DASHBOARD_QUERY_KEY, projectId, "v2"] as const;
 
-export async function fetchDashboard(): Promise<DashboardData> {
+export async function fetchDashboard(projectId: string | null = null): Promise<DashboardData> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort('Dashboard request timeout'), 30000);
 
   try {
+    // The server resolves the project from this header, so prefetch and the
+    // dashboard hook must request the same project to share one cache entry.
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (projectId) headers["x-project-id"] = projectId;
     const [dashboardResponse, alertsResponse] = await Promise.all([
       fetch("/api/dashboard", {
         signal: controller.signal,
-        headers: {
-          "Content-Type": "application/json",
-          // Removed manual cache busting. Browser/Proxy should respect server Cache-Control headers.
-        },
+        headers,
       }),
       fetch("/api/alerts/history", {
         signal: controller.signal,
-        headers: { "Content-Type": "application/json" },
+        headers,
       }),
     ]);
 
@@ -143,7 +159,8 @@ export async function fetchDashboard(): Promise<DashboardData> {
     return transformDashboardData(data, alertsData);
   } catch (error) {
     clearTimeout(timeoutId);
-    if (error instanceof Error && error.name === 'AbortError') {
+    // fetch rejects with the abort reason (a string here), not an AbortError, so check the signal.
+    if (controller.signal.aborted) {
       throw new Error('Dashboard request timed out. Please try again.');
     }
     throw error;
@@ -152,28 +169,33 @@ export async function fetchDashboard(): Promise<DashboardData> {
 
 const LOOKBACK_DAYS = 30;
 
-function transformDashboardData(data: Record<string, unknown>, alertsData: unknown[]): DashboardData {
-  const systemIssues: SystemHealth["issues"] = [];
+/**
+ * The server builds the full issue list (monitors, failed runs, queue
+ * capacity). Pass it through untouched; never rebuild it client-side.
+ */
+export function parseSystemHealth(raw: unknown): SystemHealth {
+  const system = (raw ?? {}) as Record<string, unknown>;
+  const issues = Array.isArray(system.issues)
+    ? (system.issues as Array<Record<string, unknown>>).map((issue) => ({
+        type: (["monitor", "job", "queue"].includes(String(issue.type))
+          ? issue.type
+          : "job") as SystemHealth["issues"][number]["type"],
+        message: String(issue.message || ""),
+        severity: (["low", "medium", "high", "critical"].includes(String(issue.severity))
+          ? issue.severity
+          : "medium") as SystemHealth["issues"][number]["severity"],
+      }))
+    : [];
+  return {
+    timestamp: String(system.timestamp || new Date().toISOString()),
+    healthy: issues.length === 0,
+    issues,
+  };
+}
 
-  const monitorsDown = Number(data.monitors && typeof data.monitors === 'object' ? (data.monitors as Record<string, unknown>).down : 0) || 0;
-  if (monitorsDown > 0) {
-    systemIssues.push({
-      type: "monitor" as const,
-      message: `${monitorsDown} monitor${monitorsDown === 1 ? "" : "s"} ${monitorsDown === 1 ? "is" : "are"} down`,
-      severity: monitorsDown > 2 ? ("critical" as const) : ("high" as const),
-    });
-  }
+function transformDashboardData(data: Record<string, unknown>, alertsData: unknown[]): DashboardData {
 
   const jobsData = data.jobs as Record<string, unknown> | undefined;
-  const failedJobs = Number(jobsData?.failedRuns24h) || 0;
-  if (failedJobs > 0) {
-    systemIssues.push({
-      type: "job" as const,
-      message: `${failedJobs} job${failedJobs === 1 ? "" : "s"} failed in the last 24 hours`,
-      severity: failedJobs > 5 ? ("high" as const) : ("medium" as const),
-    });
-  }
-
   const monitorsData = data.monitors as Record<string, unknown> | undefined;
   const testsData = data.tests as Record<string, unknown> | undefined;
   const k6Data = data.k6 as Record<string, unknown> | undefined;
@@ -190,6 +212,10 @@ function transformDashboardData(data: Record<string, unknown>, alertsData: unkno
       active: Math.max(0, Number(monitorsData?.active) || 0),
       up: Math.max(0, Number(monitorsData?.up) || 0),
       down: Math.max(0, Number(monitorsData?.down) || 0),
+      paused: Math.max(0, Number(monitorsData?.paused) || 0),
+      pending: Math.max(0, Number(monitorsData?.pending) || 0),
+      maintenance: Math.max(0, Number(monitorsData?.maintenance) || 0),
+      error: Math.max(0, Number(monitorsData?.error) || 0),
       uptime: Math.max(0, Math.min(100, Number(monitorsData?.uptime) || 0)),
       criticalAlerts: Array.isArray(monitorsData?.criticalAlerts)
         ? (monitorsData.criticalAlerts as Array<Record<string, unknown>>).slice(0, 100).map(alert => ({
@@ -218,7 +244,7 @@ function transformDashboardData(data: Record<string, unknown>, alertsData: unkno
           : null,
       },
       availabilityTrend: Array.isArray(monitorsData?.availabilityTrend)
-        ? (monitorsData.availabilityTrend as Array<Record<string, unknown>>).slice(0, LOOKBACK_DAYS).map(item => ({
+        ? (monitorsData.availabilityTrend as Array<Record<string, unknown>>).slice(-LOOKBACK_DAYS).map(item => ({
             date: String(item.date || ''),
             uptime: Number(item.uptime) || 0,
           }))
@@ -226,17 +252,27 @@ function transformDashboardData(data: Record<string, unknown>, alertsData: unkno
     },
     jobs: {
       total: Math.max(0, Number(jobsData?.total) || 0),
+      scheduled: Math.max(0, Number(jobsData?.scheduled) || 0),
+      passedRuns30d: Math.max(0, Number(jobsData?.passedRuns30d) || 0),
+      failedRuns30d: Math.max(0, Number(jobsData?.failedRuns30d) || 0),
       successfulRuns24h: Math.max(0, Number(jobsData?.successfulRuns24h) || 0),
       failedRuns24h: Math.max(0, Number(jobsData?.failedRuns24h) || 0),
-      recentRuns: Array.isArray(jobsData?.recentRuns)
-        ? (jobsData.recentRuns as Array<Record<string, unknown>>).slice(0, 1000).map(run => ({
+      recentFailures: Array.isArray(jobsData?.recentFailures)
+        ? (jobsData.recentFailures as Array<Record<string, unknown>>).slice(0, RECENT_FAILURES_LIMIT).map(run => ({
             id: String(run.id || ''),
             jobId: String(run.jobId || ''),
             jobName: String(run.jobName || ''),
             status: String(run.status || ''),
             startedAt: String(run.startedAt || ''),
-            duration: String(run.durationMs || ''),
             trigger: String(run.trigger || ''),
+          }))
+        : [],
+      triggerTrend: Array.isArray(jobsData?.triggerTrend)
+        ? (jobsData.triggerTrend as Array<Record<string, unknown>>).slice(-LOOKBACK_DAYS).map(day => ({
+            date: String(day.date || ''),
+            manual: Math.max(0, Number(day.manual) || 0),
+            scheduled: Math.max(0, Number(day.scheduled) || 0),
+            remote: Math.max(0, Number(day.remote) || 0),
           }))
         : [],
       executionTime: {
@@ -259,7 +295,7 @@ function transformDashboardData(data: Record<string, unknown>, alertsData: unkno
         : [],
       playgroundExecutions30d: Math.max(0, Number(testsData?.playgroundExecutions30d) || 0),
       playgroundExecutionsTrend: Array.isArray(testsData?.playgroundExecutionsTrend)
-        ? (testsData.playgroundExecutionsTrend as Array<Record<string, unknown>>).slice(0, LOOKBACK_DAYS).map(item => ({
+        ? (testsData.playgroundExecutionsTrend as Array<Record<string, unknown>>).slice(-LOOKBACK_DAYS).map(item => ({
             date: String(item.date || ''),
             count: Number(item.count) || 0,
           }))
@@ -289,11 +325,7 @@ function transformDashboardData(data: Record<string, unknown>, alertsData: unkno
           };
         })
       : [],
-    system: {
-      timestamp: new Date().toISOString(),
-      healthy: systemIssues.length === 0,
-      issues: systemIssues,
-    },
+    system: parseSystemHealth(data.system),
   };
 }
 
@@ -307,7 +339,7 @@ export function useDashboard() {
 
   const query = useQuery({
     queryKey,
-    queryFn: fetchDashboard,
+    queryFn: () => fetchDashboard(projectId),
     enabled: !!projectId,
     staleTime: 60 * 1000,  // Dashboard data refreshes more frequently (60s)
     // gcTime uses global default (24h)

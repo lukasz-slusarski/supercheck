@@ -28,11 +28,13 @@ Node.js scripts for any scenario
 </Card>
 
 <Card icon={<TrendingUp className="text-violet-500" />} title="Performance Test">
-k6 load testing from multiple regions
+k6 load testing with configurable virtual users and thresholds
 </Card>
 </Cards>
 
 ## Create Test
+
+On Supercheck Cloud, creating tests and saving changes from the Playground requires an active organization subscription and a valid billing customer. These billing checks do not apply to self-hosted installations.
 
 1. Open **Create** and select a test type.
 2. Write a script in the [Playground](/docs/app/automate/playground), choose a **Template**, or use **AI Create** for a starting point.
@@ -193,27 +195,17 @@ Tags are project-scoped, so each project can have its own tagging system.
 - **Variables** — Project-scoped config, secrets, and file-backed test data ([learn more](/docs/app/automate/variables))
 - **Reports** — Screenshots, traces, and logs
 - **Tags** — Color-coded organization and filtering
-- **Execution locations** — Run performance tests from the locations available to your project
 
 ## Execution Limits
 
-<Callout type="info">
-**Playwright Tests:** Individual test executions have a maximum runtime of **5 minutes**. Tests exceeding this limit are automatically terminated.
-
-**K6 Performance Tests:** Individual test executions have a maximum runtime of **60 minutes** to accommodate load testing scenarios.
-</Callout>
+| Test type | Maximum runtime per execution |
+|---|---|
+| **Playwright** | **5 minutes**. Tests exceeding this limit are automatically terminated |
+| **K6 Performance** | **60 minutes**, to accommodate load testing scenarios |
 
 ## Running Multiple Tests
 
-For running multiple tests together in a sequence, use **[Jobs](/docs/app/automate/jobs)**. Jobs allow you to:
-
-- Group related tests into automated workflows
-- Schedule regular execution (hourly, daily, or custom cron)
-- Trigger from CI/CD pipelines
-- Get aggregated reports and notifications
-- Set up alerts for the entire test suite
-
-Jobs are ideal for regression testing, smoke tests, and comprehensive validation of your application.
+For running multiple tests together in a sequence, use **[Jobs](/docs/app/automate/jobs)**: group related tests into automated workflows, schedule regular execution (hourly, daily, or custom cron), trigger from CI/CD pipelines, get aggregated reports and notifications, and set up alerts for the entire test suite. Jobs are ideal for regression testing, smoke tests, and comprehensive validation of your application.
 
 ## Learn More
 

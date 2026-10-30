@@ -18,6 +18,7 @@ import {
 import { organization, webhookIdempotency } from "@/db/schema";
 import { eq, and, lt, lte, isNull, or } from "drizzle-orm";
 import type { SubscriptionPlan } from "@/db/schema";
+import { restoreTrialSuspensions } from "@/lib/execution/trial-lifecycle";
 
 // A short processing lease prevents concurrent delivery from running twice.
 // Completed records are retained for 24 hours to suppress provider retries.
@@ -263,6 +264,14 @@ function getWebhookEventKey(
     String(data.endsAt || ""),
     String(data.started_at || ""),
     String(data.ends_at || ""),
+    // Distinguish same-instant events that differ in plan or cancellation state.
+    String(data.productId || data.product_id || ""),
+    String(data.cancelAtPeriodEnd ?? data.cancel_at_period_end ?? ""),
+    String(
+      asRecord(data.pendingUpdate ?? data.pending_update)?.productId ??
+        asRecord(data.pendingUpdate ?? data.pending_update)?.product_id ??
+        "",
+    ),
   ];
 
   return fingerprintParts.join("|");
@@ -437,7 +446,7 @@ function getCustomerIdFromPayload(
   return undefined;
 }
 
-function getSubscriptionStatusFromPayload(
+export function getSubscriptionStatusFromPayload(
   payload: PolarWebhookPayload,
 ): "active" | "canceled" | "past_due" | "none" | undefined {
   const status = payload.data.status;
@@ -447,7 +456,7 @@ function getSubscriptionStatusFromPayload(
       (payload.data.cancelAtPeriodEnd ?? payload.data.cancel_at_period_end) === true) {
     return "canceled";
   }
-  if (["canceled", "unpaid", "incomplete", "incomplete_expired", "trialing"].includes(status ?? "")) {
+  if (["canceled", "unpaid", "incomplete", "incomplete_expired", "trialing", "paused"].includes(status ?? "")) {
     return "none";
   }
   if (
@@ -465,7 +474,7 @@ function getSubscriptionStatusFromPayload(
  * SECURITY: Only allows "plus" or "pro" plans in cloud mode
  * Never returns "unlimited" - that's reserved for self-hosted only
  */
-function getPlanFromProductId(
+export function getPlanFromProductId(
   productId: string | undefined | null,
 ): SubscriptionPlan | null {
   if (!productId) {
@@ -619,6 +628,16 @@ async function findOrganizationByUserId(userId: string) {
 /**
  * Extract user ID from customer metadata in payload
  */
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Only a real user UUID may be used as an owner identity. Customers created by
+// this app carry external_id "organization:<id>", which is not a user and would
+// make the member lookup fail with an invalid-UUID database error.
+function asUserId(value: unknown): string | null {
+  return typeof value === "string" && UUID_PATTERN.test(value) ? value : null;
+}
+
 function getUserIdFromPayload(payload: PolarWebhookPayload): string | null {
   // Check customer metadata.userId
   const customer = payload.data.customer as
@@ -628,26 +647,17 @@ function getUserIdFromPayload(payload: PolarWebhookPayload): string | null {
         externalId?: string;
       }
     | undefined;
-  if (customer?.metadata?.userId) {
-    return customer.metadata.userId;
-  }
+  const fromCustomerMetadata = asUserId(customer?.metadata?.userId);
+  if (fromCustomerMetadata) return fromCustomerMetadata;
 
-  // Check customer.external_id (set during customer creation as user.id)
-  if (customer?.external_id) {
-    return customer.external_id;
-  }
-  // Also check camelCase version
-  if (customer?.externalId) {
-    return customer.externalId;
-  }
+  // Check customer.external_id (legacy customers used user.id as external id)
+  const fromExternalId =
+    asUserId(customer?.external_id) ?? asUserId(customer?.externalId);
+  if (fromExternalId) return fromExternalId;
 
   // Check direct metadata
   const metadata = payload.data.metadata as { userId?: string } | undefined;
-  if (metadata?.userId) {
-    return metadata.userId;
-  }
-
-  return null;
+  return asUserId(metadata?.userId);
 }
 
 /**
@@ -901,6 +911,24 @@ async function processSubscriptionActive(payload: PolarWebhookPayload) {
   }
 
   console.log(`[Polar] ✅ Activated ${plan} for org ${truncateId(org.id)}`);
+
+  // Bring back the monitors and status pages the trial end paused or archived.
+  // This must never fail the webhook: the subscription itself is already saved.
+  try {
+    // Reuse the webhook's own transaction: a second connection per event can exhaust the pool when
+    // events arrive together, with every event waiting for a connection another one holds.
+    const restored = await restoreTrialSuspensions(org.id, getPolarWebhookDb(org.id));
+    if (restored.monitorsResumed || restored.statusPagesRestored) {
+      console.log(
+        `[Polar] Restored ${restored.monitorsResumed} monitors and ${restored.statusPagesRestored} status pages for org ${truncateId(org.id)}`,
+      );
+    }
+  } catch (restoreError) {
+    console.error(
+      `[Polar] Failed to restore trial resources for org ${truncateId(org.id)}:`,
+      restoreError,
+    );
+  }
 
   // Mark webhook as successfully processed
   await updateWebhookResult(
@@ -1532,7 +1560,7 @@ export async function handleCustomerCreated(payload: PolarWebhookPayload) {
     typeof customerMetadata?.userId === "string"
       ? customerMetadata.userId
       : null;
-  const userId = metadataUserId || externalId;
+  const userId = asUserId(metadataUserId) ?? asUserId(externalId);
 
   if (!userId) {
     console.log(
@@ -1715,8 +1743,11 @@ async function processSubscriptionUncanceled(payload: PolarWebhookPayload) {
  * Handle customer state changes
  * Aggregated event for any customer-related changes
  */
-export async function handleCustomerStateChanged() {
-  // Customer state changes are handled by subscription events
+export async function handleCustomerStateChanged(payload: PolarWebhookPayload) {
+  const org = await findOrganizationByCustomerId(payload.data.id);
+  if (!org) return;
+  const { reconcilePolarSubscription } = await import("@/lib/services/subscription-reconciliation");
+  await reconcilePolarSubscription(org.id);
 }
 
 /**
@@ -1821,7 +1852,7 @@ function orderedHandler(
         // A deferred plan change keeps the current plan, so compare with that.
         snapshot: eventType === "order.paid" ? undefined : {
           status: getSubscriptionStatusFromPayload(payload),
-          plan: isFuturePendingProduct(payload, getProductIdFromPayload(payload))
+          plan: (eventType === "subscription.canceled" && !getProductIdFromPayload(payload)) || isFuturePendingProduct(payload, getProductIdFromPayload(payload))
             ? org.subscriptionPlan
             : getPlanFromProductId(getProductIdFromPayload(payload) || null),
         },

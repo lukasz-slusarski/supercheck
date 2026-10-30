@@ -1,3 +1,4 @@
+import { isUuid } from "@/lib/uuid";
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/utils/db";
 import { monitors, monitorResults, MonitoringLocation } from "@/db/schema";
@@ -9,6 +10,7 @@ import {
   calculatePercentile,
 } from "@/lib/monitor-aggregation-service";
 import { createLogger } from "@/lib/logger/index";
+import { excludeSupersededSyntheticResults } from "@/lib/monitor-result-filters";
 
 const logger = createLogger({ module: "monitor-stats-api" }) as {
   debug: (data: unknown, msg?: string) => void;
@@ -48,8 +50,16 @@ export async function GET(
 
   try {
     const authContext = await requireAuthContext();
+    const canView = checkPermissionWithContext("monitor", "view", authContext);
+    if (!canView) {
+      return NextResponse.json(
+        { error: "Insufficient permissions to view this monitor" },
+        { status: 403 }
+      );
+    }
 
-    // First, find the monitor to check permissions
+    // Find the monitor and verify its organization and project.
+    if (!isUuid((await routeContext.params).id)) return NextResponse.json({ error: "Monitor not found" }, { status: 404 });
     const monitor = await db.query.monitors.findFirst({
       where: eq(monitors.id, id),
     });
@@ -63,13 +73,6 @@ export async function GET(
       return NextResponse.json({ error: "Monitor not found" }, { status: 404 });
     }
 
-    const canView = checkPermissionWithContext("monitor", "view", authContext);
-    if (!canView) {
-      return NextResponse.json(
-        { error: "Insufficient permissions to view this monitor" },
-        { status: 403 }
-      );
-    }
 
     // Calculate date boundaries
     const now = new Date();
@@ -189,29 +192,33 @@ export async function GET(
 
     // Fallback: Query raw data for new monitors without aggregates
     // This ensures new monitors still show stats before the first aggregation run
-    logger.debug({ monitorId: id }, "No aggregates found, falling back to raw query");
+    logger.debug({ monitorId: id }, "Some aggregate windows missing, falling back to raw query");
 
     // Build base conditions for raw queries
     const baseConditions24h = locationFilter
       ? and(
           eq(monitorResults.monitorId, id),
           gte(monitorResults.checkedAt, last24Hours),
+          excludeSupersededSyntheticResults,
           eq(monitorResults.location, locationFilter as MonitoringLocation)
         )
       : and(
           eq(monitorResults.monitorId, id),
-          gte(monitorResults.checkedAt, last24Hours)
+          gte(monitorResults.checkedAt, last24Hours),
+          excludeSupersededSyntheticResults
         );
 
     const baseConditions30d = locationFilter
       ? and(
           eq(monitorResults.monitorId, id),
           gte(monitorResults.checkedAt, last30Days),
+          excludeSupersededSyntheticResults,
           eq(monitorResults.location, locationFilter as MonitoringLocation)
         )
       : and(
           eq(monitorResults.monitorId, id),
-          gte(monitorResults.checkedAt, last30Days)
+          gte(monitorResults.checkedAt, last30Days),
+          excludeSupersededSyntheticResults
         );
 
     // Run all 4 statistics queries in parallel for better performance
@@ -297,14 +304,26 @@ export async function GET(
     return NextResponse.json({
       success: true,
       data: {
-        period24h: {
+        period24h: hasAggregates24h ? {
+          totalChecks: aggregates24h.totalChecks,
+          upChecks: Math.round((aggregates24h.uptimePercentage / 100) * aggregates24h.totalChecks),
+          uptimePercentage: aggregates24h.uptimePercentage,
+          avgResponseTimeMs: aggregates24h.avgResponseMs,
+          p95ResponseTimeMs: aggregates24h.p95ResponseMs ?? (aggregates24h.totalChecks >= 5 ? p95Response24h : null),
+        } : {
           totalChecks: total24h,
           upChecks: up24h,
           uptimePercentage: uptime24h,
           avgResponseTimeMs: avgResponse24h ? Math.round(avgResponse24h) : null,
           p95ResponseTimeMs: p95Response24h ? Math.round(p95Response24h) : null,
         },
-        period30d: {
+        period30d: hasAggregates30d ? {
+          totalChecks: aggregates30d.totalChecks,
+          upChecks: Math.round((aggregates30d.uptimePercentage / 100) * aggregates30d.totalChecks),
+          uptimePercentage: aggregates30d.uptimePercentage,
+          avgResponseTimeMs: aggregates30d.avgResponseMs,
+          p95ResponseTimeMs: aggregates30d.p95ResponseMs ?? (aggregates30d.totalChecks >= 5 ? p95Response30d : null),
+        } : {
           totalChecks: total30d,
           upChecks: up30d,
           uptimePercentage: uptime30d,
@@ -316,7 +335,7 @@ export async function GET(
         monitorId: id,
         location: locationFilter || "all",
         calculatedAt: now.toISOString(),
-        source: "raw", // Indicates data came from raw query (fallback)
+        source: hasAggregates24h || hasAggregates30d ? "aggregates+raw" : "raw",
       },
     });
   } catch (error) {

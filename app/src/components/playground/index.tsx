@@ -198,7 +198,9 @@ const Playground: React.FC<PlaygroundProps> = ({
   // Fetch dynamic locations to determine if location dialog should be shown
   const { locations: dynamicLocations, hasRestrictions, isLoading: locationsLoading } = useAvailableLocations();
   const hasMultipleLocations = dynamicLocations.length > 1;
-  const defaultAvailableLocation = dynamicLocations[0]?.code;
+  const defaultAvailableLocation = (
+    dynamicLocations.find((location) => location.supportsK6 !== false) ?? dynamicLocations[0]
+  )?.code;
   // Only set testId from initialTestId if we're on a specific test page
   // Always ensure testId is null when on the main playground page
   const [testId, setTestId] = useState<string | null>(initialTestId || null);
@@ -786,7 +788,7 @@ const Playground: React.FC<PlaygroundProps> = ({
       console.error("Error validating form:", error);
       if (error instanceof z.ZodError) {
         const formattedErrors: Record<string, string> = {};
-        error.errors.forEach((err) => {
+        error.issues.forEach((err) => {
           if (err.path[0]) {
             formattedErrors[err.path[0] as string] = err.message;
           }

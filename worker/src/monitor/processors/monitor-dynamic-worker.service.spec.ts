@@ -1,10 +1,18 @@
+import { ExecutionCapacityError } from '../../execution/services/execution-admission.service';
 jest.mock('bullmq', () => ({
+  DelayedError: jest.requireActual('bullmq').DelayedError,
+  UnrecoverableError: jest.requireActual('bullmq').UnrecoverableError,
   Worker: jest.fn().mockImplementation(() => ({
     on: jest.fn(),
     close: jest.fn().mockResolvedValue(undefined),
   })),
 }));
-jest.mock('../monitor.service', () => ({ MonitorService: class {} }));
+jest.mock('../monitor.service', () => ({
+  MonitorService: class {},
+  MonitorAggregationBusyError: class extends Error {
+    readonly retryAfterMs = 60000;
+  },
+}));
 jest.mock('../../db/db.service', () => ({ DbService: class {} }));
 jest.mock('../../common/heartbeat/heartbeat.service', () => ({
   HeartbeatService: class {},
@@ -12,15 +20,367 @@ jest.mock('../../common/heartbeat/heartbeat.service', () => ({
 
 import { EventEmitter } from 'events';
 import { ConfigService } from '@nestjs/config';
-import { Worker, Job } from 'bullmq';
+import { Worker, Job, UnrecoverableError, DelayedError } from 'bullmq';
+import { clearLocationCapabilityCache } from '../../common/location/location-capability';
+import { resetWorkerQueuesForTests } from '../../common/worker-queues';
 import { MonitorJobDataDto } from '../dto/monitor-job.dto';
+import { EXECUTE_MONITOR_JOB_NAME } from '../monitor.constants';
 import Redis from 'ioredis';
 import { MonitorDynamicWorkerService } from './monitor-dynamic-worker.service';
-import { MonitorService } from '../monitor.service';
+import {
+  MonitorService,
+  MonitorAggregationBusyError,
+} from '../monitor.service';
 import { DbService } from '../../db/db.service';
 import { HeartbeatService } from '../../common/heartbeat/heartbeat.service';
 
 describe('MonitorDynamicWorkerService lifecycle', () => {
+  it('defers a synthetic check while its organization slot is occupied', async () => {
+    const { service } = setup();
+    const executeMonitor = jest
+      .fn()
+      .mockRejectedValue(new ExecutionCapacityError('occupied'));
+    const saveDistributedMonitorResult = jest.fn();
+    Object.assign(service['monitorService'], {
+      executeMonitor,
+      saveDistributedMonitorResult,
+    });
+    jest
+      .spyOn(service as any, 'assertBrowserCapability')
+      .mockResolvedValue(undefined);
+    const moveToDelayed = jest.fn().mockResolvedValue(undefined);
+    const job = {
+      name: EXECUTE_MONITOR_JOB_NAME,
+      data: { executionLocation: 'local', type: 'synthetic_test' },
+      token: 'token',
+      moveToDelayed,
+      updateData: jest.fn().mockResolvedValue(undefined),
+    };
+    await expect(service['processJob'](job as never)).rejects.toBeInstanceOf(
+      jest.requireActual('bullmq').DelayedError,
+    );
+    expect(moveToDelayed).toHaveBeenCalledWith(expect.any(Number), 'token');
+    expect(saveDistributedMonitorResult).not.toHaveBeenCalled();
+  });
+
+  it('does not record downtime when a check gave up waiting for an execution slot', async () => {
+    const { service } = setup();
+    const saveDistributedMonitorResult = jest.fn();
+    Object.assign(service['monitorService'], { saveDistributedMonitorResult });
+    const job = {
+      data: {
+        monitorId: 'm1',
+        executionGroupId: 'g1',
+        executionLocation: 'local',
+        expectedLocations: ['local'],
+        _capacityGaveUp: true,
+      },
+      attemptsMade: 1,
+      getState: jest.fn().mockResolvedValue('failed'),
+    };
+    await service['handleFinalJobFailure'](
+      job as never,
+      new Error('capacity stayed occupied'),
+    );
+    expect(saveDistributedMonitorResult).not.toHaveBeenCalled();
+  });
+
+  it('aborts the monitor cycle of a check that gave up, so its deadline records no false down', async () => {
+    const { service } = setup();
+    const abortMonitorCycle = jest.fn().mockResolvedValue(undefined);
+    Object.assign(service['monitorService'], { abortMonitorCycle });
+    const job = {
+      data: {
+        monitorId: 'm1',
+        executionGroupId: 'g1',
+        executionLocation: 'local',
+        expectedLocations: ['local'],
+        monitorCycle: true,
+        _capacityGaveUp: true,
+      },
+      attemptsMade: 1,
+      getState: jest.fn().mockResolvedValue('failed'),
+    };
+    await service['handleFinalJobFailure'](job as never, new Error('busy'));
+    expect(abortMonitorCycle).toHaveBeenCalledWith('g1');
+  });
+
+  it('leaves a check outside a monitor cycle alone when it gives up', async () => {
+    const { service } = setup();
+    const abortMonitorCycle = jest.fn();
+    Object.assign(service['monitorService'], { abortMonitorCycle });
+    await service['abortCycleOf']({
+      data: { monitorId: 'm1', executionGroupId: 'g1' },
+    } as never);
+    expect(abortMonitorCycle).not.toHaveBeenCalled();
+  });
+
+  it('closes a skipped regional group without recording a failed check', async () => {
+    const { service } = setup();
+    const skipDistributedMonitorGroup = jest.fn().mockResolvedValue(undefined);
+    Object.assign(service['monitorService'], {
+      executeMonitor: jest.fn().mockResolvedValue(null),
+      skipDistributedMonitorGroup,
+    });
+    jest
+      .spyOn(service as any, 'assertBrowserCapability')
+      .mockResolvedValue(undefined);
+    const job = {
+      name: EXECUTE_MONITOR_JOB_NAME,
+      data: {
+        monitorId: 'm1',
+        executionGroupId: 'g1',
+        executionLocation: 'local',
+        expectedLocations: ['local', 'eu'],
+        monitorCycle: true,
+      },
+      updateData: jest.fn().mockResolvedValue(undefined),
+    };
+    expect(await service['processJob'](job as never)).toEqual([]);
+    expect(skipDistributedMonitorGroup).toHaveBeenCalledWith('m1', 'g1', true);
+  });
+
+  it('retries only group closure after capacity was exhausted, never the check', async () => {
+    const { service } = setup();
+    const executeMonitor = jest.fn();
+    const skipDistributedMonitorGroup = jest.fn().mockResolvedValue(undefined);
+    Object.assign(service['monitorService'], {
+      executeMonitor,
+      skipDistributedMonitorGroup,
+    });
+    const job = {
+      name: EXECUTE_MONITOR_JOB_NAME,
+      data: {
+        monitorId: 'm1',
+        executionGroupId: 'g1',
+        executionLocation: 'local',
+        _capacityGaveUp: true,
+      },
+    };
+    expect(await service['processJob'](job as never)).toEqual([]);
+    expect(executeMonitor).not.toHaveBeenCalled();
+    expect(skipDistributedMonitorGroup).toHaveBeenCalledWith('m1', 'g1', false);
+  });
+
+  it('skips a capacity-blocked control-plane cycle before its missing-region deadline', async () => {
+    const { service } = setup();
+    const skipDistributedMonitorGroup = jest.fn().mockResolvedValue(undefined);
+    const executeMonitor = jest
+      .fn()
+      .mockRejectedValue(new ExecutionCapacityError('busy'));
+    Object.assign(service['monitorService'], {
+      executeMonitor,
+      skipDistributedMonitorGroup,
+    });
+    jest
+      .spyOn(service as any, 'assertBrowserCapability')
+      .mockResolvedValue(undefined);
+    const job = {
+      name: EXECUTE_MONITOR_JOB_NAME,
+      data: {
+        monitorId: 'm1',
+        executionGroupId: 'g1',
+        executionLocation: 'local',
+        monitorCycle: true,
+      },
+      updateData: jest.fn().mockResolvedValue(undefined),
+      moveToDelayed: jest.fn(),
+    };
+    expect(await service['processJob'](job as never)).toEqual([]);
+    expect(skipDistributedMonitorGroup).toHaveBeenCalledWith('m1', 'g1', true);
+    expect(job.moveToDelayed).not.toHaveBeenCalled();
+    expect(job.updateData).toHaveBeenCalledWith(
+      expect.objectContaining({ _groupSkipped: true }),
+    );
+  });
+
+  it('delays only closure when a skipped group is busy, without retrying execution', async () => {
+    const { service } = setup();
+    const executeMonitor = jest.fn();
+    const skipDistributedMonitorGroup = jest
+      .fn()
+      .mockRejectedValue(new MonitorAggregationBusyError());
+    Object.assign(service['monitorService'], {
+      executeMonitor,
+      skipDistributedMonitorGroup,
+    });
+    const job = {
+      name: EXECUTE_MONITOR_JOB_NAME,
+      token: 't',
+      data: {
+        monitorId: 'm1',
+        executionGroupId: 'g1',
+        executionLocation: 'local',
+        _groupSkipped: true,
+      },
+      updateData: jest.fn().mockResolvedValue(undefined),
+      moveToDelayed: jest.fn().mockResolvedValue(undefined),
+    };
+    await expect(service['processJob'](job as never)).rejects.toBeInstanceOf(
+      jest.requireActual('bullmq').DelayedError,
+    );
+    expect(executeMonitor).not.toHaveBeenCalled();
+    expect(job.moveToDelayed).toHaveBeenCalledWith(expect.any(Number), 't');
+  });
+
+  describe('closing a skipped group', () => {
+    const skippedJob = (extra: Record<string, unknown> = {}) => ({
+      name: EXECUTE_MONITOR_JOB_NAME,
+      token: 't',
+      data: {
+        monitorId: 'm1',
+        executionGroupId: 'g1',
+        executionLocation: 'local',
+        _groupSkipped: true,
+        ...extra,
+      },
+      updateData: jest.fn().mockResolvedValue(undefined),
+      moveToDelayed: jest.fn().mockResolvedValue(undefined),
+    });
+    const withClosure = (skipDistributedMonitorGroup: jest.Mock) => {
+      const { service } = setup();
+      Object.assign(service['monitorService'], {
+        executeMonitor: jest.fn(),
+        skipDistributedMonitorGroup,
+      });
+      return service;
+    };
+
+    it('counts each busy wait so it can be capped', async () => {
+      const service = withClosure(
+        jest.fn().mockRejectedValue(new MonitorAggregationBusyError()),
+      );
+      const job = skippedJob({ _aggregationBusyRetries: 4 });
+      await expect(service['processJob'](job as never)).rejects.toBeInstanceOf(
+        jest.requireActual('bullmq').DelayedError,
+      );
+      expect(job.data).toMatchObject({ _aggregationBusyRetries: 5 });
+      expect(job.updateData).toHaveBeenCalledWith(
+        expect.objectContaining({ _aggregationBusyRetries: 5 }),
+      );
+    });
+
+    it('gives up for good once the aggregation lease has stayed busy for the whole cap', async () => {
+      const service = withClosure(
+        jest.fn().mockRejectedValue(new MonitorAggregationBusyError()),
+      );
+      const job = skippedJob({ _aggregationBusyRetries: 30 });
+      await expect(service['processJob'](job as never)).rejects.toBeInstanceOf(
+        UnrecoverableError,
+      );
+      // A permanent failure, not another delay: BullMQ then runs the final-failure handler, which aborts the
+      // cycle without recording downtime because the group is marked skipped.
+      expect(job.moveToDelayed).not.toHaveBeenCalled();
+    });
+
+    it('still closes the group when the skip flags cannot be persisted', async () => {
+      const skipDistributedMonitorGroup = jest
+        .fn()
+        .mockResolvedValue(undefined);
+      const service = withClosure(skipDistributedMonitorGroup);
+      const job = skippedJob();
+      delete (job.data as Record<string, unknown>)._groupSkipped;
+      job.updateData.mockRejectedValue(new Error('lock lost'));
+      expect(await service['processJob'](job as never)).toEqual([]);
+      expect(skipDistributedMonitorGroup).toHaveBeenCalledWith(
+        'm1',
+        'g1',
+        false,
+      );
+      // The in-memory job still carries the flag the final-failure handler reads.
+      expect(job.data).toMatchObject({ _groupSkipped: true });
+    });
+
+    it('waits out an outage of the database or Redis the same bounded way, instead of using up job attempts', async () => {
+      const service = withClosure(
+        jest.fn().mockRejectedValue(new Error('redis unavailable')),
+      );
+      const job = skippedJob();
+      await expect(service['processJob'](job as never)).rejects.toBeInstanceOf(
+        jest.requireActual('bullmq').DelayedError,
+      );
+      expect(job.moveToDelayed).toHaveBeenCalledWith(expect.any(Number), 't');
+      expect(job.data).toMatchObject({ _aggregationBusyRetries: 1 });
+    });
+
+    it('still gives up after the cap when the outage lasts', async () => {
+      const service = withClosure(
+        jest.fn().mockRejectedValue(new Error('database unavailable')),
+      );
+      const job = skippedJob({ _aggregationBusyRetries: 30 });
+      await expect(service['processJob'](job as never)).rejects.toBeInstanceOf(
+        UnrecoverableError,
+      );
+    });
+
+    it('closes the group once when the capacity path has already closed it', async () => {
+      const skipDistributedMonitorGroup = jest
+        .fn()
+        .mockResolvedValue(undefined);
+      const { service } = setup();
+      Object.assign(service['monitorService'], {
+        executeMonitor: jest
+          .fn()
+          .mockRejectedValue(new ExecutionCapacityError('busy')),
+        skipDistributedMonitorGroup,
+      });
+      jest
+        .spyOn(service as never, 'assertBrowserCapability')
+        .mockResolvedValue(undefined as never);
+      const job = {
+        ...skippedJob({
+          expectedLocations: ['local', 'eu'],
+          monitorCycle: true,
+        }),
+      };
+      delete (job.data as Record<string, unknown>)._groupSkipped;
+      expect(await service['processJob'](job as never)).toEqual([]);
+      expect(skipDistributedMonitorGroup).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('marks the job when the capacity wait is given up', async () => {
+    const { service } = setup();
+    const updateData = jest.fn().mockResolvedValue(undefined);
+    const job = {
+      data: { monitorId: 'm1', _capacityDeferrals: 720 },
+      token: 't',
+      updateData,
+      moveToDelayed: jest.fn(),
+    };
+    await expect(
+      service['executeOrDefer'](job as never, () =>
+        Promise.reject(new ExecutionCapacityError('busy')),
+      ),
+    ).rejects.toBeInstanceOf(UnrecoverableError);
+    expect(updateData).toHaveBeenCalledWith(
+      expect.objectContaining({ _capacityGaveUp: true }),
+    );
+  });
+
+  it('defers a legacy single-queue check too, instead of failing the job', async () => {
+    const { service } = setup();
+    const executeMonitorWithLocations = jest
+      .fn()
+      .mockRejectedValue(new ExecutionCapacityError('occupied'));
+    Object.assign(service['monitorService'], { executeMonitorWithLocations });
+    jest
+      .spyOn(service as any, 'assertBrowserCapability')
+      .mockResolvedValue(undefined);
+    const moveToDelayed = jest.fn().mockResolvedValue(undefined);
+    const job = {
+      name: EXECUTE_MONITOR_JOB_NAME,
+      data: { type: 'synthetic_test' }, // no executionLocation: legacy job
+      token: 'token',
+      moveToDelayed,
+      updateData: jest.fn().mockResolvedValue(undefined),
+    };
+    await expect(service['processJob'](job as never)).rejects.toBeInstanceOf(
+      jest.requireActual('bullmq').DelayedError,
+    );
+    expect(moveToDelayed).toHaveBeenCalledWith(expect.any(Number), 'token');
+  });
+
   function setup(location = 'local') {
     const execute = jest.fn().mockRejectedValue(new Error('DB unavailable'));
     const subscriber = Object.assign(new EventEmitter(), {
@@ -47,8 +407,165 @@ describe('MonitorDynamicWorkerService lifecycle', () => {
     return { service, connection, heartbeat, execute, subscriber };
   }
 
-  beforeEach(() => jest.clearAllMocks());
-  afterEach(() => jest.useRealTimers());
+  const originalPoolMax = process.env.DB_POOL_MAX;
+  beforeEach(() => {
+    jest.clearAllMocks();
+    process.env.DB_POOL_MAX = '10';
+  });
+  afterEach(() => {
+    if (originalPoolMax === undefined) delete process.env.DB_POOL_MAX;
+    else process.env.DB_POOL_MAX = originalPoolMax;
+    jest.useRealTimers();
+  });
+
+  it.each([
+    ['1', 1],
+    ['2', 1],
+    ['3', 1],
+    ['10', 8],
+    ['30', 10],
+  ])('keeps monitor headroom for pool %s', async (pool, concurrency) => {
+    const previous = process.env.DB_POOL_MAX;
+    process.env.DB_POOL_MAX = pool;
+    const { service } = setup('eu');
+    try {
+      await service['handleQueueRefresh'](
+        JSON.stringify({ locationCodes: ['eu'] }),
+      );
+      expect(Worker).toHaveBeenCalledWith(
+        'monitor-eu',
+        expect.any(Function),
+        expect.objectContaining({ concurrency }),
+      );
+    } finally {
+      if (previous === undefined) delete process.env.DB_POOL_MAX;
+      else process.env.DB_POOL_MAX = previous;
+      await service.onModuleDestroy();
+    }
+  });
+
+  it('allows unrelated regional checks to progress while a slow check is running', async () => {
+    const { service } = setup('eu');
+    await service['handleQueueRefresh'](
+      JSON.stringify({ locationCodes: ['eu'] }),
+    );
+    expect(Worker).toHaveBeenCalledWith(
+      'monitor-eu',
+      expect.any(Function),
+      expect.objectContaining({ concurrency: 8 }),
+    );
+    let finishSlow: () => void = () => {};
+    const slow = new Promise<void>((resolve) => {
+      finishSlow = resolve;
+    });
+    const executeMonitor = jest
+      .fn()
+      .mockImplementation(async (data: MonitorJobDataDto) => {
+        if (data.monitorId === 'slow') await slow;
+        return { monitorId: data.monitorId, location: 'eu', isUp: true };
+      });
+    Object.assign(service['monitorService'], {
+      executeMonitor,
+      saveDistributedMonitorResult: jest.fn().mockResolvedValue(undefined),
+    });
+    const process = (Worker as unknown as jest.Mock).mock.calls[0][1] as (
+      job: Job<MonitorJobDataDto>,
+    ) => Promise<unknown>;
+    const job = (id: string) =>
+      ({
+        name: EXECUTE_MONITOR_JOB_NAME,
+        data: { monitorId: id, executionLocation: 'eu', type: 'http_request' },
+      }) as Job<MonitorJobDataDto>;
+    const pending = process(job('slow'));
+    try {
+      await expect(process(job('fast'))).resolves.toEqual([
+        expect.objectContaining({ monitorId: 'fast' }),
+      ]);
+    } finally {
+      finishSlow();
+      await pending;
+      await service.onModuleDestroy();
+    }
+  });
+
+  it('shares one monitor budget across all local queues', async () => {
+    const { service } = setup('local');
+    await service['handleQueueRefresh'](
+      JSON.stringify({ locationCodes: ['eu', 'us', 'apac'] }),
+    );
+    const processors = (Worker as unknown as jest.Mock).mock.calls.map(
+      (call) => call[1] as (job: Job<MonitorJobDataDto>) => Promise<unknown>,
+    );
+    expect(processors).toHaveLength(3);
+    let releaseFirst = () => {};
+    let releaseRest = () => {};
+    const first = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const rest = new Promise<void>((resolve) => {
+      releaseRest = resolve;
+    });
+    let active = 0;
+    let peak = 0;
+    const execute = jest.fn(async (job: Job<MonitorJobDataDto>) => {
+      peak = Math.max(peak, ++active);
+      try {
+        await (job.id === '0' ? first : rest);
+        return [];
+      } finally {
+        active--;
+      }
+    });
+    service['processJob'] = execute;
+    const pending = Array.from({ length: 9 }, (_, index) =>
+      processors[index % 3]({ id: String(index) } as Job<MonitorJobDataDto>),
+    );
+    try {
+      await Promise.resolve();
+      expect(execute).toHaveBeenCalledTimes(8);
+      releaseFirst();
+      await pending[0];
+      await Promise.resolve();
+      expect(execute).toHaveBeenCalledTimes(9);
+      expect(peak).toBe(8);
+    } finally {
+      releaseFirst();
+      releaseRest();
+      await Promise.all(pending);
+      await service.onModuleDestroy();
+    }
+  });
+
+  it.each([new Error('probe failed'), new DelayedError()])(
+    'releases the shared permit after %s',
+    async (error) => {
+      const previous = process.env.DB_POOL_MAX;
+      process.env.DB_POOL_MAX = '3';
+      const { service } = setup('eu');
+      if (previous === undefined) delete process.env.DB_POOL_MAX;
+      else process.env.DB_POOL_MAX = previous;
+      await service['handleQueueRefresh'](
+        JSON.stringify({ locationCodes: ['eu'] }),
+      );
+      service['processJob'] = jest
+        .fn()
+        .mockRejectedValueOnce(error)
+        .mockResolvedValue([]);
+      const runJob = (Worker as unknown as jest.Mock).mock.calls[0][1] as (
+        job: Job<MonitorJobDataDto>,
+      ) => Promise<unknown>;
+      try {
+        const failed = runJob({} as Job<MonitorJobDataDto>).catch(
+          (reason) => reason,
+        );
+        const next = runJob({} as Job<MonitorJobDataDto>);
+        await expect(failed).resolves.toBe(error);
+        await expect(next).resolves.toEqual([]);
+      } finally {
+        await service.onModuleDestroy();
+      }
+    },
+  );
 
   it('shares the owned command connection and closes it after workers drain', async () => {
     const { service, connection } = setup();
@@ -476,4 +993,318 @@ describe('MonitorDynamicWorkerService lifecycle', () => {
       }
     },
   );
+  it('carries the cycle marker into a final failure so it records a hint, never legacy evaluation', async () => {
+    const save = jest.fn().mockResolvedValue(undefined);
+    const service = new MonitorDynamicWorkerService(
+      { saveDistributedMonitorResult: save } as unknown as MonitorService,
+      new ConfigService(),
+      {} as HeartbeatService,
+      {
+        db: {
+          query: {
+            monitorResults: {
+              findFirst: jest.fn().mockResolvedValue(undefined),
+            },
+          },
+        },
+      } as unknown as DbService,
+    );
+    const job = {
+      data: {
+        monitorId: 'monitor-1',
+        executionGroupId: 'cycle-1',
+        executionLocation: 'eu',
+        expectedLocations: ['eu'],
+        monitorCycle: true,
+      },
+      opts: { attempts: 3 },
+      attemptsMade: 2,
+      getState: jest.fn().mockResolvedValue('failed'),
+    } as unknown as Job<MonitorJobDataDto>;
+    await service['handleFinalJobFailure'](job, new Error('probe crashed'));
+    expect(save).toHaveBeenCalledWith(
+      expect.objectContaining({ monitorId: 'monitor-1', isUp: false }),
+      {
+        executionGroupId: 'cycle-1',
+        expectedLocations: ['eu'],
+        monitorCycle: true,
+      },
+    );
+  });
+  it('defers aggregation contention without spending a failed attempt', async () => {
+    const monitorService = {
+      executeMonitor: jest.fn().mockResolvedValue({
+        monitorId: 'monitor-1',
+        location: 'eu',
+        isUp: true,
+      }),
+      saveDistributedMonitorResult: jest
+        .fn()
+        .mockRejectedValue(new MonitorAggregationBusyError()),
+    };
+    const service = new MonitorDynamicWorkerService(
+      monitorService as unknown as MonitorService,
+      new ConfigService(),
+      {} as HeartbeatService,
+      {} as DbService,
+    );
+    const moveToDelayed = jest.fn().mockResolvedValue(undefined);
+    const job = {
+      name: 'executeMonitorJob',
+      data: { monitorId: 'monitor-1', executionLocation: 'eu' },
+      token: 'worker-token',
+      attemptsMade: 0,
+      moveToDelayed,
+      updateData: jest.fn().mockResolvedValue(undefined),
+    };
+    await expect(
+      service['processJob'](job as unknown as Job<MonitorJobDataDto>),
+    ).rejects.toMatchObject({ name: 'DelayedError' });
+    expect(moveToDelayed).toHaveBeenCalledWith(
+      expect.any(Number),
+      'worker-token',
+    );
+    expect(job.attemptsMade).toBe(0);
+    expect(job.updateData).toHaveBeenCalledWith(
+      expect.objectContaining({ aggregationOnly: true }),
+    );
+  });
+  it.each([false, true])(
+    'requeues final aggregation contention without another probe (existing=%s)',
+    async (existing) => {
+      const row = {
+        id: 'result',
+        monitorId: 'monitor-1',
+        location: 'eu',
+        status: 'error',
+        isUp: false,
+        checkedAt: new Date(),
+        details: null,
+      };
+      const findFirst = jest
+        .fn()
+        .mockResolvedValueOnce(existing ? row : undefined)
+        .mockResolvedValue(row);
+      const executeMonitor = jest.fn();
+      const save = jest
+        .fn()
+        .mockRejectedValueOnce(new MonitorAggregationBusyError())
+        .mockResolvedValue(undefined);
+      const service = new MonitorDynamicWorkerService(
+        {
+          executeMonitor,
+          saveDistributedMonitorResult: save,
+        } as unknown as MonitorService,
+        new ConfigService(),
+        {} as HeartbeatService,
+        {
+          db: { query: { monitorResults: { findFirst } } },
+        } as unknown as DbService,
+      );
+      const job = {
+        name: 'executeMonitorJob',
+        data: {
+          monitorId: 'monitor-1',
+          executionGroupId: 'group-1',
+          executionLocation: 'eu',
+          expectedLocations: ['eu'],
+        },
+        attemptsMade: 3,
+        getState: jest.fn().mockResolvedValue('failed'),
+        updateData: jest.fn(),
+        retry: jest.fn().mockResolvedValue(undefined),
+      };
+      job.updateData.mockImplementation(async (data: typeof job.data) => {
+        job.data = data;
+      });
+      await service['handleFinalJobFailure'](
+        job as unknown as Job<MonitorJobDataDto>,
+        new Error('probe failed'),
+      );
+      expect(job.updateData).toHaveBeenCalledWith(
+        expect.objectContaining({ aggregationOnly: true }),
+      );
+      expect(job.retry).toHaveBeenCalledWith('failed');
+      if (existing)
+        expect(save.mock.calls[0][1]).toMatchObject({ persisted: true });
+      await service['processJob'](job as unknown as Job<MonitorJobDataDto>);
+      expect(executeMonitor).not.toHaveBeenCalled();
+      expect(save).toHaveBeenLastCalledWith(
+        expect.objectContaining({ id: 'result' }),
+        expect.objectContaining({ persisted: true }),
+      );
+    },
+  );
+  it('resumes an aggregation delay from persisted evidence without rerunning the probe', async () => {
+    const executeMonitor = jest.fn();
+    const save = jest.fn().mockResolvedValue(undefined);
+    const row = {
+      monitorId: 'monitor-1',
+      location: 'eu',
+      status: 'up',
+      isUp: true,
+      checkedAt: new Date(),
+      details: null,
+      responseTimeMs: 1,
+      testExecutionId: null,
+      testReportS3Url: null,
+    };
+    const service = new MonitorDynamicWorkerService(
+      {
+        executeMonitor,
+        saveDistributedMonitorResult: save,
+      } as unknown as MonitorService,
+      new ConfigService(),
+      {} as HeartbeatService,
+      {
+        db: {
+          query: {
+            monitorResults: { findFirst: jest.fn().mockResolvedValue(row) },
+          },
+        },
+      } as unknown as DbService,
+    );
+    await service['processJob']({
+      name: 'executeMonitorJob',
+      data: {
+        monitorId: 'monitor-1',
+        executionLocation: 'eu',
+        executionGroupId: 'group-1',
+        aggregationOnly: true,
+      },
+    } as unknown as Job<MonitorJobDataDto>);
+    expect(executeMonitor).not.toHaveBeenCalled();
+    expect(save).toHaveBeenCalledWith(
+      expect.objectContaining({ monitorId: 'monitor-1', isUp: true }),
+      expect.objectContaining({ persisted: true }),
+    );
+  });
+});
+
+describe('MonitorDynamicWorkerService workload gating and backstops', () => {
+  const originalQueues = process.env.WORKER_QUEUES;
+  beforeEach(() => resetWorkerQueuesForTests());
+  afterEach(() => {
+    if (originalQueues === undefined) delete process.env.WORKER_QUEUES;
+    else process.env.WORKER_QUEUES = originalQueues;
+    clearLocationCapabilityCache();
+    resetWorkerQueuesForTests();
+  });
+
+  function build(execute: jest.Mock, saved?: object) {
+    const executeMonitor = jest.fn().mockResolvedValue({
+      monitorId: 'monitor-1',
+      location: 'us-east',
+      status: 'up',
+      isUp: true,
+      checkedAt: new Date(),
+    });
+    const save = jest.fn().mockResolvedValue(undefined);
+    const service = new MonitorDynamicWorkerService(
+      {
+        executeMonitor,
+        saveDistributedMonitorResult: save,
+      } as unknown as MonitorService,
+      new ConfigService(),
+      {} as HeartbeatService,
+      {
+        db: {
+          execute,
+          query: {
+            monitorResults: { findFirst: jest.fn().mockResolvedValue(saved) },
+          },
+        },
+      } as unknown as DbService,
+    );
+    return { service, executeMonitor, save };
+  }
+
+  const job = (type: string, extra: object = {}) =>
+    ({
+      name: 'executeMonitorJob',
+      data: {
+        monitorId: 'monitor-1',
+        type,
+        executionLocation: 'us-east',
+        executionGroupId: 'group-1',
+        expectedLocations: ['us-east'],
+        ...extra,
+      },
+    }) as unknown as Job<MonitorJobDataDto>;
+
+  it('fails a synthetic job permanently when the location lost browser capability', async () => {
+    const execute = jest
+      .fn()
+      .mockResolvedValue([{ supports_browser: false, supports_k6: false }]);
+    const { service, executeMonitor } = build(execute);
+    await expect(
+      service['processJob'](job('synthetic_test')),
+    ).rejects.toBeInstanceOf(UnrecoverableError);
+    expect(executeMonitor).not.toHaveBeenCalled();
+  });
+
+  it('runs a synthetic job when the location supports browser', async () => {
+    const execute = jest
+      .fn()
+      .mockResolvedValue([{ supports_browser: true, supports_k6: false }]);
+    const { service, executeMonitor } = build(execute);
+    await service['processJob'](job('synthetic_test'));
+    expect(executeMonitor).toHaveBeenCalledTimes(1);
+  });
+
+  it('never checks capability for HTTP monitors', async () => {
+    const execute = jest.fn();
+    const { service, executeMonitor } = build(execute);
+    await service['processJob'](job('website'));
+    expect(execute).not.toHaveBeenCalled();
+    expect(executeMonitor).toHaveBeenCalledTimes(1);
+  });
+
+  it('treats a capability lookup failure as retryable, not as allowed', async () => {
+    const execute = jest.fn().mockRejectedValue(new Error('db down'));
+    const { service, executeMonitor } = build(execute);
+    const error = await service['processJob'](job('synthetic_test')).catch(
+      (e: unknown) => e,
+    );
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(UnrecoverableError);
+    expect(executeMonitor).not.toHaveBeenCalled();
+  });
+
+  it('lets an aggregation retry finish even after capability is revoked', async () => {
+    const execute = jest
+      .fn()
+      .mockResolvedValue([{ supports_browser: false, supports_k6: false }]);
+    const saved = {
+      monitorId: 'monitor-1',
+      location: 'us-east',
+      status: 'up',
+      isUp: true,
+      checkedAt: new Date(),
+      details: null,
+      responseTimeMs: 1,
+      testExecutionId: null,
+      testReportS3Url: null,
+    };
+    const { service, executeMonitor, save } = build(execute, saved);
+    await service['processJob'](
+      job('synthetic_test', { aggregationOnly: true }),
+    );
+    expect(execute).not.toHaveBeenCalled();
+    expect(executeMonitor).not.toHaveBeenCalled();
+    expect(save).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ persisted: true }),
+    );
+  });
+
+  it('starts no monitor consumers when WORKER_QUEUES excludes monitor', async () => {
+    process.env.WORKER_QUEUES = 'k6';
+    const execute = jest.fn();
+    const { service } = build(execute);
+    service['createRedisConnection'] = jest.fn();
+    await service.onModuleInit();
+    expect(service['createRedisConnection']).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+  });
 });

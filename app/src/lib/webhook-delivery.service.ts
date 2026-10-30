@@ -16,6 +16,7 @@ import { validateWebhookUrlString } from "@/lib/url-validator";
 export type WebhookEvent = {
   type: "incident.created" | "incident.updated" | "incident.resolved";
   timestamp: string;
+  incident_update_id?: string;
   statusPageId: string;
   incident: {
     id: string;
@@ -31,6 +32,19 @@ export type WebhookDeliveryResult = {
   statusCode?: number;
   error?: string;
   retriesAttempted: number;
+};
+
+export type WebhookVerificationEvent = {
+  type: "supercheck.webhook.verification";
+  token: string;
+  statusPageId: string;
+  createdAt: string;
+};
+
+export type WebhookVerificationResult = {
+  success: boolean;
+  statusCode?: number;
+  error?: string;
 };
 
 /**
@@ -57,12 +71,9 @@ const WEBHOOK_CONFIG = {
  */
 export function generateWebhookSignature(
   payload: string,
-  secret: string
+  secret: string,
 ): string {
-  return crypto
-    .createHmac("sha256", secret)
-    .update(payload)
-    .digest("hex");
+  return crypto.createHmac("sha256", secret).update(payload).digest("hex");
 }
 
 /**
@@ -71,13 +82,14 @@ export function generateWebhookSignature(
 export function verifyWebhookSignature(
   payload: string,
   signature: string,
-  secret: string
+  secret: string,
 ): boolean {
   const expectedSignature = generateWebhookSignature(payload, secret);
   // Use timing-safe comparison to prevent timing attacks
+  if (!/^[a-f0-9]{64}$/i.test(signature)) return false;
   return crypto.timingSafeEqual(
     Buffer.from(signature),
-    Buffer.from(expectedSignature)
+    Buffer.from(expectedSignature),
   );
 }
 
@@ -92,7 +104,7 @@ export function verifyWebhookSignature(
 export async function deliverWebhook(
   endpoint: string,
   event: WebhookEvent,
-  secret: string
+  secret: string,
 ): Promise<WebhookDeliveryResult> {
   // Validate endpoint URL
   const endpointValidation = validateWebhookUrlString(endpoint);
@@ -154,7 +166,11 @@ export async function deliverWebhook(
       lastError = `HTTP ${response.status}`;
 
       // Don't retry on 4xx errors (client errors) unless it's 429 (rate limit)
-      if (response.status >= 400 && response.status < 500 && response.status !== 429) {
+      if (
+        response.status >= 400 &&
+        response.status < 500 &&
+        response.status !== 429
+      ) {
         return {
           success: false,
           statusCode: response.status,
@@ -188,7 +204,7 @@ export async function deliverWebhook(
     if (attempt < WEBHOOK_CONFIG.MAX_RETRIES) {
       const delayMs = Math.min(
         WEBHOOK_CONFIG.INITIAL_DELAY_MS * Math.pow(2, attempt),
-        WEBHOOK_CONFIG.MAX_DELAY_MS
+        WEBHOOK_CONFIG.MAX_DELAY_MS,
       );
 
       // Add jitter to prevent thundering herd
@@ -204,6 +220,73 @@ export async function deliverWebhook(
     error: `Failed after ${WEBHOOK_CONFIG.MAX_RETRIES + 1} attempts. Last error: ${lastError}`,
     retriesAttempted: WEBHOOK_CONFIG.MAX_RETRIES + 1,
   };
+}
+
+/**
+ * Prove that a webhook subscriber controls its endpoint before any incident
+ * notification is delivered. The endpoint returns the token in the
+ * `x-supercheck-verification` header or a JSON `challenge` field.
+ */
+export async function sendWebhookVerificationChallenge(
+  endpoint: string,
+  event: WebhookVerificationEvent,
+): Promise<WebhookVerificationResult> {
+  const endpointValidation = validateWebhookUrlString(endpoint);
+  if (!endpointValidation.valid) {
+    return {
+      success: false,
+      error: endpointValidation.error ?? "Invalid webhook endpoint URL",
+    };
+  }
+
+  try {
+    const response = await fetchPublicEndpoint(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": "Supercheck/1.0 (Webhook Verification)",
+      },
+      body: JSON.stringify(event),
+      signal: AbortSignal.timeout(WEBHOOK_CONFIG.TIMEOUT_MS),
+    }, 4096);
+
+    if (response.status < 200 || response.status >= 300) {
+      return {
+        success: false,
+        statusCode: response.status,
+        error: `HTTP ${response.status}`,
+      };
+    }
+
+    if (response.headers.get("x-supercheck-verification") === event.token) {
+      return { success: true, statusCode: response.status };
+    }
+
+    const body: unknown = await response.json().catch(() => null);
+    if (
+      body &&
+      typeof body === "object" &&
+      "challenge" in body &&
+      body.challenge === event.token
+    ) {
+      return { success: true, statusCode: response.status };
+    }
+
+    return {
+      success: false,
+      statusCode: response.status,
+      error:
+        "Endpoint responded but did not echo the verification token. Return it in the x-supercheck-verification header or a JSON challenge field.",
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error:
+        error instanceof Error
+          ? error.message
+          : "Webhook verification request failed",
+    };
+  }
 }
 
 /**

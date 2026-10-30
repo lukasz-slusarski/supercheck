@@ -1,7 +1,7 @@
 import { Command } from 'commander'
 import { createAuthenticatedClient } from '../api/authenticated-client.js'
 import { logger } from '../utils/logger.js'
-import { getOutputFormat, output, outputDetail, outputPagination } from '../output/formatter.js'
+import { getOutputFormat, output, outputDetail, outputMutation, outputPagination } from '../output/formatter.js'
 import type { PaginatedResponse } from '../api/client.js'
 import { parseBooleanStrict, parseIntStrict } from '../utils/number.js'
 import { withSpinner } from '../utils/spinner.js'
@@ -31,6 +31,14 @@ function normalizeHttpMethod(value: string): string {
     )
   }
   return normalized
+}
+
+function validateMonitorTarget(target: string, type?: string): void {
+  if (!type || ['http_request', 'website'].includes(type)) {
+    try {
+      if (!['http:', 'https:'].includes(new URL(target).protocol)) throw new Error('protocol')
+    } catch { throw new CLIError('--url must be a valid HTTP(S) URL.', ExitCode.ConfigError) }
+  }
 }
 
 function getLatestMonitorResponseTimeMs(data: Record<string, unknown>): number | undefined {
@@ -199,6 +207,7 @@ monitorCommand
     if (monitorType !== 'synthetic_test' && !options.url) {
       throw new CLIError('--url is required for this monitor type.', ExitCode.ConfigError)
     }
+    if (options.url) validateMonitorTarget(options.url, monitorType)
     if (monitorType === 'synthetic_test' && !z.string().uuid().safeParse(options.testId).success) {
       throw new CLIError('--test-id must be a valid test UUID for synthetic_test.', ExitCode.ConfigError)
     }
@@ -239,7 +248,7 @@ monitorCommand
 
     if (options.dryRun) {
       logger.header('Dry run — monitor create payload:')
-      logger.info(JSON.stringify(body, null, 2))
+      outputDetail({ dryRun: true, payload: body })
       return
     }
 
@@ -267,7 +276,11 @@ monitorCommand
 
     const body: Record<string, unknown> = {}
     if (options.name !== undefined) body.name = options.name
-    if (options.url !== undefined) body.target = options.url
+    if (options.url !== undefined) {
+      const { data: existing } = await client.get<{ type?: string }>(`/api/monitors/${id}`)
+      validateMonitorTarget(options.url, existing.type)
+      body.target = options.url
+    }
     if (options.interval !== undefined) {
       logger.warn('--interval (seconds) is deprecated. Use --interval-minutes instead.')
       const intervalSeconds = parseIntStrict(options.interval, '--interval', { min: 60, max: 86400 })
@@ -296,7 +309,7 @@ monitorCommand
 
     if (options.dryRun) {
       logger.header('Dry run — monitor update payload:')
-      logger.info(JSON.stringify(body, null, 2))
+      outputDetail({ dryRun: true, payload: body })
       return
     }
 
@@ -315,11 +328,7 @@ monitorCommand
   .action(async (id: string, options: { force?: boolean }) => {
     if (!options.force) {
       const { confirmPrompt } = await import('../utils/prompt.js')
-      const confirmed = await confirmPrompt(`Delete monitor ${id}?`, { default: false })
-      if (!confirmed) {
-        logger.info('Aborted')
-        return
-      }
+      await confirmPrompt(`Delete monitor ${id}?`, { default: false })
     }
 
     const client = createAuthenticatedClient()
@@ -328,4 +337,5 @@ monitorCommand
       () => client.delete(`/api/monitors/${id}`),
     )
     logger.success(`Monitor ${id} deleted`)
+    outputMutation({ id, deleted: true })
   })

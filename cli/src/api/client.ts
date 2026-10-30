@@ -48,6 +48,8 @@ export class ApiClient {
     this.proxy = options.proxy ?? null
   }
 
+  getBaseUrl(): string { const url = new URL(this.baseUrl); return url.origin + url.pathname.replace(/\/$/, '') }
+
   setToken(token: string): void {
     this.token = token
   }
@@ -107,6 +109,10 @@ export class ApiClient {
       params?: Record<string, string | number | boolean | undefined>
       headers?: Record<string, string>
       retries?: number
+      /** Per-request timeout in ms; overrides the client default. */
+      timeout?: number
+      /** Return the raw response text as `data` instead of parsing JSON (e.g. CSV exports). */
+      text?: boolean
     },
   ): Promise<ApiResponse<T>> {
     const url = this.buildUrl(path, options?.params)
@@ -116,6 +122,7 @@ export class ApiClient {
     const targetOrigin = parsedUrl.origin
     const headers = this.buildHeaders(options?.headers)
     const maxRetries = options?.retries ?? MAX_RETRIES
+    const timeout = options?.timeout ?? this.timeout
     const attemptCount = maxRetries + 1
     const attemptLabel = `${attemptCount} ${attemptCount === 1 ? 'attempt' : 'attempts'}`
 
@@ -130,7 +137,7 @@ export class ApiClient {
       let timeoutId: ReturnType<typeof setTimeout> | null = null
       try {
         const controller = new AbortController()
-        timeoutId = setTimeout(() => controller.abort(), this.timeout)
+        timeoutId = setTimeout(() => controller.abort(), timeout)
 
         // Use explicitly-set proxy, otherwise resolve from env vars (NO_PROXY-aware)
         const proxy = this.proxy || getProxyEnv(parsedUrl)
@@ -147,20 +154,19 @@ export class ApiClient {
 
         const response = await fetch(url, fetchOptions)
 
-        clearTimeout(timeoutId)
-        timeoutId = null
 
         // Rate limit handling
         if (response.status === 429) {
+          const retryAfter = response.headers.get('Retry-After')
+          const parsedSeconds = retryAfter ? Number(retryAfter) : NaN
           if (attempt >= maxRetries) {
+            const hint = Number.isFinite(parsedSeconds) && parsedSeconds > 0 ? ` Retry in ${Math.ceil(parsedSeconds)}s.` : ''
             throw new ApiRequestError(
-              `Rate limited after ${attemptLabel}: ${method} ${path}`,
+              `Rate limited after ${attemptLabel}: ${method} ${path}.${hint}`,
               429,
             )
           }
 
-          const retryAfter = response.headers.get('Retry-After')
-          const parsedSeconds = retryAfter ? Number(retryAfter) : NaN
           const waitMs = Number.isFinite(parsedSeconds) && parsedSeconds > 0
             ? parsedSeconds * 1000
             : RETRY_BACKOFF_MS * Math.pow(2, attempt)
@@ -187,7 +193,8 @@ export class ApiClient {
           try {
             responseBody = JSON.parse(text)
           } catch {
-            responseBody = text
+            // HTML/proxy diagnostics are untrusted and may contain credentials or huge documents.
+            responseBody = undefined
           }
 
           throw new ApiRequestError(
@@ -197,7 +204,12 @@ export class ApiClient {
           )
         }
 
-        const data = text ? (JSON.parse(text) as T) : ({} as T)
+        if (options?.text) return { data: text as T, status: response.status, headers: response.headers }
+
+        let data: T
+        try { data = text ? JSON.parse(text) as T : {} as T } catch {
+          throw new ApiRequestError(`Invalid JSON response from ${targetOrigin}: ${method} ${path}`, response.status)
+        }
 
         return {
           data,
@@ -208,7 +220,7 @@ export class ApiClient {
         if (err instanceof ApiRequestError) throw err
 
         if (err instanceof DOMException && err.name === 'AbortError') {
-          throw new TimeoutError(`Request to ${targetOrigin} timed out after ${this.timeout}ms: ${method} ${path}`)
+          throw new TimeoutError(`Request to ${targetOrigin} timed out after ${timeout}ms: ${method} ${path}`)
         }
 
         lastError = err as Error
@@ -242,8 +254,17 @@ export class ApiClient {
     return this.request<T>('GET', path, { params })
   }
 
-  async post<T = unknown>(path: string, body?: unknown): Promise<ApiResponse<T>> {
-    return this.request<T>('POST', path, { body })
+  /** GET a non-JSON body (e.g. CSV) as text. */
+  async getText(path: string, params?: Record<string, string | number | boolean | undefined>): Promise<ApiResponse<string>> {
+    return this.request<string>('GET', path, { params, text: true })
+  }
+
+  async post<T = unknown>(
+    path: string,
+    body?: unknown,
+    options?: { timeout?: number; retries?: number },
+  ): Promise<ApiResponse<T>> {
+    return this.request<T>('POST', path, { body, ...options })
   }
 
   async put<T = unknown>(path: string, body?: unknown): Promise<ApiResponse<T>> {
@@ -254,8 +275,8 @@ export class ApiClient {
     return this.request<T>('PATCH', path, { body })
   }
 
-  async delete<T = unknown>(path: string): Promise<ApiResponse<T>> {
-    return this.request<T>('DELETE', path)
+  async delete<T = unknown>(path: string, body?: unknown): Promise<ApiResponse<T>> {
+    return this.request<T>('DELETE', path, { body })
   }
 
   private sleep(ms: number): Promise<void> {

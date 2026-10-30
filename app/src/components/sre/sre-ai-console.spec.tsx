@@ -29,6 +29,22 @@ jest.mock("@/components/sre/sre-assistant-ui-thread", () => ({
 
 describe("SreAiConsole", () => {
   beforeEach(() => window.history.replaceState(null, "", "/copilot"));
+
+  it("renders without a re-render loop when history failed to load", () => {
+    const errors = jest.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const { rerender } = render(<SreAiConsole loadError="History unavailable" />);
+      // The loop only starts once a second render hands the effect a fresh default array.
+      rerender(<SreAiConsole loadError="History unavailable" />);
+      expect(screen.getByTestId("chat-thread")).toBeInTheDocument();
+      expect(errors).not.toHaveBeenCalledWith(
+        expect.stringContaining("Maximum update depth"),
+      );
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
   it("keeps New chat incident-scoped and preserves that scope in history", () => {
     window.history.replaceState(null, "", "/copilot?incident=incident-1");
     render(
@@ -289,5 +305,59 @@ describe("SreAiConsole", () => {
       "aria-expanded",
       "false",
     );
+  });
+
+  it("refreshes once per sheet open and shows a chat abandoned mid-stream", () => {
+    const onRequestHistoryRefresh = jest.fn();
+    const { rerender } = render(
+      <SreAiConsole
+        initialHistories={[
+          {
+            conversationId: "saved-chat",
+            incidentId: null,
+            title: "Saved chat",
+            updatedAt: "2026-10-09",
+            messages: [],
+          },
+        ]}
+        onRequestHistoryRefresh={onRequestHistoryRefresh}
+      />,
+    );
+
+    expect(onRequestHistoryRefresh).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "History" }));
+    expect(onRequestHistoryRefresh).toHaveBeenCalledTimes(1);
+    // Keeping the sheet open must not keep refetching.
+    expect(onRequestHistoryRefresh).toHaveBeenCalledTimes(1);
+
+    rerender(
+      <SreAiConsole
+        initialHistories={[
+          {
+            conversationId: "abandoned-chat",
+            incidentId: null,
+            title: "Question abandoned mid-stream",
+            updatedAt: "2026-10-10",
+            messages: [],
+          },
+          {
+            conversationId: "saved-chat",
+            incidentId: null,
+            title: "Saved chat",
+            updatedAt: "2026-10-09",
+            messages: [],
+          },
+        ]}
+        onRequestHistoryRefresh={onRequestHistoryRefresh}
+      />,
+    );
+
+    expect(screen.getAllByText("Question abandoned mid-stream")).toHaveLength(1);
+    expect(screen.getAllByText("Saved chat")).toHaveLength(1);
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    fireEvent.click(screen.getByRole("button", { name: "History" }));
+    expect(onRequestHistoryRefresh).toHaveBeenCalledTimes(2);
   });
 });

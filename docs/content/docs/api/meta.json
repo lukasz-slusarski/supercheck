@@ -2,8 +2,9 @@
   "title": "Supercheck API",
   "description": "REST API documentation and OpenAPI specification",
   "root": true,
-  "icon": "Braces",
+  "icon": "CodeXml",
   "pages": [
+    "index",
     "---Reference---",
     "authentication",
     "errors",
@@ -16,6 +17,7 @@
     "trigger-keys",
     "runs",
     "tests",
+    "requirements",
     "variables",
     "monitors",
     "tags",

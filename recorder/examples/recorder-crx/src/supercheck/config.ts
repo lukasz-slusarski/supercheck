@@ -15,6 +15,10 @@ export interface SupercheckConfig {
   autoConnected?: boolean; // True if connected via seamless auth
 }
 
+function isConfig(value: unknown): value is SupercheckConfig {
+  return !!value && typeof value === 'object' && 'instanceUrl' in value && typeof value.instanceUrl === 'string';
+}
+
 const STORAGE_KEY = 'supercheckConfig';
 const DEFAULT_INSTANCE_URL = 'https://app.supercheck.io';
 
@@ -30,7 +34,7 @@ const DEFAULT_CONFIG: SupercheckConfig = {
  */
 export async function getConfig(): Promise<SupercheckConfig> {
   try {
-    const result = await chrome.storage.sync.get(STORAGE_KEY);
+    const result = await chrome.storage.sync.get<{ supercheckConfig?: Partial<SupercheckConfig> }>(STORAGE_KEY);
     return { ...DEFAULT_CONFIG, ...result[STORAGE_KEY] };
   } catch (error) {
     console.error('[Supercheck] Failed to get config:', error);
@@ -53,11 +57,65 @@ export async function saveConfig(config: Partial<SupercheckConfig>): Promise<voi
 }
 
 /**
- * Clear all Supercheck configuration (logout)
+ * Replace the stored configuration with `config`, dropping any credential that
+ * belonged to a different instance. Used when the options page switches to a
+ * new instance URL so an old key is never sent to the new host.
  */
-export async function clearConfig(): Promise<void> {
+export async function replaceConfig(config: SupercheckConfig): Promise<void> {
   try {
+    await chrome.storage.sync.set({ [STORAGE_KEY]: config });
+  } catch (error) {
+    console.error('[Supercheck] Failed to replace config:', error);
+    throw error;
+  }
+}
+
+/**
+ * Compare two instance URLs by origin, ignoring trailing slashes and paths.
+ */
+export function isSameInstance(first?: string, second?: string): boolean {
+  if (!first || !second)
+    return false;
+
+  try {
+    return new URL(first).origin === new URL(second).origin;
+  } catch {
+    return false;
+  }
+}
+
+/** How long to wait for the instance when revoking the key on disconnect. */
+const REVOKE_TIMEOUT_MS = 5000;
+
+/**
+ * Clear all Supercheck configuration (logout).
+ *
+ * Local credentials are always removed: the user asked to disconnect, and an
+ * unreachable or changed instance must not leave the key stuck in this browser.
+ * The held key is revoked on the server first, best-effort. When that fails the
+ * caller gets `revoked: false` so it can tell the user to revoke the key from
+ * their Supercheck settings.
+ */
+export async function clearConfig(): Promise<{ revoked: boolean }> {
+  let revoked = true;
+  try {
+    const config = await getConfig();
+    if (config.apiKey) {
+      try {
+        const response = await fetch(`${config.instanceUrl.replace(/\/$/, '')}/api/extension/auth`, {
+          method: 'DELETE',
+          headers: { 'x-api-key': config.apiKey },
+          signal: AbortSignal.timeout(REVOKE_TIMEOUT_MS),
+        });
+        // 401 means the key is already invalid, which is the outcome we want.
+        revoked = response.ok || response.status === 401;
+      } catch (error) {
+        console.warn('[Supercheck] Could not reach the instance to revoke the key:', error);
+        revoked = false;
+      }
+    }
     await chrome.storage.sync.remove(STORAGE_KEY);
+    return { revoked };
   } catch (error) {
     console.error('[Supercheck] Failed to clear config:', error);
     throw error;
@@ -114,9 +172,10 @@ export function addConfigChangeListener(
   listener: (config: SupercheckConfig | null) => void
 ): () => void {
   const handler = (changes: { [key: string]: chrome.storage.StorageChange }) => {
-    if (STORAGE_KEY in changes)
-      listener(changes[STORAGE_KEY].newValue || null);
-
+    if (STORAGE_KEY in changes) {
+      const value = changes[STORAGE_KEY].newValue;
+      listener(isConfig(value) ? value : null);
+    }
   };
 
   chrome.storage.sync.onChanged.addListener(handler);

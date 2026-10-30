@@ -57,12 +57,14 @@ jobs:
 
       - name: Upload review input
         if: steps.prepare.outputs.decision != 'skip'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: pr-review-${{ github.run_id }}
           path: |
             ${{ runner.temp }}/pr-review/prompt.txt
             ${{ runner.temp }}/pr-review/index.json
+            ${{ runner.temp }}/pr-review/evidence.json
+            ${{ runner.temp }}/pr-review/prior.json
             ${{ runner.temp }}/pr-review/meta.json
           overwrite: true
           retention-days: 1
@@ -104,7 +106,7 @@ jobs:
         run: node .github/scripts/pr-review.mjs model
 
       - name: Upload the review
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: pr-review-result-${{ github.run_id }}
           path: |
@@ -156,7 +158,9 @@ jobs:
       - name: Publish the GitHub review
         env:
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pull_number }}
+          # Retain the legacy result path while this workflow runs with default-branch scripts.
           REVIEW_DIR: ${{ needs.prepare.outputs.decision == 'review' && format('{0}/pr-review-result', runner.temp) || format('{0}/pr-review', runner.temp) }}
+          REVIEW_INPUT_DIR: ${{ runner.temp }}/pr-review
           GH_TOKEN: ${{ github.token }}
           GITHUB_TOKEN: ${{ github.token }}
         run: node .github/scripts/pr-review.mjs publish

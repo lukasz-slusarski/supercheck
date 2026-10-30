@@ -116,14 +116,10 @@ export const upgradeCommand = new Command('upgrade')
         )
       }
 
-      const confirmed = await confirmPrompt(`Upgrade Supercheck CLI using ${pm}?`, { default: false })
-      if (!confirmed) {
-        logger.info('Upgrade cancelled.')
-        return
-      }
+      await confirmPrompt(`Upgrade Supercheck CLI using ${pm}?`, { default: false })
     }
 
-    let code = 0
+    let code: number
     try {
       code = await withSpinner(
         'Upgrading Supercheck CLI...',

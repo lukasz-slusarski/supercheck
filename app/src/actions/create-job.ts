@@ -11,6 +11,7 @@ import { getNextRunDate } from "@/lib/cron-utils";
 import { requireProjectContext } from "@/lib/project-context";
 import { requirePermissions } from "@/lib/rbac/middleware";
 import { logAuditEvent } from "@/lib/audit-logger";
+import { subscriptionService, SubscriptionAccessDeniedError } from "@/lib/services/subscription-service";
 import type { TestType } from "@/db/schema/types";
 import {
   getJobTestTypeMismatchError,
@@ -42,7 +43,7 @@ export async function createJob(data: CreateJobData) {
     try {
       await requirePermissions({
         job: ["create"],
-      });
+      }, { organizationId, projectId: project.id });
     } catch (error) {
       console.warn(
         `User ${userId} attempted to create job without permission:`,
@@ -71,6 +72,9 @@ export async function createJob(data: CreateJobData) {
         message: "Duplicate test IDs are not allowed in a job.",
       };
     }
+
+    await subscriptionService.blockUntilSubscribed(organizationId);
+    await subscriptionService.requireValidPolarCustomer(organizationId);
 
     const scopedTests = await db
       .select({ id: testsTable.id, type: testsTable.type })
@@ -231,6 +235,9 @@ export async function createJob(data: CreateJobData) {
       };
     }
   } catch (validationError) {
+    if (validationError instanceof SubscriptionAccessDeniedError) {
+      return { success: false, message: validationError.message, error: validationError.message };
+    }
     console.error("Validation error:", validationError);
     return {
       success: false,

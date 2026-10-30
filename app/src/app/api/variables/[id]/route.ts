@@ -1,3 +1,4 @@
+import { isUuid } from "@/lib/uuid";
 /**
  * GET/PUT/DELETE /api/variables/[id]
  *
@@ -14,7 +15,7 @@ import { projectVariables } from "@/db/schema";
 import { eq, and } from "drizzle-orm";
 import { checkPermissionWithContext } from "@/lib/rbac/middleware";
 import { requireAuthContext, isAuthError } from "@/lib/auth-context";
-import { encryptValue, decryptValue } from "@/lib/encryption";
+import { encryptValue } from "@/lib/encryption";
 import { getS3Client } from "@/lib/s3-proxy";
 import { DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { updateVariableSchema } from "@/lib/validations/variable";
@@ -37,6 +38,7 @@ export async function GET(
       );
     }
 
+    if (!isUuid((await params).id)) return NextResponse.json({ error: "Variable not found" }, { status: 404 });
     const [variable] = await db
       .select()
       .from(projectVariables)
@@ -92,6 +94,7 @@ export async function PUT(
     }
 
     // Verify variable exists and belongs to project
+    if (!isUuid((await params).id)) return NextResponse.json({ error: "Variable not found" }, { status: 404 });
     const [existing] = await db
       .select()
       .from(projectVariables)
@@ -195,15 +198,10 @@ export async function PUT(
         updateData.encryptedValue = encryptValue(existing.value, context.project.id);
         updateData.value = "[ENCRYPTED]";
       } else {
-        // Switching from secret to plaintext: decrypt the existing encrypted value
-        if (!existing.encryptedValue) {
-          return NextResponse.json(
-            { error: "Cannot unmark as secret without providing a value. The encrypted value is unavailable." },
-            { status: 400 }
-          );
-        }
-        updateData.value = decryptValue(existing.encryptedValue as string, context.project.id);
-        updateData.encryptedValue = null;
+        return NextResponse.json(
+          { error: "Provide a replacement value to convert a secret to plaintext. Use the audited decrypt action to reveal an existing secret." },
+          { status: 400 },
+        );
       }
     }
 
@@ -250,6 +248,7 @@ export async function DELETE(
     }
 
     // Verify variable exists and belongs to project
+    if (!isUuid((await params).id)) return NextResponse.json({ error: "Variable not found" }, { status: 404 });
     const [existing] = await db
       .select({
         id: projectVariables.id,

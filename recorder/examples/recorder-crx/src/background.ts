@@ -19,6 +19,13 @@ import type { CrxApplication } from 'playwright-crx';
 import playwright, { crx, _debug, _setUnderTest, _isUnderTest as isUnderTest } from 'playwright-crx';
 import type { CrxSettings } from './settings';
 import { addSettingsChangedListener, defaultSettings, loadSettings } from './settings';
+import { clearConfig } from './supercheck/config';
+import type { RecordingContextPayload } from './supercheck/message-security';
+
+type StoredRecordingContext = RecordingContextPayload & {
+  sourceTabId?: number;
+  pendingStart?: boolean;
+};
 
 type CrxMode = Mode | 'detached';
 
@@ -177,7 +184,7 @@ async function attach(tab: chrome.tabs.Tab, mode?: Mode) {
 
   try {
     // Check for pending recording context from Supercheck
-    const { recordingContext } = await chrome.storage.session.get('recordingContext');
+    const { recordingContext } = await chrome.storage.session.get<{ recordingContext?: StoredRecordingContext }>('recordingContext');
     let targetUrl = 'about:blank';
 
     if (recordingContext?.pendingStart) {
@@ -242,7 +249,7 @@ async function setTestIdAttributeName(testIdAttributeName: string) {
 chrome.action.onClicked.addListener(attach);
 
 chrome.commands.onCommand.addListener(async (command, tab) => {
-  if (!tab.id)
+  if (!tab?.id)
     return;
   if (command === 'inspect')
     await attach(tab, 'inspecting');
@@ -324,8 +331,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   // Handle DISCONNECT from content script
   if (message.type === 'INTERNAL_DISCONNECT') {
-    chrome.storage.sync.remove('supercheckConfig').then(() => {
-      sendResponse({ success: true });
+    clearConfig().then(({ revoked }) => {
+      sendResponse({ success: true, revoked });
     }).catch(error => {
       console.error('[Supercheck] Failed to clear config:', error);
       sendResponse({ success: false, error: error.message });
@@ -340,7 +347,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
  */
 async function sendCodeToPlayground(payload: { code: string }): Promise<void> {
   // Get the recording context to find the source tab
-  const result = await chrome.storage.session.get('recordingContext');
+  const result = await chrome.storage.session.get<{ recordingContext?: StoredRecordingContext }>('recordingContext');
   const context = result.recordingContext;
 
   if (!context?.sourceTabId)

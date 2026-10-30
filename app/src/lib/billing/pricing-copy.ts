@@ -1,3 +1,5 @@
+import { trialFaqs } from "./trial-copy";
+
 export const PRICING_FAQS = [
   {
     question: "Does one subscription cover the projects in my organization?",
@@ -5,9 +7,19 @@ export const PRICING_FAQS = [
       "Yes. Your account has one default organization, and all projects within it share your monthly subscription, usage allowances, member limits, and spending controls. You can create and switch projects without purchasing another subscription. Projects you join by invitation use their host team's plan and allowances separately; joining a paid team does not require a personal subscription. Only the host organization owner can manage billing.",
   },
   {
+    question: "Where do Cloud checks run?",
+    answer:
+      "HTTP, SSL, ping, and port monitors can run from Europe, North America, and Asia Pacific. Browser synthetic monitors, Playwright tests, and k6 load tests run in Europe. Enterprise can use custom locations, and self-hosted deployments can run checks wherever you deploy.",
+  },
+  {
+    question: "Why do browser checks and k6 tests run only in Europe?",
+    answer:
+      "At launch, browser and k6 execution is available in Europe only. They can still test any public URL worldwide, and each run currently uses your browser minutes or VU-minutes once. If browser execution is enabled in more locations later, each location counts separately. Enterprise and self-hosted deployments can use other locations.",
+  },
+  {
     question: "How are browser execution minutes measured?",
     answer:
-      "Playwright tests and synthetic monitors share your minute allowance. Execution time is rounded to four decimal places in minutes per run, without a whole-minute minimum. A five-second run uses 0.0833 minutes. Each location and executed retry contributes usage. Failed or canceled executions can still consume compute usage. HTTP, ping, and port checks do not consume Playwright minutes.",
+      "Playwright tests and synthetic monitors share your minute allowance. Execution time is rounded to four decimal places in minutes per run, without a whole-minute minimum. A five-second run uses 0.0833 minutes. Browser checks currently run from one location (Europe). Each executed retry contributes usage, and if browser checks are enabled in more locations, each location counts separately. Failed or canceled executions can still consume compute usage. HTTP, SSL, ping, and port checks from any location do not consume Playwright minutes.",
   },
   {
     question: "How are load tests measured?",
@@ -17,7 +29,7 @@ export const PRICING_FAQS = [
   {
     question: "How do AI credits work?",
     answer:
-      "AI credits are a hard monthly pool for test generation, test fixes, and failure analysis. Each accepted action uses one credit before generation or analysis starts, even if it later fails. There are no AI credit overages; upgrade or wait for your next billing cycle when the pool is exhausted.",
+      "Each plan includes a monthly pool of AI credits for test generation, test fixes, and failure analysis, subject to fair use. Automated bulk use and abuse are restricted. Your account shows your monthly allowance and remaining credits. Each accepted action uses one credit before generation or analysis starts, even if it later fails. There are no AI credit overages; upgrade or wait for your next billing cycle when the pool is exhausted.",
   },
   {
     question: "What counts as an AI SRE investigation?",
@@ -27,7 +39,7 @@ export const PRICING_FAQS = [
   {
     question: "What happens if I exceed my limits?",
     answer:
-      "Playwright minutes, K6 VU-minutes, and completed full AI SRE reports use the overage rates shown above. AI credits have a hard monthly limit with no overages. Monitor, member, project, and status-page limits require an upgrade rather than an overage payment.",
+      "Playwright minutes, K6 VU-minutes, and completed full AI SRE reports use the overage rates shown above. AI credits are included, subject to fair use, with no overages. Monitor, member, project, and status-page limits require an upgrade rather than an overage payment.",
   },
   {
     question: "How can I control overage spending?",
@@ -43,6 +55,7 @@ export const PRICING_FAQS = [
     question: "Do unused allowances roll over?",
     answer: "No. Execution minutes, AI credits, and AI SRE investigation allowances reset monthly on your billing date.",
   },
+  ...trialFaqs(),
   {
     question: "Can I try Supercheck before subscribing?",
     answer: "Yes. Try our free demo at demo.supercheck.dev — no signup required. When you are ready, choose a monthly plan. Cancel anytime.",
@@ -55,6 +68,6 @@ export const PRICING_FAQS = [
   {
     question: "Can I self-host Supercheck?",
     answer:
-      "Yes. Supercheck core is open source under AGPLv3. Self-host on your infrastructure with unlimited Supercheck usage at no license cost. You still pay your own infrastructure and AI provider costs. See the self-hosting guide at supercheck.io/docs/app/deployment/self-hosted.",
+      "Yes. Supercheck core is open source under AGPLv3. Self-host on your infrastructure with unlimited Supercheck usage at no license cost, and with no trial or usage limits. You still pay your own infrastructure and AI provider costs. See the self-hosting guide at supercheck.io/docs/app/deployment/self-hosted.",
   },
 ];

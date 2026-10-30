@@ -1,3 +1,4 @@
+import { isUuid } from "@/lib/uuid";
 import { NextRequest, NextResponse } from 'next/server';
 import { getUserOrgRole } from '@/lib/rbac/middleware';
 import { requireUserAuthContext, isAuthError } from '@/lib/auth-context';
@@ -30,10 +31,14 @@ export async function GET(
 ) {
   const resolvedParams = await params;
   try {
-    const { userId } = await requireUserAuthContext();
+    const { userId, isCliAuth } = await requireUserAuthContext();
+    if (isCliAuth) {
+      return NextResponse.json({ error: "Organization administration requires an interactive browser session; CLI tokens are project-scoped" }, { status: 403 });
+    }
     const organizationId = resolvedParams.id;
     
     // Verify user is a member of this organization (implicit view permission)
+    if (!isUuid((await params).id)) return NextResponse.json({ error: "Organization not found" }, { status: 404 });
     const orgData = await db
       .select({
         id: organization.id,
@@ -110,11 +115,15 @@ export async function PUT(
   const resolvedParams = await params;
   try {
     const { userId, isCliAuth } = await requireUserAuthContext();
+    if (isCliAuth) {
+      return NextResponse.json({ error: "Organization administration requires an interactive browser session; CLI tokens are project-scoped" }, { status: 403 });
+    }
     const originError = requireSameOriginRequest(request, { allowMissing: isCliAuth });
     if (originError) return originError;
     const organizationId = resolvedParams.id;
     
     // Check permission using getUserOrgRole (works for both CLI tokens and session cookies)
+    if (!isUuid((await params).id)) return NextResponse.json({ error: "Organization not found" }, { status: 404 });
     const orgRole = await getUserOrgRole(userId, organizationId);
     if (!orgRole) {
       return NextResponse.json(
@@ -144,7 +153,7 @@ export async function PUT(
     // Validate organization name
     const nameValidation = updateOrgNameSchema.safeParse({ name });
     if (!nameValidation.success) {
-      const firstError = nameValidation.error.errors[0];
+      const firstError = nameValidation.error.issues[0];
       return NextResponse.json(
         { error: firstError?.message || 'Invalid organization name' },
         { status: 400 }
@@ -219,12 +228,16 @@ export async function DELETE(
   const resolvedParams = await params;
   try {
     const { userId, isCliAuth } = await requireUserAuthContext();
+    if (isCliAuth) {
+      return NextResponse.json({ error: "Organization administration requires an interactive browser session; CLI tokens are project-scoped" }, { status: 403 });
+    }
     const originError = requireSameOriginRequest(request, { allowMissing: isCliAuth });
     if (originError) return originError;
     const organizationId = resolvedParams.id;
     
     // Check permission - only owners can delete organizations
     // Uses getUserOrgRole which works for both CLI tokens and session cookies
+    if (!isUuid((await params).id)) return NextResponse.json({ error: "Organization not found" }, { status: 404 });
     const orgRole = await getUserOrgRole(userId, organizationId);
     if (!orgRole) {
       return NextResponse.json(

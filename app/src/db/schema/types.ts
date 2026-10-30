@@ -126,6 +126,7 @@ export type MonitorConfig = {
   timeoutSeconds?: number;
   regions?: string[];
   locationConfig?: LocationConfig;
+  /** @deprecated Unsupported for monitors; accepted for compatibility and ignored. */
   retryStrategy?: {
     maxRetries: number;
     backoffFactor: number;
@@ -253,6 +254,9 @@ export type NotificationContent = {
 
 // Audit types
 export type AuditDetails = {
+  actorUserId?: string;
+  impersonatedBy?: string;
+  deletedUserId?: string;
   resource?: string;
   resourceId?: string;
   changes?: Record<string, { before: unknown; after: unknown }>;

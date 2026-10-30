@@ -10,11 +10,23 @@ import { DbService } from './db.service';
 import { RedisService } from './redis.service';
 import { ReportUploadService } from '../../common/services/report-upload.service';
 import { ContainerExecutorService } from '../../common/security/container-executor.service';
-import { CancellationService } from '../../common/services/cancellation.service';
+import {
+  CancellationService,
+  RUN_CANCELLATION_MARKER,
+} from '../../common/services/cancellation.service';
 import { RequirementCoverageService } from './requirement-coverage.service';
-import { filterFileVariablesToUsedKeys } from '../../common/utils/script-analysis';
+import {
+  filterSecretVariablesToUsedKeys,
+  filterFileVariablesToUsedKeys,
+} from '../../common/utils/script-analysis';
 import { createSecretStream } from '../../common/utils/secret-stream';
 import { decodeStoredTestScript } from '../../common/utils/test-script';
+import {
+  ExecutionAdmissionService,
+  type ExecutionReservation,
+  LIMITED_RUN_OVERHEAD_MS,
+} from './execution-admission.service';
+import { attachBillableMs } from '../../common/billable-ms';
 import { VariableResolverService } from '../../common/services/variable-resolver.service';
 import {
   TestResult,
@@ -108,10 +120,12 @@ export function ensureProperTraceConfiguration(
 // Interface defining the result from the internal _executePlaywright function
 interface PlaywrightExecutionResult {
   success: boolean;
+  cancelled?: boolean;
   error: string | null;
   stdout: string;
   stderr: string;
   executionTimeMs?: number; // Actual execution time in milliseconds
+  billableMs?: number; // Container run time evidenced by Kubernetes
 }
 
 @Injectable()
@@ -173,6 +187,7 @@ export class ExecutionService implements OnModuleDestroy {
     private cancellationService: CancellationService,
     private requirementCoverageService: RequirementCoverageService,
     private variableResolverService: VariableResolverService,
+    private admissionService: ExecutionAdmissionService,
   ) {
     // Set timeouts: configurable via env vars with sensible defaults
     // Note: Environment variables are always strings, so we must parse them as numbers
@@ -357,10 +372,38 @@ export class ExecutionService implements OnModuleDestroy {
    * Runs a single test defined by the task data.
    * Container-only execution: No host filesystem dependencies
    */
+  async hasActiveExecution(
+    runId: string,
+    options?: { boundUncertainty?: boolean },
+  ): Promise<boolean> {
+    return this.containerExecutorService.hasActiveExecution(runId, options);
+  }
+
   async runSingleTest(
     task: TestExecutionTask,
     bypassConcurrencyCheck = false,
     isMonitorExecution = false,
+  ): Promise<TestResult> {
+    return this.admissionService.run(
+      task.organizationId,
+      task.runId ?? `test:${crypto.randomUUID()}`,
+      'playwright',
+      this.testExecutionTimeoutMs,
+      (reservation) =>
+        this.runSingleTestReserved(
+          task,
+          bypassConcurrencyCheck,
+          isMonitorExecution,
+          reservation,
+        ),
+    );
+  }
+
+  private async runSingleTestReserved(
+    task: TestExecutionTask,
+    bypassConcurrencyCheck = false,
+    isMonitorExecution = false,
+    reservation?: ExecutionReservation,
   ): Promise<TestResult> {
     if (task.projectId) {
       const resolved =
@@ -387,7 +430,7 @@ export class ExecutionService implements OnModuleDestroy {
 
     const runtimeEnv = this.buildVariableRuntimeEnv(
       runtimeVariables,
-      runtimeSecrets,
+      filterSecretVariablesToUsedKeys(runtimeSecrets, [code]),
       filePaths,
     );
 
@@ -408,12 +451,14 @@ export class ExecutionService implements OnModuleDestroy {
     // Generate unique ID for this run to avoid conflicts in parallel executions
     const uniqueRunId = `${testId}-${crypto.randomUUID().substring(0, 8)}`;
     // For monitor executions, use uniqueRunId to preserve historical reports and separate bucket
-    // For regular test execution, use testId to maintain existing behavior (overwrite previous report)
-    const executionId = isMonitorExecution ? uniqueRunId : testId;
+    // Run-backed tests own immutable directories, including repeated saved-test executions.
+    const executionId = isMonitorExecution ? uniqueRunId : task.runId || testId;
     const s3ReportKeyPrefix = `${executionId}/report`;
     const entityType = isMonitorExecution ? 'monitor' : 'test';
     let finalResult: TestResult;
     let s3Url: string | null = null;
+    // Container run time once the execution pod has actually started.
+    let billableMs = 0;
 
     // Create temp directory for extracted reports (OS-managed temp)
     const extractedReportsDir = path.join(
@@ -448,6 +493,10 @@ export class ExecutionService implements OnModuleDestroy {
       // 2. Store initial metadata about the run
       await this.dbService.storeReportMetadata({
         entityId: executionId,
+        aliasEntityId:
+          !isMonitorExecution && task.runId && task.runId !== testId
+            ? testId
+            : undefined,
         entityType,
         status: 'running',
         reportPath: s3ReportKeyPrefix,
@@ -488,8 +537,10 @@ export class ExecutionService implements OnModuleDestroy {
           : undefined,
         task.runId || undefined, // Pass runId for cancellation tracking
         runtimeEnv,
+        reservation,
       );
 
+      billableMs = execResult.billableMs ?? 0;
       execResult.stdout = this.redactSecretsFromText(
         execResult.stdout,
         runtimeSecrets,
@@ -503,22 +554,19 @@ export class ExecutionService implements OnModuleDestroy {
         runtimeSecrets,
       );
 
-      // Check if this was a cancellation (exit code 137 = SIGKILL)
-      const wasCancelled =
-        !execResult.success && execResult.error?.includes('code 137');
+      const wasCancelled = execResult.cancelled === true;
       if (wasCancelled) {
         this.logger.warn(`[${testId}] Execution was cancelled (exit code 137)`);
         throw new Error('Execution cancelled by user');
       }
 
       // 5. Process result and upload report
-      // The report evaluation is the authoritative source for test status
-      // It correctly handles flaky tests (which pass on retry)
+      // A passing report cannot override a runner or artifact extraction failure.
+      // Flaky tests that pass on retry still have a successful runner outcome.
       const reportOutcome =
         await this.evaluatePlaywrightReport(extractedReportsDir);
-      const finalStatus: 'passed' | 'failed' = !reportOutcome.hasFailures
-        ? 'passed'
-        : 'failed';
+      const finalStatus: 'passed' | 'failed' =
+        execResult.success && !reportOutcome.hasFailures ? 'passed' : 'failed';
 
       if (finalStatus === 'passed') {
         // Removed success log - only log errors and completion summary
@@ -549,6 +597,10 @@ export class ExecutionService implements OnModuleDestroy {
         // Publish final status
         await this.dbService.storeReportMetadata({
           entityId: executionId,
+          aliasEntityId:
+            !isMonitorExecution && task.runId && task.runId !== testId
+              ? testId
+              : undefined,
           entityType,
           reportPath: s3ReportKeyPrefix,
           status: finalStatus,
@@ -563,6 +615,7 @@ export class ExecutionService implements OnModuleDestroy {
           stderr: execResult.stderr,
           error: null,
           executionTimeMs: execResult.executionTimeMs,
+          billableMs,
         };
         this.logger.log(
           `[Playwright Test] ${testId} passed (${execResult.executionTimeMs ?? 0}ms)`,
@@ -610,6 +663,10 @@ export class ExecutionService implements OnModuleDestroy {
         // Update status *after* logging and upload attempt
         await this.dbService.storeReportMetadata({
           entityId: executionId,
+          aliasEntityId:
+            !isMonitorExecution && task.runId && task.runId !== testId
+              ? testId
+              : undefined,
           entityType,
           reportPath: s3ReportKeyPrefix,
           status: 'failed',
@@ -625,6 +682,7 @@ export class ExecutionService implements OnModuleDestroy {
           stdout: execResult.stdout,
           stderr: execResult.stderr,
           executionTimeMs: execResult.executionTimeMs,
+          billableMs,
         };
         this.logger.error(
           `[Playwright Test] ${testId} failed: ${specificError} (${execResult.executionTimeMs ?? 0}ms)`,
@@ -638,13 +696,12 @@ export class ExecutionService implements OnModuleDestroy {
       const errorMessage = (error as Error).message;
       const isCancellation =
         errorMessage.includes('cancelled') ||
-        errorMessage.includes('cancellation') ||
-        errorMessage.includes('code 137');
+        errorMessage.includes('cancellation');
 
       // Use 'error' status for cancellation, 'failed' for other errors
       const finalStatus = isCancellation ? 'error' : 'failed';
       const errorDetails = isCancellation
-        ? 'Cancellation requested by user'
+        ? RUN_CANCELLATION_MARKER
         : errorMessage;
 
       this.logger.error(
@@ -656,6 +713,10 @@ export class ExecutionService implements OnModuleDestroy {
       await this.dbService
         .storeReportMetadata({
           entityId: executionId,
+          aliasEntityId:
+            !isMonitorExecution && task.runId && task.runId !== testId
+              ? testId
+              : undefined,
           entityType,
           reportPath: s3ReportKeyPrefix,
           status: finalStatus,
@@ -678,8 +739,9 @@ export class ExecutionService implements OnModuleDestroy {
       this.logger.error(
         `[Playwright Test] ${testId} ${isCancellation ? 'cancelled' : 'crashed'}: ${errorMessage}`,
       );
-      // Propagate the error to the BullMQ processor so the job is marked as failed
-      throw error;
+      // Propagate the error to the BullMQ processor so the job is marked as failed.
+      // Carry container run time so metering charges only work that ran.
+      throw attachBillableMs(error, billableMs);
     } finally {
       // Remove from active executions
       this.activeExecutions.delete(uniqueRunId);
@@ -709,6 +771,19 @@ export class ExecutionService implements OnModuleDestroy {
    * Uses the native Playwright test runner and HTML reporter.
    */
   async runJob(task: JobExecutionTask): Promise<TestExecutionResult> {
+    return this.admissionService.run(
+      task.organizationId,
+      task.runId,
+      'playwright',
+      this.jobExecutionTimeoutMs,
+      (reservation) => this.runJobReserved(task, reservation),
+    );
+  }
+
+  private async runJobReserved(
+    task: JobExecutionTask,
+    reservation?: ExecutionReservation,
+  ): Promise<TestExecutionResult> {
     const resolved = await this.variableResolverService.resolveProjectVariables(
       task.projectId,
     );
@@ -743,6 +818,8 @@ export class ExecutionService implements OnModuleDestroy {
     const s3ReportKeyPrefix = `${runId}/report`;
     let finalResult: TestExecutionResult;
     let s3Url: string | null = null;
+    // Container run time once the execution pod has actually started.
+    let jobBillableMs = 0;
     let finalError: string | null = null;
     const timestamp = new Date().toISOString();
     let overallSuccess = false; // Default to failure
@@ -915,12 +992,17 @@ export class ExecutionService implements OnModuleDestroy {
         runId, // Pass runId for cancellation tracking
         this.buildVariableRuntimeEnv(
           task.variables ?? {},
-          task.secrets ?? {},
+          filterSecretVariablesToUsedKeys(
+            task.secrets ?? {},
+            rawDecodedScripts,
+          ),
           filePaths,
         ),
+        reservation,
       );
 
       const taskSecrets = task.secrets ?? {};
+      jobBillableMs = execResult.billableMs ?? 0;
       execResult.stdout = this.redactSecretsFromText(
         execResult.stdout,
         taskSecrets,
@@ -939,9 +1021,7 @@ export class ExecutionService implements OnModuleDestroy {
       stderr_log = execResult.stderr;
       finalError = execResult.error;
 
-      // Check if this was a cancellation (exit code 137 = SIGKILL)
-      const wasCancelled =
-        !execResult.success && execResult.error?.includes('code 137');
+      const wasCancelled = execResult.cancelled === true;
       if (wasCancelled) {
         this.logger.warn(`[${runId}] Execution was cancelled (exit code 137)`);
         throw new Error('Execution cancelled by user');
@@ -1004,6 +1084,7 @@ export class ExecutionService implements OnModuleDestroy {
         })),
         timestamp,
         duration: durationStr,
+        billableMs: jobBillableMs,
         stdout: stdout_log,
         stderr: stderr_log,
       };
@@ -1043,8 +1124,7 @@ export class ExecutionService implements OnModuleDestroy {
       const errorMessage = (error as Error).message;
       const isCancellation =
         errorMessage.includes('cancelled') ||
-        errorMessage.includes('cancellation') ||
-        errorMessage.includes('code 137');
+        errorMessage.includes('cancellation');
 
       this.logger.error(
         `[${runId}] Unhandled error during job execution: ${errorMessage}`,
@@ -1054,7 +1134,7 @@ export class ExecutionService implements OnModuleDestroy {
       // Use 'error' status for cancellation, 'failed' for other errors
       const finalStatus = isCancellation ? 'error' : 'failed';
       const errorDetails = isCancellation
-        ? 'Cancellation requested by user'
+        ? RUN_CANCELLATION_MARKER
         : errorMessage;
 
       // Attempt to mark DB with appropriate status
@@ -1082,6 +1162,7 @@ export class ExecutionService implements OnModuleDestroy {
         reportUrl: null,
         results: [],
         timestamp,
+        billableMs: jobBillableMs,
         stdout: stdout_log,
         stderr: stderr_log + ((error as Error).stack || ''),
       };
@@ -1132,6 +1213,7 @@ export class ExecutionService implements OnModuleDestroy {
     additionalFiles?: Record<string, string>,
     runId?: string,
     runtimeEnvOverrides?: Record<string, string>,
+    reservation?: ExecutionReservation,
   ): Promise<PlaywrightExecutionResult> {
     return this.executePlaywrightDirectly(
       testScript,
@@ -1140,6 +1222,7 @@ export class ExecutionService implements OnModuleDestroy {
       additionalFiles,
       runId,
       runtimeEnvOverrides,
+      reservation,
     );
   }
 
@@ -1158,6 +1241,7 @@ export class ExecutionService implements OnModuleDestroy {
     additionalFiles?: Record<string, string>,
     runId?: string,
     runtimeEnvOverrides?: Record<string, string>,
+    reservation?: ExecutionReservation,
   ): Promise<PlaywrightExecutionResult> {
     // For jobs with multiple tests, run playwright test /tmp/ to execute all tests
     // For single tests, target specific file
@@ -1204,6 +1288,12 @@ export class ExecutionService implements OnModuleDestroy {
         // omit when running locally so Playwright uses system default
         ...(browsersPath ? { PLAYWRIGHT_BROWSERS_PATH: browsersPath } : {}),
         ...(runtimeEnvOverrides ?? {}),
+        // A limited run may not use more workload time than it reserved. The pod deadline keeps the
+        // extra headroom for startup and report export, which is not charged. Set after the overrides
+        // so nothing a test supplies can lift it.
+        ...(reservation?.limited
+          ? { PLAYWRIGHT_GLOBAL_TIMEOUT_MS: String(reservation.reservedMs) }
+          : {}),
       };
 
       this.logger.debug(
@@ -1227,9 +1317,15 @@ export class ExecutionService implements OnModuleDestroy {
         env: envVars,
         cwd: workerDir,
         shell: false,
-        timeout: isJob
-          ? this.jobExecutionTimeoutMs
-          : this.testExecutionTimeoutMs,
+        timeout: reservation?.limited
+          ? reservation.reservedMs + LIMITED_RUN_OVERHEAD_MS
+          : isJob
+            ? this.jobExecutionTimeoutMs
+            : this.testExecutionTimeoutMs,
+        hardDeadlineMs: reservation?.limited
+          ? reservation.reservedMs + LIMITED_RUN_OVERHEAD_MS
+          : undefined,
+        expiresAtMs: reservation?.expiresAt?.getTime(),
         scriptPath: null, // No host path to mount - using inline script
         workingDir: workerDir,
         runId, // Pass runId for cancellation tracking
@@ -1277,10 +1373,12 @@ export class ExecutionService implements OnModuleDestroy {
 
       return {
         success: execResult.success,
+        cancelled: execResult.cancelled,
         error: extractedError, // Use the extracted error message
         stdout: execResult.stdout,
         stderr: execResult.stderr,
         executionTimeMs: execResult.executionTimeMs,
+        billableMs: execResult.billableMs ?? 0,
       };
     } catch (error) {
       return {
@@ -1653,6 +1751,8 @@ export class ExecutionService implements OnModuleDestroy {
       cwd?: string;
       shell?: boolean;
       timeout?: number;
+      hardDeadlineMs?: number;
+      expiresAtMs?: number;
       scriptPath?: string | null; // Path to the script being executed (for container mounting), null for inline mode
       workingDir?: string; // Working directory inside container
       runId?: string; // Run ID for cancellation tracking
@@ -1665,9 +1765,11 @@ export class ExecutionService implements OnModuleDestroy {
     } = {},
   ): Promise<{
     success: boolean;
+    cancelled?: boolean;
     stdout: string;
     stderr: string;
     executionTimeMs?: number;
+    billableMs?: number;
     error?: string;
   }> {
     const startTime = Date.now();
@@ -1719,6 +1821,8 @@ export class ExecutionService implements OnModuleDestroy {
         [command, ...args],
         {
           timeoutMs: options.timeout,
+          hardDeadlineMs: options.hardDeadlineMs,
+          expiresAtMs: options.expiresAtMs,
           runId: options.runId, // Pass runId for cancellation tracking
           env: options.env as Record<string, string>,
           workingDir: resolvedWorkingDir,
@@ -1763,9 +1867,11 @@ export class ExecutionService implements OnModuleDestroy {
 
     return {
       success: containerResult.success,
+      cancelled: containerResult.cancelled,
       stdout: redactedStdout,
       stderr: redactedStderr,
       executionTimeMs: containerResult.duration,
+      billableMs: containerResult.billableMs ?? 0,
       error: redactedError,
     };
   }

@@ -10,12 +10,14 @@ import {
   RadioTower,
 } from "lucide-react";
 import { toast } from "sonner";
+import { copyToClipboard } from "./copy-to-clipboard";
 
 import {
   disablePrivateAgent,
   rotatePrivateAgentToken,
   type PrivateAgentListItem,
 } from "@/actions/private-agents";
+import { TabSectionHeader } from "@/components/org-admin/tab-section-header";
 import { DashboardEmptyState } from "@/components/dashboard/dashboard-empty-state";
 import { PrivateAgentFormDialog } from "@/components/sre/private-agents/private-agent-form-dialog";
 import {
@@ -57,6 +59,8 @@ import {
 type PrivateAgentsAdminViewProps = {
   initialAgents: PrivateAgentListItem[];
   loadError: string | null;
+  /** Called after an agent is created, changed, or disabled so connector options can refresh. */
+  onSetupChanged?: () => void;
 };
 
 const statusTones: Record<PrivateAgentListItem["status"], TableBadgeTone> = {
@@ -80,6 +84,7 @@ function formatDate(value: Date | string | null) {
 export function PrivateAgentsAdminView({
   initialAgents,
   loadError,
+  onSetupChanged,
 }: PrivateAgentsAdminViewProps) {
   const [agents, setAgents] = useState(initialAgents);
   const [isRegisterOpen, setIsRegisterOpen] = useState(false);
@@ -89,6 +94,8 @@ export function PrivateAgentsAdminView({
     agent: PrivateAgentListItem;
     token: string;
   } | null>(null);
+  const [rotatingAgent, setRotatingAgent] =
+    useState<PrivateAgentListItem | null>(null);
   const [isMutating, startMutationTransition] = useTransition();
 
   const handleSaved = (savedAgent: PrivateAgentListItem) => {
@@ -101,6 +108,7 @@ export function PrivateAgentsAdminView({
       }
       return [savedAgent, ...current];
     });
+    onSetupChanged?.();
   };
 
   const confirmDisable = () => {
@@ -128,6 +136,7 @@ export function PrivateAgentsAdminView({
       }
 
       handleSaved(result.agent);
+      setRotatingAgent(null);
       if (result.registrationToken) {
         setRotatedToken({
           agent: result.agent,
@@ -140,13 +149,11 @@ export function PrivateAgentsAdminView({
 
   const copyRotatedToken = async () => {
     if (!rotatedToken) return;
-    await navigator.clipboard.writeText(rotatedToken.token);
-    toast.success("Registration token copied");
+    await copyToClipboard(rotatedToken.token, "Registration token");
   };
 
   const copyAgentId = async (agentId: string) => {
-    await navigator.clipboard.writeText(agentId);
-    toast.success("Agent ID copied");
+    await copyToClipboard(agentId, "Agent ID");
   };
 
   if (loadError) {
@@ -162,6 +169,19 @@ export function PrivateAgentsAdminView({
 
   return (
     <div className="space-y-4">
+      <TabSectionHeader
+        icon={<RadioTower />}
+        title="Private Agents"
+        description="Run connectors inside your private network without exposing it."
+        action={
+          agents.length > 0 ? (
+            <Button onClick={() => setIsRegisterOpen(true)}>
+              <Plus className="mr-2 h-4 w-4" />
+              Register agent
+            </Button>
+          ) : undefined
+        }
+      />
       {agents.length === 0 ? (
         <DashboardEmptyState
           className="min-h-[420px]"
@@ -177,14 +197,8 @@ export function PrivateAgentsAdminView({
         />
       ) : (
         <div className="space-y-4">
-          <div className="flex justify-end">
-            <Button onClick={() => setIsRegisterOpen(true)}>
-              <Plus className="mr-2 h-4 w-4" />
-              Register agent
-            </Button>
-          </div>
-          <div className="overflow-hidden rounded-lg border">
-            <Table>
+          <div className="relative max-w-full overflow-x-auto rounded-t-lg border">
+            <Table className="w-full min-w-[900px]">
               <TableHeader>
                 <TableRow>
                   <TableHead>Agent</TableHead>
@@ -198,7 +212,7 @@ export function PrivateAgentsAdminView({
               <TableBody>
                 {agents.map((agent) => (
                   <TableRow key={agent.id}>
-                    <TableCell className="min-w-[240px] whitespace-normal">
+                    <TableCell className="min-w-[240px] whitespace-normal py-2.5">
                       <div className="space-y-1">
                         <p className="font-medium">{agent.name}</p>
                         <div className="flex items-center gap-1 text-xs text-muted-foreground">
@@ -224,7 +238,7 @@ export function PrivateAgentsAdminView({
                         )}
                       </div>
                     </TableCell>
-                    <TableCell>
+                    <TableCell className="py-2.5">
                       <TableBadge
                         tone={statusTones[agent.status]}
                         compact
@@ -233,7 +247,7 @@ export function PrivateAgentsAdminView({
                         {agent.status}
                       </TableBadge>
                     </TableCell>
-                    <TableCell>
+                    <TableCell className="py-2.5">
                       <div className="space-y-1 text-sm">
                         <p>{agent.region ?? "No region"}</p>
                         <p className="text-xs text-muted-foreground">
@@ -241,13 +255,13 @@ export function PrivateAgentsAdminView({
                         </p>
                       </div>
                     </TableCell>
-                    <TableCell suppressHydrationWarning>
+                    <TableCell className="py-2.5" suppressHydrationWarning>
                       {formatDate(agent.lastHeartbeatAt)}
                     </TableCell>
-                    <TableCell>
+                    <TableCell className="py-2.5">
                       {agent.projectScoped ? "Current project" : "Organization"}
                     </TableCell>
-                    <TableCell>
+                    <TableCell className="py-2.5">
                       <DropdownMenu>
                         <DropdownMenuTrigger asChild>
                           <Button
@@ -263,7 +277,7 @@ export function PrivateAgentsAdminView({
                           {agent.status !== "disabled" && (
                             <>
                               <DropdownMenuItem
-                                onClick={() => rotateToken(agent)}
+                                onClick={() => setRotatingAgent(agent)}
                               >
                                 Rotate token
                               </DropdownMenuItem>
@@ -295,6 +309,35 @@ export function PrivateAgentsAdminView({
       )}
 
       <AlertDialog
+        open={Boolean(rotatingAgent)}
+        onOpenChange={(open) => !open && !isMutating && setRotatingAgent(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Rotate registration token?</AlertDialogTitle>
+            <AlertDialogDescription>
+              A new one-time token for {rotatingAgent?.name} is shown once. The
+              agent must be restarted with it to reconnect, so jobs stop until
+              you do.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={isMutating}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(event) => {
+                event.preventDefault();
+                if (rotatingAgent) rotateToken(rotatingAgent);
+              }}
+              disabled={isMutating}
+            >
+              {isMutating && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+              Rotate token
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog
         open={Boolean(disablingAgent)}
         onOpenChange={(open) => !open && setDisablingAgent(null)}
       >
@@ -303,12 +346,19 @@ export function PrivateAgentsAdminView({
             <AlertDialogTitle>Disable Private Agent?</AlertDialogTitle>
             <AlertDialogDescription>
               {disablingAgent?.name} will stop receiving connector jobs. Active
-              credentials are revoked, and existing audit history is preserved.
+              credentials are revoked, connectors bound to this agent will fail
+              until reassigned, and audit history is preserved.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel disabled={isMutating}>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={confirmDisable} disabled={isMutating}>
+            <AlertDialogAction
+              onClick={(event) => {
+                event.preventDefault();
+                confirmDisable();
+              }}
+              disabled={isMutating}
+            >
               {isMutating && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
               Disable agent
             </AlertDialogAction>

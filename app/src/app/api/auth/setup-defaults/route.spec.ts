@@ -6,8 +6,8 @@ const mockPolarGetExternal = jest.fn();
 const mockPolarUpdateExternal = jest.fn();
 const mockPolarCreate = jest.fn();
 
-jest.mock("@polar-sh/sdk", () => ({
-  Polar: jest.fn().mockImplementation(() => ({
+jest.mock("@polar-sh/sdk/2026-10", () => ({
+  createPolar: jest.fn().mockImplementation(() => ({
     customers: {
       getExternal: mockPolarGetExternal,
       list: jest.fn(),
@@ -116,9 +116,7 @@ describe("POST /api/auth/setup-defaults", () => {
 
     expect(response.status).toBe(200);
     expect(mockPolarGetExternal).toHaveBeenCalledTimes(1);
-    expect(mockPolarGetExternal).toHaveBeenCalledWith({
-      externalId: "organization:org-owned",
-    });
+    expect(mockPolarGetExternal).toHaveBeenCalledWith("organization:org-owned");
     expect(updateSet).toHaveBeenCalledWith({ polarCustomerId: "customer-1" });
     expect(updateWhere).toHaveBeenCalledTimes(1);
     expect(mockDb.transaction).not.toHaveBeenCalled();
@@ -155,7 +153,7 @@ describe("POST /api/auth/setup-defaults", () => {
     expect(mockPolarCreate).toHaveBeenNthCalledWith(
       1,
       expect.objectContaining({
-        externalId: "organization:org-a",
+        external_id: "organization:org-a",
         metadata: expect.objectContaining({
           referenceId: "org-a",
           userId: "user-1",
@@ -197,7 +195,7 @@ describe("POST /api/auth/setup-defaults", () => {
     };
     mockDb.transaction.mockImplementation(async callback => callback(tx));
     expect((await POST(request())).status).toBe(200);
-    expect(mockPolarGetExternal).toHaveBeenCalledWith({ externalId: "organization:oldest-owned" });
+    expect(mockPolarGetExternal).toHaveBeenCalledWith("organization:oldest-owned");
     expect(mockPolarGetExternal).toHaveBeenCalledTimes(1);
     expect(mockDb.select).toHaveBeenCalledTimes(3);
     expect(tx.insert).not.toHaveBeenCalled();
@@ -248,4 +246,65 @@ describe("POST /api/auth/setup-defaults", () => {
     if (!sessionExists) expect(mockPolarGetExternal).not.toHaveBeenCalled();
   });
 
+  describe("free trial", () => {
+    const originalTrialFlag = process.env.TRIAL_ENABLED;
+    afterEach(() => {
+      if (originalTrialFlag === undefined) delete process.env.TRIAL_ENABLED;
+      else process.env.TRIAL_ENABLED = originalTrialFlag;
+    });
+
+    function arrangeCreation(trialGrantedAt: Date | null = null) {
+      mockDb.select.mockReturnValueOnce(selectResult([{ emailVerified: true }], true))
+        .mockReturnValueOnce(selectResult([]))
+        .mockReturnValueOnce({ from: jest.fn().mockReturnThis(), where: jest.fn().mockReturnThis(), orderBy: jest.fn().mockReturnThis(), limit: jest.fn().mockResolvedValue([]) });
+      (auth.api.getSession as unknown as jest.Mock).mockResolvedValue({ session: { token: "browser-token" } });
+      const txSet = jest.fn().mockReturnValue({ where: jest.fn().mockReturnValue({ returning: jest.fn().mockResolvedValue([{ id: "session" }]) }) });
+      const values = jest.fn().mockReturnValue({ returning: jest.fn().mockResolvedValue([{ id: "new-id", name: "Default" }]) });
+      const tx = {
+        select: jest.fn().mockReturnValueOnce({ from: jest.fn().mockReturnThis(), where: jest.fn().mockReturnThis(), limit: jest.fn().mockReturnThis(), for: jest.fn().mockResolvedValue([{ id: "user-1", trialGrantedAt }]) })
+          .mockReturnValueOnce(selectResult([])),
+        insert: jest.fn().mockReturnValue({ values }),
+        update: jest.fn().mockReturnValue({ set: txSet }),
+      };
+      mockDb.transaction.mockImplementation(async callback => callback(tx));
+      return { values, txSet };
+    }
+
+    it("starts a 14 day trial with the trial limits for a new cloud organization when enabled", async () => {
+      process.env.TRIAL_ENABLED = "true";
+      const { values, txSet } = arrangeCreation();
+      const before = Date.now();
+      expect((await POST(request())).status).toBe(200);
+      const trial = values.mock.calls.map(call => call[0]).find(row => row && "expiresAt" in row);
+      expect(trial).toMatchObject({ organizationId: "new-id", maxMonitors: 5, maxStatusPages: 2, queuedCapacity: 5 });
+      expect(txSet).toHaveBeenCalledWith({ trialGrantedAt: trial.trialStartedAt });
+      const days = (trial.expiresAt.getTime() - before) / 86_400_000;
+      expect(days).toBeGreaterThan(13.99);
+      expect(days).toBeLessThan(14.01);
+    });
+
+    it("grants no trial unless the launch switch is on", async () => {
+      delete process.env.TRIAL_ENABLED;
+      const { values, txSet } = arrangeCreation();
+      expect((await POST(request())).status).toBe(200);
+      expect(values.mock.calls.some(call => call[0] && "expiresAt" in call[0])).toBe(false);
+      expect(txSet).not.toHaveBeenCalledWith(expect.objectContaining({ trialGrantedAt: expect.anything() }));
+    });
+
+    it("does not grant another trial after the user's organization was deleted", async () => {
+      process.env.TRIAL_ENABLED = "true";
+      const { values, txSet } = arrangeCreation(new Date("2026-01-01"));
+      expect((await POST(request())).status).toBe(200);
+      expect(values.mock.calls.some(call => call[0] && "expiresAt" in call[0])).toBe(false);
+      expect(txSet).not.toHaveBeenCalledWith(expect.objectContaining({ trialGrantedAt: expect.anything() }));
+    });
+
+    it("never grants a trial for a self-hosted organization", async () => {
+      process.env.TRIAL_ENABLED = "true";
+      (isCloudHosted as jest.Mock).mockReturnValue(false);
+      const { values } = arrangeCreation();
+      await POST(request());
+      expect(values.mock.calls.some(call => call[0] && "expiresAt" in call[0])).toBe(false);
+    });
+  });
 });

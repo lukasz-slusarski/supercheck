@@ -1,9 +1,10 @@
+import { loadProjectEnv } from './project-env.js'
 import { createJiti } from 'jiti'
 import { deepmergeCustom } from 'deepmerge-ts'
 import { existsSync } from 'node:fs'
-import { resolve, dirname } from 'node:path'
+import { resolve, dirname, basename } from 'node:path'
 import { supercheckConfigSchema, type SupercheckConfig } from './schema.js'
-import { CLIError, ConfigNotFoundError, ExitCode } from '../utils/errors.js'
+import { CLIError, ConfigNotFoundError, ConfigurationError, ExitCode } from '../utils/errors.js'
 
 const CONFIG_FILES = [
   'supercheck.config.ts',
@@ -61,7 +62,16 @@ async function loadConfigFile(filePath: string): Promise<unknown> {
     interopDefault: true,
   })
 
-  const mod = await jiti.import(filePath) as Record<string, unknown>
+  let mod: Record<string, unknown>
+  try {
+    mod = await jiti.import(filePath) as Record<string, unknown>
+  } catch (err) {
+    // `init --skip-install` leaves a config that imports the CLI package before it is installed.
+    if (err instanceof Error && /Cannot find (module|package) '@supercheck\/cli'/.test(err.message)) {
+      throw new ConfigurationError(`${basename(filePath)} imports @supercheck/cli, which is not installed here. Run \`npm install\` first.`)
+    }
+    throw new ConfigurationError(`Cannot load ${basename(filePath)}: ${err instanceof Error ? err.message : String(err)}`)
+  }
   return mod.default ?? mod
 }
 
@@ -123,11 +133,15 @@ function validateNoSecrets(config: SupercheckConfig): void {
 export interface LoadConfigOptions {
   cwd?: string
   configPath?: string
+  offline?: boolean
+  allowMissing?: boolean
 }
 
 export interface LoadConfigResult {
   config: SupercheckConfig
   configPath: string | null
+  /** `api.baseUrl` as written in the config files, before SUPERCHECK_URL overrides it; used for the wrong-target guard. */
+  declaredBaseUrl?: string
 }
 
 /**
@@ -142,11 +156,11 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<LoadC
   const cwd = options.cwd ?? process.cwd()
 
   // Load .env file if present (quiet: true suppresses injection logs)
-  const { config: loadEnv } = await import('dotenv')
-  loadEnv({ path: resolve(cwd, '.env'), quiet: true })
+  loadProjectEnv(resolve(cwd, '.env'))
 
   const configPath = resolveConfigPath(cwd, options.configPath)
   if (!configPath) {
+    if (options.offline && options.allowMissing) return { config: { schemaVersion: '1.0', project: { organization: 'local', project: 'local' }, tests: { playwright: { testMatch: '_supercheck_/playwright/**/*.pw.ts', browser: 'chromium' }, k6: { testMatch: '_supercheck_/k6/**/*.k6.ts' } } }, configPath: null }
     throw new ConfigNotFoundError()
   }
 
@@ -159,6 +173,8 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<LoadC
     config = mergeLocalConfig(config, localConfig) as SupercheckConfig
   }
 
+  if (options.offline && !config.project) config = { ...config, project: { organization: 'local', project: 'local' } }
+  const declaredBaseUrl = config.api?.baseUrl
   config = applyEnvOverrides(config)
 
   validateNoSecrets(config)
@@ -166,7 +182,7 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<LoadC
   const parsed = supercheckConfigSchema.safeParse(config)
   if (!parsed.success) {
     const issues = parsed.error.issues
-      .map((i) => `  - ${i.path.join('.')}: ${i.message}`)
+      .map((i) => `  - ${i.path.join('.') || '<root>'}: ${i.message}`)
       .join('\n')
     throw new CLIError(
       `Invalid configuration:\n${issues}`,
@@ -177,6 +193,7 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<LoadC
   return {
     config: parsed.data,
     configPath,
+    declaredBaseUrl,
   }
 }
 

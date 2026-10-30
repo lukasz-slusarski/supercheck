@@ -1,3 +1,5 @@
+jest.mock("@/lib/status-page-subscription-rate-limit", () => ({ allowStatusPageSubscription: jest.fn(async () => true) }));
+jest.mock("next/headers", () => ({ headers: jest.fn(async () => new Headers()) }));
 jest.mock("@/utils/db", () => ({
   db: {
     query: {
@@ -21,6 +23,10 @@ jest.mock("@/lib/webhook-utils", () => ({
   generateWebhookSecret: jest.fn(() => "test-webhook-secret"),
 }));
 
+jest.mock("@/lib/incident-notifications/webhook-verification", () => ({
+  sendWebhookChallenge: jest.fn(async () => ({ verified: true })),
+}));
+
 import { db } from "@/utils/db";
 import { subscribeToStatusPage } from "./subscribe-to-status-page";
 
@@ -33,7 +39,7 @@ describe("subscribeToStatusPage", () => {
     (
       mockDb.query.statusPages.findFirst as unknown as jest.Mock
     ).mockResolvedValue({
-      id: "00000000-0000-0000-0000-000000000123",
+      id: "00000000-0000-4000-8000-000000000123",
       status: "published",
       allowPageSubscribers: true,
       allowIncidentSubscribers: false,
@@ -56,7 +62,7 @@ describe("subscribeToStatusPage", () => {
       values: jest.fn().mockReturnValue({
         returning: jest.fn().mockResolvedValue([
           {
-            id: "00000000-0000-0000-0000-000000000999",
+            id: "00000000-0000-4000-8000-000000000999",
           },
         ]),
       }),
@@ -65,7 +71,7 @@ describe("subscribeToStatusPage", () => {
 
   it("allows non-incident webhook subscriptions when incident subscribers are disabled", async () => {
     const result = await subscribeToStatusPage({
-      statusPageId: "00000000-0000-0000-0000-000000000123",
+      statusPageId: "00000000-0000-4000-8000-000000000123",
       subscriptionMode: "webhook",
       endpoint: "https://example.com/webhooks/status",
       subscribeToAllComponents: true,
@@ -73,13 +79,13 @@ describe("subscribeToStatusPage", () => {
     });
 
     expect(result.success).toBe(true);
-    expect(result.message).toContain("Webhook subscription successful");
+    expect(result.message).toContain("Webhook subscription verified");
     expect(mockDb.insert).toHaveBeenCalled();
   });
 
   it("blocks explicit incident-interest subscriptions when incident subscribers are disabled", async () => {
     const result = await subscribeToStatusPage({
-      statusPageId: "00000000-0000-0000-0000-000000000123",
+      statusPageId: "00000000-0000-4000-8000-000000000123",
       subscriptionMode: "webhook",
       endpoint: "https://example.com/webhooks/status",
       subscribeToAllComponents: true,

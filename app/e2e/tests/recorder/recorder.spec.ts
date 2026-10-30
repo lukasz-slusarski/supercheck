@@ -1,11 +1,13 @@
 import { expect } from '@playwright/test';
 import { test } from '../../fixtures';
+import { waitForHydration } from '../../utils/hydration';
 
 test.describe('Recorder web integration @recorder', () => {
   test('Playground gives an exact install path when the Recorder extension is absent @high @positive', async ({
     page,
   }) => {
     await page.goto('/playground?scriptType=browser', { waitUntil: 'load' });
+    await waitForHydration(page);
     const recordButton = page.getByRole('button', { name: 'Start Recording' });
     await expect(recordButton).toBeVisible();
     await recordButton.click();
@@ -19,6 +21,10 @@ test.describe('Recorder web integration @recorder', () => {
     );
     await expect(installLink).toHaveAttribute('target', '_blank');
     await expect(installLink).toHaveAttribute('rel', 'noopener noreferrer');
+    // Installed-but-unconfigured users need the self-hosted path, not a second install.
+    await expect(dialog.getByText(/demo \/ self-hosted/i)).toBeVisible();
+    await expect(dialog.getByText(new URL(page.url()).origin)).toBeVisible();
+    await expect(dialog.getByRole('button', { name: 'Copy' })).toBeVisible();
   });
 
   test('Recorder extension credential lifecycle is scoped, one-time, and revocable @high @security', async ({

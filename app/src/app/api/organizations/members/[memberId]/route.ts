@@ -1,3 +1,4 @@
+import { isUuid } from "@/lib/uuid";
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/utils/db';
 import { member, user as userTable, projectMembers, projects } from '@/db/schema';
@@ -14,7 +15,10 @@ export async function PUT(
 ) {
   const resolvedParams = await params;
   try {
-    const { userId, organizationId } = await requireUserAuthContext();
+    const { userId, organizationId, isCliAuth } = await requireUserAuthContext();
+    if (isCliAuth) {
+      return NextResponse.json({ error: "Organization administration requires an interactive browser session; CLI tokens are project-scoped" }, { status: 403 });
+    }
     
     if (!organizationId) {
       return NextResponse.json(
@@ -79,7 +83,7 @@ export async function PUT(
     });
 
     if (!parseResult.success) {
-      const firstError = parseResult.error.errors[0];
+      const firstError = parseResult.error.issues[0];
       return NextResponse.json(
         { error: firstError?.message || 'Invalid request data' },
         { status: 400 }
@@ -91,6 +95,7 @@ export async function PUT(
       role === 'project_editor' || role === 'project_admin';
 
     // Prevent changing owner role
+    if (!isUuid((await params).memberId)) return NextResponse.json({ error: "Member not found" }, { status: 404 });
     const existingMember = await db
       .select({
         id: member.userId,
@@ -168,8 +173,17 @@ export async function PUT(
     // SECURITY: Wrap all role update operations in a transaction
     // to prevent partial state (e.g., role updated but project assignments not changed)
     await db.transaction(async (tx) => {
-      // Update member role
-      await tx
+      // Serialize membership changes with leave so a departed user cannot regain assignments.
+      const [lockedMember] = await tx.select({ role: member.role }).from(member)
+        .where(and(eq(member.userId, resolvedParams.memberId), eq(member.organizationId, organizationId)))
+        .for("update");
+      if (!lockedMember) throw new Error('MEMBER_NOT_FOUND');
+      if (lockedMember.role === 'org_owner') throw new Error('MEMBER_OWNER_PROTECTED');
+      if (lockedMember.role === 'org_admin' && orgRole !== Role.ORG_OWNER) {
+        throw new Error('MEMBER_ADMIN_PROTECTED');
+      }
+      // Update member role only after locking and revalidating its current role.
+      const updatedMembers = await tx
         .update(member)
         .set({ 
           role: role
@@ -177,7 +191,8 @@ export async function PUT(
         .where(and(
           eq(member.userId, resolvedParams.memberId),
           eq(member.organizationId, organizationId)
-        ));
+        )).returning({ id: member.id });
+      if (!updatedMembers.length) throw new Error('MEMBER_NOT_FOUND');
 
       // Always reset organization-scoped project assignments for this member first.
       // This keeps role/project state deterministic across all transitions.
@@ -304,6 +319,11 @@ export async function PUT(
       }
     });
   } catch (error) {
+    if (error instanceof Error) {
+      if (error.message === 'MEMBER_NOT_FOUND') return NextResponse.json({ error: 'Member not found' }, { status: 404 });
+      if (error.message === 'MEMBER_OWNER_PROTECTED') return NextResponse.json({ error: 'Cannot change owner role' }, { status: 403 });
+      if (error.message === 'MEMBER_ADMIN_PROTECTED') return NextResponse.json({ error: 'Only organization owners can modify org admin members' }, { status: 403 });
+    }
     if (error instanceof Error && error.message === 'MEMBER_PROJECT_SCOPE_MISMATCH') {
       return NextResponse.json(
         { error: 'One or more selected projects are invalid for this organization' },
@@ -331,7 +351,10 @@ export async function DELETE(
 ) {
   const resolvedParams = await params;
   try {
-    const { userId: currentUserId, organizationId: delOrgId } = await requireUserAuthContext();
+    const { userId: currentUserId, organizationId: delOrgId, isCliAuth } = await requireUserAuthContext();
+    if (isCliAuth) {
+      return NextResponse.json({ error: "Organization administration requires an interactive browser session; CLI tokens are project-scoped" }, { status: 403 });
+    }
     
     if (!delOrgId) {
       return NextResponse.json(
@@ -352,6 +375,7 @@ export async function DELETE(
     }
 
     // Get member details for audit
+    if (!isUuid((await params).memberId)) return NextResponse.json({ error: "Member not found" }, { status: 404 });
     const existingMember = await db
       .select({
         id: member.userId,

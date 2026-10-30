@@ -1,16 +1,82 @@
 import { ApiRequestError, CLIError, ExitCode } from './errors.js'
+import { createJiti } from 'jiti'
 import type { ApiClient } from '../api/client.js'
 
-export type ApiTestType = 'browser' | 'performance' | 'api' | 'database' | 'custom'
+export type ApiTestType =
+  | 'browser'
+  | 'performance'
+  | 'api'
+  | 'database'
+  | 'custom'
 
-const K6_IMPORT_PATTERN = /import\s+.*\s+from\s+['"]k6(?:\/[^'"]*)?['"]/
+// Detection depends on Babel hooks running for every call, including identical scripts.
+const scriptParser = createJiti(import.meta.url, { fsCache: false })
 
-/**
- * Detects whether a script imports any k6 modules.
- * Mirrors the server-side `isK6Script` logic from `k6-validator.ts`.
- */
+type ImportNode = {
+  type: string
+  importKind?: string
+  exportKind?: string
+  source?: { value: string }
+}
+
+/** Parse imports without executing code; jiti is already used for CLI TypeScript. */
+function detectK6Script(script: string): boolean | undefined {
+  let found = false
+  let parsed = false
+  const inspect = (value: string) => {
+    if (value === 'k6' || value.startsWith('k6/')) found = true
+  }
+  try {
+    scriptParser.transform({
+      source: script,
+      filename: 'script.ts',
+      ts: true,
+      babel: {
+        plugins: [
+          () => ({
+            // Inspect the parsed source before TypeScript removes unused value imports.
+            pre(file: { ast: { program: { body: ImportNode[] } } }) {
+              parsed = true
+              for (const node of file.ast.program.body) {
+                if (
+                  node.source &&
+                  node.importKind !== 'type' &&
+                  node.exportKind !== 'type'
+                )
+                  inspect(node.source.value)
+              }
+            },
+            visitor: {
+              CallExpression({
+                node,
+              }: {
+                node: {
+                  callee: { type: string; name?: string }
+                  arguments: { type: string; value?: string }[]
+                }
+              }) {
+                const first = node.arguments[0]
+                if (
+                  node.callee.type === 'Identifier' &&
+                  node.callee.name === 'require' &&
+                  first?.type === 'StringLiteral' &&
+                  typeof first.value === 'string'
+                )
+                  inspect(first.value)
+              },
+            },
+          }),
+        ],
+      },
+    })
+  } catch {
+    return undefined
+  }
+  return parsed ? found : undefined
+}
+
 export function isK6Script(script: string): boolean {
-  return K6_IMPORT_PATTERN.test(script)
+  return detectK6Script(script) === true
 }
 
 /**
@@ -27,7 +93,9 @@ export function validateScriptTypeMatch(
 ): string | undefined {
   if (!script || !declaredType) return undefined
 
-  const scriptIsK6 = isK6Script(script)
+  const scriptIsK6 = detectK6Script(script)
+  // The server (or local runtime in offline mode) reports the actual syntax error.
+  if (scriptIsK6 === undefined) return undefined
 
   if (scriptIsK6 && declaredType !== 'performance') {
     return `Script contains k6 imports but test type is "${declaredType}". k6 scripts must use type "performance".`
@@ -53,7 +121,9 @@ export interface TestValidationResult {
   warnings?: string[]
 }
 
-export function normalizeTestTypeForApi(localType: unknown): ApiTestType | undefined {
+export function normalizeTestTypeForApi(
+  localType: unknown,
+): ApiTestType | undefined {
   if (typeof localType !== 'string') return undefined
 
   const normalized = localType.trim().toLowerCase()
@@ -76,6 +146,7 @@ export function normalizeTestTypeForApi(localType: unknown): ApiTestType | undef
 }
 
 function formatValidationError(responseBody: unknown): string {
+  if (typeof responseBody === 'string') return responseBody || 'Validation failed'
   if (responseBody && typeof responseBody === 'object') {
     const body = responseBody as Record<string, unknown>
     if (typeof body.error === 'string') {
@@ -88,7 +159,7 @@ function formatValidationError(responseBody: unknown): string {
     }
   }
 
-  return 'Validation failed'
+  return responseBody === undefined ? 'Validation failed' : JSON.stringify(responseBody)
 }
 
 export async function validateScripts(
@@ -99,22 +170,27 @@ export async function validateScripts(
 
   for (const input of inputs) {
     if (!input.script || input.script.trim().length === 0) {
-      throw new CLIError(`Test "${input.name}" has no script content`, ExitCode.ConfigError)
+      throw new CLIError(
+        `Test "${input.name}" has no script content`,
+        ExitCode.ConfigError,
+      )
     }
 
     try {
-      const { data } = await client.post<{ valid: boolean; warnings?: string[] }>(
-        '/api/validate-script',
-        {
-          script: input.script,
-          testType: input.testType,
-        },
-      )
+      const { data } = await client.post<{
+        valid: boolean
+        warnings?: string[]
+      }>('/api/validate-script', {
+        script: input.script,
+        testType: input.testType,
+      })
 
       results.push({
         name: input.name,
         valid: data?.valid === true,
-        ...(!data?.valid ? { error: `Unexpected validation response: ${JSON.stringify(data)}` } : {}),
+        ...(!data?.valid
+          ? { error: `Unexpected validation response: ${JSON.stringify(data)}` }
+          : {}),
         warnings: data?.warnings,
       })
     } catch (err) {
@@ -122,7 +198,7 @@ export async function validateScripts(
         results.push({
           name: input.name,
           valid: false,
-          error: `${err.message}: ${formatValidationError(err.responseBody)}${err.responseBody === undefined ? '' : ` — ${typeof err.responseBody === 'string' ? err.responseBody : JSON.stringify(err.responseBody)}`}`,
+          error: `${err.message}: ${formatValidationError(err.responseBody)}`,
         })
         continue
       }

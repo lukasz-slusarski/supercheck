@@ -1,8 +1,14 @@
+import { isUuid } from "@/lib/uuid";
+import { getExecutionPolicy, ExecutionWorkloadError, type ExecutionPolicy } from "@/lib/execution/execution-policy";
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/utils/db";
 import { tests, runs, type K6Location } from "@/db/schema";
-import { resolveProjectK6Location } from "@/lib/location-registry";
-import { eq } from "drizzle-orm";
+import {
+  assertProjectSupportsBrowser,
+  LocationWorkloadUnavailableError,
+  resolveProjectK6Location,
+} from "@/lib/location-registry";
+import { eq, and, inArray } from "drizzle-orm";
 import { checkPermissionWithContext } from "@/lib/rbac/middleware";
 import { requireAuthContext, isAuthError } from "@/lib/auth-context";
 import {
@@ -14,7 +20,7 @@ import {
 import { validateK6Script } from "@/lib/k6-validator";
 import { resolveProjectVariables } from "@/lib/variable-resolver";
 import { randomUUID } from "crypto";
-import { SubscriptionService, SubscriptionAccessDeniedError } from "@/lib/services/subscription-service";
+import { SubscriptionAccessDeniedError } from "@/lib/services/subscription-service";
 import { polarUsageService } from "@/lib/services/polar-usage.service";
 import { buildBillingBlockedResponse } from "@/lib/billing-errors";
 import { checkExecutionRateLimit } from "@/lib/execution-rate-limiter";
@@ -23,6 +29,7 @@ import {
   buildExecutionQueueErrorResponse,
   buildExecutionRateLimitResponse,
   getSafeExecutionQueueErrorDetails,
+  buildExecutionPolicyFailureResponse,
 } from "@/lib/execution-api-responses";
 import { requireSameOriginRequest } from "@/lib/security/same-origin";
 declare const Buffer: {
@@ -61,42 +68,20 @@ export async function POST(request: NextRequest, context: ExecuteContext) {
       );
     }
 
+    if (!isUuid(testId)) return NextResponse.json({ error: "Test not found" }, { status: 404 });
     const rateLimitResponse = buildExecutionRateLimitResponse(
       await checkExecutionRateLimit(userId, organizationId),
     );
     if (rateLimitResponse) return rateLimitResponse;
 
-    // Check subscription plan limits
-    const subscriptionService = new SubscriptionService();
+    let executionPolicy: ExecutionPolicy;
     try {
-      // First check if user has an active subscription (defense-in-depth)
-      await subscriptionService.blockUntilSubscribed(organizationId);
-      // Then validate the Polar customer still exists
-      await subscriptionService.requireValidPolarCustomer(organizationId);
-      // Finally get the plan to check limits
-      await subscriptionService.getOrganizationPlan(organizationId);
+      executionPolicy = await getExecutionPolicy(organizationId);
     } catch (error) {
-      if (!(error instanceof SubscriptionAccessDeniedError)) {
-        console.error("[Test Execute API] Subscription validation failed:", error);
-      }
-      return NextResponse.json(
-        {
-          error: error instanceof SubscriptionAccessDeniedError
-            ? error.message
-            : "Subscription validation failed. Please try again later.",
-        },
-        { status: error instanceof SubscriptionAccessDeniedError ? 402 : 500 }
-      );
+      return buildExecutionPolicyFailureResponse(error);
     }
-
-    // BILLING: Check spending limit hard-stop before allowing execution
-    const spendingBlock = await polarUsageService.shouldBlockUsage(organizationId);
-    if (spendingBlock.blocked) {
-      return NextResponse.json(
-        buildBillingBlockedResponse(spendingBlock.reason),
-        { status: 402 }
-      );
-    }
+    const spendingBlock = executionPolicy.tier === "paid" ? await polarUsageService.shouldBlockUsage(organizationId) : { blocked: false };
+    if (spendingBlock.blocked) return NextResponse.json(buildBillingBlockedResponse(spendingBlock.reason), { status: 402 });
 
     // Fetch test
     const test = await db.query.tests.findFirst({
@@ -123,6 +108,18 @@ export async function POST(request: NextRequest, context: ExecuteContext) {
         typeof body.location === "string" ? body.location : undefined;
     } catch {
       // Body might be empty, use default
+    }
+
+
+    if (test.type !== "performance") {
+      try {
+        await assertProjectSupportsBrowser(project.id);
+      } catch (error) {
+        // Only the expected error is user-facing; anything else (e.g. a database
+        // failure) must not leak details and is handled by the route's outer catch.
+        if (!(error instanceof LocationWorkloadUnavailableError)) throw error;
+        return NextResponse.json({ error: error.message }, { status: 400 });
+      }
     }
 
     // Resolve location and validate k6 script only for performance tests
@@ -241,7 +238,7 @@ export async function POST(request: NextRequest, context: ExecuteContext) {
       await db
         .update(runs)
         .set({ status: queueStatus })
-        .where(eq(runs.id, run.id));
+        .where(and(eq(runs.id, run.id), inArray(runs.status, ['queued', 'running'])));
     } catch (statusError) {
       console.error(
         `[Test Execute API] Failed to persist admitted run status for ${run.id}:`,
@@ -273,7 +270,7 @@ export async function POST(request: NextRequest, context: ExecuteContext) {
             completedAt: new Date(),
             errorDetails: getSafeExecutionQueueErrorDetails(error),
           })
-          .where(eq(runs.id, createdRunId));
+          .where(and(eq(runs.id, createdRunId), inArray(runs.status, ['queued', 'running'])));
       } catch (statusError) {
         console.error(
           `[Test Execute API] Failed to finalize rejected run ${createdRunId}:`,

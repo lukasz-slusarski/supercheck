@@ -31,12 +31,23 @@ import {
   publishStatusPage,
   unpublishStatusPage,
 } from "@/actions/publish-status-page";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { toast } from "sonner";
 import { useRouter } from "next/navigation";
 import { getPublicStatusPageUrl } from "@/lib/domain-utils";
 import { DataTable } from "@/components/monitors/data-table";
 import { statusPageColumns } from "@/components/monitors/status-page-columns";
-import type { Monitor } from "@/components/monitors/schema";
+import { toOverviewMonitor } from "./overview-monitor";
+import type { StatusPageMonitor } from "@/hooks/use-status-pages";
 
 type StatusPage = {
   id: string;
@@ -71,14 +82,6 @@ type StatusPage = {
   updatedAt: Date | null;
 };
 
-type StatusPageMonitor = {
-  id: string;
-  name: string;
-  type: string;
-  status?: string;
-  target?: string;
-};
-
 type Component = {
   id: string;
   name: string;
@@ -94,6 +97,8 @@ type Component = {
   createdAt: Date | null;
   updatedAt: Date | null;
 };
+
+type PendingAction = "unpublish" | "archive";
 
 type StatusPageDetailProps = {
   statusPage: StatusPage;
@@ -122,6 +127,8 @@ export function StatusPageDetail({
 }: StatusPageDetailProps) {
   const router = useRouter();
   const [isPublishing, setIsPublishing] = useState(false);
+  const [pendingAction, setPendingAction] = useState<PendingAction | null>(null);
+  const [confirmAction, setConfirmAction] = useState<PendingAction | null>(null);
   const [appUrl, setAppUrl] = useState<string>();
 
   useEffect(() => {
@@ -176,29 +183,77 @@ export function StatusPageDetail({
     }
   };
 
-  const handleUnpublish = async () => {
-    setIsPublishing(true);
+  const handleDestructiveAction = async (action: PendingAction) => {
+    const isArchive = action === "archive";
+    setPendingAction(action);
     try {
-      const result = await unpublishStatusPage(statusPage.id);
+      const result = await unpublishStatusPage(statusPage.id, isArchive);
       if (result.success) {
-        toast.success("Status page unpublished successfully", {
-          description: "Your status page is no longer publicly accessible",
-        });
+        toast.success(
+          isArchive
+            ? "Status page archived"
+            : "Status page unpublished successfully",
+          {
+            description: isArchive
+              ? "The page is no longer publicly accessible. Its records stay in the dashboard."
+              : "Your status page is no longer publicly accessible and has been returned to draft.",
+          },
+        );
         router.refresh();
-      } else {
-        toast.error("Failed to unpublish status page", {
-          description: result.message,
-        });
+        return true;
       }
+
+      toast.error(
+        isArchive
+          ? "Failed to archive status page"
+          : "Failed to unpublish status page",
+        { description: result.message },
+      );
+      return false;
     } catch (error) {
-      console.error("Error unpublishing status page:", error);
-      toast.error("Failed to unpublish status page", {
-        description: "An unexpected error occurred",
-      });
+      console.error(
+        `Error ${isArchive ? "archiving" : "unpublishing"} status page:`,
+        error,
+      );
+      toast.error(
+        isArchive
+          ? "Failed to archive status page"
+          : "Failed to unpublish status page",
+        { description: "An unexpected error occurred" },
+      );
+      return false;
     } finally {
-      setIsPublishing(false);
+      setPendingAction(null);
     }
   };
+
+  const runConfirmedAction = async () => {
+    const action = confirmAction;
+    if (!action || pendingAction || !canUpdate) {
+      return;
+    }
+
+    const succeeded = await handleDestructiveAction(action);
+
+    if (succeeded) {
+      setConfirmAction(null);
+    }
+  };
+
+  const confirmCopy =
+    confirmAction === "archive"
+      ? {
+          title: `Archive "${statusPage.name}"?`,
+          description:
+            "Archiving takes this page off the public internet and marks it archived. Components, incidents, and subscribers are kept, and you can publish the page again later if you need it live.",
+          actionLabel: "Archive page",
+        }
+      : {
+          title: `Unpublish "${statusPage.name}"?`,
+          description:
+            "Unpublishing takes this page offline immediately. Visitors will see a not-found page until you publish it again. Components, incidents, and subscribers are kept.",
+          actionLabel: "Unpublish page",
+        };
 
   const getStatusBadgeColor = (status: string) => {
     switch (status) {
@@ -219,7 +274,7 @@ export function StatusPageDetail({
         <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4 mb-6">
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-3 mb-2 flex-wrap">
-              <h1 className="text-xl sm:text-2xl font-semibold truncate">{statusPage.name}</h1>
+              <h1 className="min-w-0 max-w-full truncate text-xl sm:text-2xl font-semibold">{statusPage.name}</h1>
               <Badge
                 className={`text-xs px-2 py-1 rounded-md ${getStatusBadgeColor(
                   statusPage.status
@@ -242,7 +297,7 @@ export function StatusPageDetail({
             {publicStatusPageUrl ? (
               <div className="flex items-center gap-2 text-sm text-muted-foreground mt-3 min-w-0">
                 <Tally4 className="h-4 w-4 flex-shrink-0 !text-green-600" />
-                <span className="font-mono text-xs sm:text-sm truncate">
+                <span className="min-w-0 truncate font-mono text-xs sm:text-sm">
                   {publicStatusPageUrl}
                 </span>
                 <Button
@@ -256,7 +311,7 @@ export function StatusPageDetail({
               </div>
             ) : null}
           </div>
-          <div className="flex gap-2 sm:gap-3 flex-shrink-0">
+          <div className="flex flex-wrap gap-2 sm:flex-shrink-0 sm:justify-end sm:gap-3">
             <Button
               asChild
               variant="outline"
@@ -269,17 +324,34 @@ export function StatusPageDetail({
                 <span className="sm:hidden">View</span>
               </Link>
             </Button>
+            {statusPage.status !== "archived" && (
+              <Button
+                variant="destructive"
+                disabled={isPublishing || pendingAction !== null || !canUpdate}
+                onClick={() => setConfirmAction("archive")}
+                title={
+                  !canUpdate ? "You don't have permission to archive" : undefined
+                }
+              >
+                {pendingAction === "archive" ? (
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                ) : null}
+                Archive
+              </Button>
+            )}
             {statusPage.status === "published" ? (
               <Button
                 variant="destructive"
                 size="default"
-                onClick={handleUnpublish}
-                disabled={isPublishing || !canUpdate}
+                onClick={() => setConfirmAction("unpublish")}
+                disabled={
+                  isPublishing || pendingAction !== null || !canUpdate
+                }
                 title={
                   !canUpdate ? "You don't have permission to unpublish" : ""
                 }
               >
-                {isPublishing ? (
+                {pendingAction === "unpublish" ? (
                   <Loader2 className="h-4 w-4 mr-2 animate-spin" />
                 ) : (
                   <EyeOff className="h-4 w-4 mr-2" />
@@ -305,24 +377,62 @@ export function StatusPageDetail({
           </div>
         </div>
 
+        <AlertDialog
+          open={confirmAction !== null}
+          onOpenChange={(open) => {
+            if (!open && !pendingAction) {
+              setConfirmAction(null);
+            }
+          }}
+        >
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>{confirmCopy.title}</AlertDialogTitle>
+              <AlertDialogDescription>
+                {confirmCopy.description}
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel disabled={pendingAction !== null}>
+                Cancel
+              </AlertDialogCancel>
+              <AlertDialogAction
+                className="bg-destructive text-white hover:bg-destructive/90 focus-visible:ring-destructive/30"
+                disabled={pendingAction !== null || !canUpdate}
+                onClick={(event) => {
+                  // Keep the dialog open so the pending state is visible while
+                  // the public page is taken offline.
+                  event.preventDefault();
+                  void runConfirmedAction();
+                }}
+              >
+                {pendingAction ? (
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                ) : null}
+                {confirmCopy.actionLabel}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+
         <TabsList className="grid w-full grid-cols-5 lg:w-auto lg:inline-flex">
-          <TabsTrigger value="overview" className="flex items-center gap-2">
+          <TabsTrigger value="overview" aria-label="Overview" className="flex items-center gap-2">
             <LayoutDashboard className="h-4 w-4" />
             <span className="hidden sm:inline">Overview</span>
           </TabsTrigger>
-          <TabsTrigger value="components" className="flex items-center gap-2">
+          <TabsTrigger value="components" aria-label="Components" className="flex items-center gap-2">
             <Layers className="h-4 w-4" />
             <span className="hidden sm:inline">Components</span>
           </TabsTrigger>
-          <TabsTrigger value="incidents" className="flex items-center gap-2">
+          <TabsTrigger value="incidents" aria-label="Incidents" className="flex items-center gap-2">
             <OctagonAlert className="h-4 w-4" />
             <span className="hidden sm:inline">Incidents</span>
           </TabsTrigger>
-          <TabsTrigger value="subscribers" className="flex items-center gap-2">
+          <TabsTrigger value="subscribers" aria-label="Subscribers" className="flex items-center gap-2">
             <Users className="h-4 w-4" />
             <span className="hidden sm:inline">Subscribers</span>
           </TabsTrigger>
-          <TabsTrigger value="settings" className="flex items-center gap-2">
+          <TabsTrigger value="settings" aria-label="Settings" className="flex items-center gap-2">
             <Settings2 className="h-4 w-4" />
             <span className="hidden sm:inline">Settings</span>
           </TabsTrigger>
@@ -330,15 +440,15 @@ export function StatusPageDetail({
 
         <TabsContent value="overview" className="space-y-4">
           {/* Stats Cards */}
-          <div className="grid gap-4 md:grid-cols-4">
+          <div className="grid grid-cols-1 gap-3 min-[380px]:grid-cols-2 lg:grid-cols-4 lg:gap-4">
             <Card className="overflow-hidden">
-              <CardContent className="p-6">
-                <div className="flex items-center gap-4">
-                  <div className="flex items-center justify-center w-12 h-12 rounded-lg bg-blue-100 dark:bg-blue-900/50">
+              <CardContent className="p-4 lg:p-6">
+                <div className="flex items-center gap-3 lg:gap-4">
+                  <div className="flex items-center justify-center w-10 h-10 rounded-lg lg:w-12 lg:h-12 bg-blue-100 dark:bg-blue-900/50">
                     <Layers className="h-6 w-6 text-blue-600 dark:text-blue-400" />
                   </div>
-                  <div>
-                    <div className="text-2xl font-bold">
+                  <div className="min-w-0">
+                    <div className="text-xl font-bold lg:text-2xl">
                       {components.length}
                     </div>
                     <div className="text-sm text-muted-foreground">
@@ -349,13 +459,13 @@ export function StatusPageDetail({
               </CardContent>
             </Card>
             <Card className="overflow-hidden">
-              <CardContent className="p-6">
-                <div className="flex items-center gap-4">
-                  <div className="flex items-center justify-center w-12 h-12 rounded-lg bg-orange-100 dark:bg-orange-900/50">
+              <CardContent className="p-4 lg:p-6">
+                <div className="flex items-center gap-3 lg:gap-4">
+                  <div className="flex items-center justify-center w-10 h-10 rounded-lg lg:w-12 lg:h-12 bg-orange-100 dark:bg-orange-900/50">
                     <OctagonAlert className="h-6 w-6 text-orange-500 dark:text-orange-400" />
                   </div>
-                  <div>
-                    <div className="text-2xl font-bold">{stats?.activeIncidents ?? 0}</div>
+                  <div className="min-w-0">
+                    <div className="text-xl font-bold lg:text-2xl">{stats?.activeIncidents ?? 0}</div>
                     <div className="text-sm text-muted-foreground">
                       Active Incidents
                     </div>
@@ -364,13 +474,13 @@ export function StatusPageDetail({
               </CardContent>
             </Card>
             <Card className="overflow-hidden">
-              <CardContent className="p-6">
-                <div className="flex items-center gap-4">
-                  <div className="flex items-center justify-center w-12 h-12 rounded-lg bg-green-100 dark:bg-green-900/50">
+              <CardContent className="p-4 lg:p-6">
+                <div className="flex items-center gap-3 lg:gap-4">
+                  <div className="flex items-center justify-center w-10 h-10 rounded-lg lg:w-12 lg:h-12 bg-green-100 dark:bg-green-900/50">
                     <Users className="h-6 w-6 text-green-600 dark:text-green-400" />
                   </div>
-                  <div>
-                    <div className="text-2xl font-bold">{stats?.subscribers ?? 0}</div>
+                  <div className="min-w-0">
+                    <div className="text-xl font-bold lg:text-2xl">{stats?.subscribers ?? 0}</div>
                     <div className="text-sm text-muted-foreground">
                       Subscribers
                     </div>
@@ -379,9 +489,9 @@ export function StatusPageDetail({
               </CardContent>
             </Card>
             <Card className="overflow-hidden">
-              <CardContent className="p-6">
-                <div className="flex items-center gap-4">
-                  <div className={`flex items-center justify-center w-12 h-12 rounded-lg ${
+              <CardContent className="p-4 lg:p-6">
+                <div className="flex items-center gap-3 lg:gap-4">
+                  <div className={`flex items-center justify-center w-10 h-10 rounded-lg lg:w-12 lg:h-12 ${
                     (stats?.failedMonitors ?? 0) > 0
                       ? "bg-red-100 dark:bg-red-900/50"
                       : "bg-gray-100 dark:bg-gray-800/50"
@@ -392,8 +502,8 @@ export function StatusPageDetail({
                         : "text-gray-400 dark:text-gray-500"
                     }`} />
                   </div>
-                  <div>
-                    <div className="text-2xl font-bold">{stats?.failedMonitors ?? 0}</div>
+                  <div className="min-w-0">
+                    <div className="text-xl font-bold lg:text-2xl">{stats?.failedMonitors ?? 0}</div>
                     <div className="text-sm text-muted-foreground">
                       Failed Monitors
                     </div>
@@ -405,7 +515,7 @@ export function StatusPageDetail({
 
           {/* Linked Monitors Section */}
           <Card>
-            <CardContent className="p-6">
+            <CardContent className="p-4 lg:p-6">
               <div className="flex items-center justify-between mb-4">
                 <div className="flex items-center gap-2">
                   <Activity className="h-5 w-5 text-muted-foreground" />
@@ -450,44 +560,31 @@ export function StatusPageDetail({
                   </p>
                 </div>
               ) : (
-                <DataTable
-                  columns={statusPageColumns}
-                  data={(() => {
-                    // Collect all monitors from all components
-                    const allMonitors = components.flatMap((c) =>
-                      c.monitors.map(
-                        (monitor) =>
-                          ({
-                            ...monitor,
-                            id: monitor.id,
-                            name: monitor.name,
-                            type: monitor.type,
-                            status: monitor.status || "pending",
-                            target: monitor.target || "", // Use the target field from monitor data
-                            frequencyMinutes: 5, // Required field but not available in StatusPageMonitor
-                            enabled: true, // Required field but not available in StatusPageMonitor
-                            createdAt: new Date().toISOString(), // Required field but not available in StatusPageMonitor
-                            updatedAt: new Date().toISOString(), // Required field but not available in StatusPageMonitor
-                            componentName: c.name, // Add component name for reference
-                          }) as Monitor & { componentName: string }
-                      )
-                    );
+                <div className="overflow-x-auto">
+                  <DataTable
+                    columns={statusPageColumns}
+                    data={(() => {
+                      // Collect all monitors from all components
+                      const allMonitors = components.flatMap((c) =>
+                        c.monitors.map((monitor) => toOverviewMonitor(monitor, c.name))
+                      );
 
-                    // Filter out duplicate monitors by ID
-                    const uniqueMonitors = allMonitors.filter(
-                      (monitor, index, self) =>
-                        index === self.findIndex((m) => m.id === monitor.id)
-                    );
+                      // Filter out duplicate monitors by ID
+                      const uniqueMonitors = allMonitors.filter(
+                        (monitor, index, self) =>
+                          index === self.findIndex((m) => m.id === monitor.id)
+                      );
 
-                    return uniqueMonitors;
-                  })()}
-                  isLoading={false}
-                  onRowClick={(row) =>
-                    router.push(`/monitors/${row.original.id}`)
-                  }
-                  hideToolbar={true}
-                  pageSize={5}
-                />
+                      return uniqueMonitors;
+                    })()}
+                    isLoading={false}
+                    onRowClick={(row) =>
+                      router.push(`/monitors/${row.original.id}`)
+                    }
+                    hideToolbar={true}
+                    pageSize={5}
+                  />
+                </div>
               )}
             </CardContent>
           </Card>

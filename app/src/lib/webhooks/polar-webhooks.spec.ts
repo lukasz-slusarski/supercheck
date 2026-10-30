@@ -1,3 +1,4 @@
+jest.mock("@/lib/execution/trial-lifecycle", () => ({ restoreTrialSuspensions: jest.fn().mockResolvedValue({ monitorsResumed: 0, statusPagesRestored: 0 }) }));
 jest.mock("@/lib/services/subscription-service", () => ({
   subscriptionService: {
     updateSubscription: jest.fn(),
@@ -108,12 +109,12 @@ describe("Polar webhook helpers", () => {
     (db.update as jest.Mock).mockReturnValue({ set });
     await handleCustomerCreated({ data: {
       id: "customer-a", externalId: "organization:org-a",
-      metadata: { referenceId: "org-a", userId: "owner-a" },
+      metadata: { referenceId: "org-a", userId: "0198a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a01" },
     } });
     expect(db.query.member.findFirst).toHaveBeenCalledWith(expect.objectContaining({
       where: { op: "and", args: [
         { op: "eq", left: "member.organizationId", right: "org-a" },
-        { op: "eq", left: "member.userId", right: "owner-a" },
+        { op: "eq", left: "member.userId", right: "0198a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a01" },
         { op: "eq", left: "member.role", right: "org_owner" },
       ] },
     }));
@@ -125,7 +126,7 @@ describe("Polar webhook helpers", () => {
       { organizationId: "org-a" }, { organizationId: "org-b" },
     ]);
     await handleCustomerCreated({ type: "customer.created", data: {
-      id: "legacy-customer", externalId: "owner-a",
+      id: "legacy-customer", externalId: "0198a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a01",
     } });
     expect(db.update).not.toHaveBeenCalled();
     expect(db.query.organization.findFirst).not.toHaveBeenCalled();
@@ -342,6 +343,40 @@ describe("Polar webhook helpers", () => {
       },
     );
 
+    it("restores what the trial end paused once the organization subscribes", async () => {
+      const { restoreTrialSuspensions } = jest.requireMock("@/lib/execution/trial-lifecycle");
+      restoreTrialSuspensions.mockClear();
+      mockWebhookClaim();
+      (db.query.organization.findFirst as jest.Mock).mockResolvedValue({
+        id: "org_123", subscriptionPlan: null, subscriptionStatus: "none", subscriptionId: null, polarCustomerId: "cus_123",
+        usagePeriodStart: null, usagePeriodEnd: null,
+      });
+      (subscriptionService.resetUsageCountersWithDates as jest.Mock).mockResolvedValue(true);
+      await handleSubscriptionActive({ id: "evt_active_restore", type: "subscription.active",
+        data: { id: "sub_new", status: "active", product_id: "prod_plus", customer_id: "cus_123",
+          current_period_start: "2026-06-01T00:00:00Z", current_period_end: "2026-07-01T00:00:00Z" },
+      });
+      expect(restoreTrialSuspensions).toHaveBeenCalledWith("org_123", expect.anything());
+    });
+
+    it("still completes the activation when restoring trial resources fails", async () => {
+      const { restoreTrialSuspensions } = jest.requireMock("@/lib/execution/trial-lifecycle");
+      restoreTrialSuspensions.mockRejectedValueOnce(new Error("database unavailable"));
+      const log = jest.spyOn(console, "error").mockImplementation(() => undefined);
+      mockWebhookClaim();
+      (db.query.organization.findFirst as jest.Mock).mockResolvedValue({
+        id: "org_123", subscriptionPlan: null, subscriptionStatus: "none", subscriptionId: null, polarCustomerId: "cus_123",
+        usagePeriodStart: null, usagePeriodEnd: null,
+      });
+      (subscriptionService.resetUsageCountersWithDates as jest.Mock).mockResolvedValue(true);
+      await expect(handleSubscriptionActive({ id: "evt_active_restore_fail", type: "subscription.active",
+        data: { id: "sub_new", status: "active", product_id: "prod_plus", customer_id: "cus_123",
+          current_period_start: "2026-06-01T00:00:00Z", current_period_end: "2026-07-01T00:00:00Z" },
+      })).resolves.toBeUndefined();
+      expect(subscriptionService.updateSubscription).toHaveBeenCalled();
+      log.mockRestore();
+    });
+
     it("applies an active snapshot's changed product without resetting same-period usage", async () => {
       mockWebhookClaim();
       (db.query.organization.findFirst as jest.Mock).mockResolvedValue({
@@ -462,7 +497,7 @@ describe("Polar webhook helpers", () => {
             id: "sub_123",
             product_id: "prod_plus",
             customer_id: "cus_123",
-            metadata: { referenceId: "org_123", userId: "user_owner" },
+            metadata: { referenceId: "org_123", userId: "0198a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a2b" },
           },
         }),
       ).rejects.toThrow("customer changed while processing webhook");
@@ -610,6 +645,15 @@ describe("Polar webhook helpers", () => {
       expect(write.subscriptionStatus).toBe(expected);
       if (expected === "none") expect(write.subscriptionPlan).toBeNull();
       else expect(write).not.toHaveProperty("subscriptionPlan");
+    });
+
+    it("treats a canceled snapshot without product_id as retaining its current plan", async () => {
+      mockWebhookClaim();
+      (db.query.organization.findFirst as jest.Mock).mockResolvedValue({
+        id: "org_123", subscriptionPlan: "pro", subscriptionStatus: "canceled", subscriptionId: "sub_123", polarCustomerId: "cus_123",
+      });
+      await handleSubscriptionCanceled({ id: "evt_cancel_no_product", type: "subscription.canceled", data: { id: "sub_123", status: "active", cancel_at_period_end: true, customer_id: "cus_123" } });
+      expect(runOrderedPolarEvent).toHaveBeenCalledWith(expect.objectContaining({ snapshot: { status: "canceled", plan: "pro" } }), expect.any(Function));
     });
 
     it("marks subscriptions past_due from the explicit Polar event", async () => {

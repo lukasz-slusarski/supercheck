@@ -17,6 +17,8 @@ import { z } from "zod";
 
 import {
   alertHistory,
+  incidents as statusPageIncidents,
+  statusPages,
   jobs,
   monitors,
   sreAlertEvents,
@@ -192,6 +194,7 @@ export type SreIncidentChatHistory = {
 };
 
 export type SreIncidentDetail = {
+  publicIncident?: { id: string; statusPageId: string } | null;
   incident: SreIncidentListItem & {
     rootCauseSummary: string | null;
     confidenceScore: string | null;
@@ -489,7 +492,7 @@ function formatValidationErrors(error: z.ZodError) {
   const flattened = error.flatten().fieldErrors;
   return Object.fromEntries(
     Object.entries(flattened).filter(
-      ([, errors]) => errors && errors.length > 0,
+      ([, errors]) => Array.isArray(errors) && errors.length > 0,
     ),
   ) as Record<string, string[]>;
 }
@@ -757,7 +760,8 @@ export async function getSreIncidentDetails(
         title: sreIncidents.title,
         severity: sreIncidents.severity,
         status: sreIncidents.status,
-        primaryServiceId: sreIncidents.primaryServiceId,
+        statusPageIncidentId: sreIncidents.statusPageIncidentId,
+      primaryServiceId: sreIncidents.primaryServiceId,
         primaryServiceName: sreServices.name,
         createdAt: sreIncidents.createdAt,
         updatedAt: sreIncidents.updatedAt,
@@ -976,10 +980,13 @@ export async function getSreIncidentDetails(
       ),
     );
     const chatHistory = chatHistories[0] ?? null;
+    const [publicIncident] = incident.statusPageIncidentId ? await db.select({ id: statusPageIncidents.id, statusPageId: statusPageIncidents.statusPageId }).from(statusPageIncidents).innerJoin(statusPages, eq(statusPages.id, statusPageIncidents.statusPageId)).where(and(eq(statusPageIncidents.id, incident.statusPageIncidentId), eq(statusPages.organizationId, organizationId), eq(statusPages.projectId, project.id))) : [];
+
 
     return {
       success: true,
       detail: {
+        publicIncident: publicIncident ?? null,
         incident: {
           ...incident,
           evidenceCount: evidence.length,
@@ -1281,6 +1288,10 @@ export async function updateSreIncident(
             parsed.data.status === "resolved"
               ? (current.resolvedAt ?? now)
               : null,
+          // A reopened incident is no longer verified.
+          ...(parsed.data.status !== "resolved" && current.status === "resolved"
+            ? { verifiedAt: null }
+            : {}),
           updatedAt: now,
         })
         .where(
@@ -1288,6 +1299,8 @@ export async function updateSreIncident(
             eq(sreIncidents.id, parsed.data.id),
             eq(sreIncidents.organizationId, organizationId),
             eq(sreIncidents.projectId, project.id),
+            // Optimistic guard: fail if a concurrent resolve/update changed the status since we read it.
+            eq(sreIncidents.status, current.status),
           ),
         )
         .returning({
@@ -1297,7 +1310,7 @@ export async function updateSreIncident(
         });
 
       if (!updatedIncident) {
-        throw new Error("Incident was updated or deleted by another request");
+        return null;
       }
 
       await tx.insert(sreIncidentTimelineEvents).values({
@@ -1325,6 +1338,10 @@ export async function updateSreIncident(
 
       return updatedIncident;
     });
+
+    if (!incident) {
+      return { success: false, error: "Incident changed by another request — reload and try again" };
+    }
 
     await logAuditEvent({
       userId,
@@ -1517,7 +1534,17 @@ export async function createSreIncidentFromAlert(
           sreIncidents,
           eq(sreIncidentAlerts.incidentId, sreIncidents.id),
         )
-        .where(eq(sreIncidentAlerts.alertEventId, alertEvent.id))
+        .where(
+          and(
+            eq(sreIncidentAlerts.alertEventId, alertEvent.id),
+            // Resolved incidents only stop absorbing the alert when they were resolved
+            // before this firing; a queued retry must not open a second incident.
+            or(
+              ne(sreIncidents.status, "resolved"),
+              gte(sreIncidents.resolvedAt, firedAt),
+            ),
+          ),
+        )
         .orderBy(desc(sreIncidents.createdAt))
         .limit(1);
 

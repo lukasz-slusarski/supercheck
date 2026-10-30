@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  NODE_VERSION: "22"
+  NODE_VERSION: "24"
 
 # Explicit permissions following least-privilege principle
 permissions:
@@ -75,6 +75,9 @@ jobs:
             exit 1
           fi
 
+          # The journal must agree with the files even when a change only touches meta/ (no new .sql file).
+          node app/scripts/check-migration-safety.js --journal app/src/db/migrations
+
           if [ "${#migrations[@]}" -eq 0 ]; then
             echo "No new migrations."
             exit 0
@@ -86,6 +89,30 @@ jobs:
     name: App Quality Checks
     runs-on: ubuntu-latest
     timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: supercheck_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6381:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
 
     steps:
       - name: Checkout code
@@ -103,11 +130,11 @@ jobs:
         run: npm ci --prefer-offline --no-audit
 
       - name: Restore Jest cache
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: app/.jest-cache
-          key: node-v22-jest-app-${{ hashFiles('app/jest.config.js', 'app/package-lock.json') }}
-          restore-keys: node-v22-jest-app-
+          key: node-v24-jest-app-${{ hashFiles('app/jest.config.js', 'app/package-lock.json') }}
+          restore-keys: node-v24-jest-app-
 
       - name: Type check
         working-directory: ./app
@@ -122,14 +149,22 @@ jobs:
         run: npm run test:cov -- --maxWorkers=2 --cacheDirectory=.jest-cache
         env:
           NODE_ENV: test
+          TEST_REDIS_URL: redis://localhost:6381
 
       - name: Upload coverage
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
           name: app-coverage
           path: app/coverage
           retention-days: 7
+
+      - name: Run database integration tests
+        working-directory: ./app
+        run: npm run test:db
+        env:
+          NODE_ENV: test
+          TEST_DATABASE_URL: postgresql://postgres@localhost:5432/supercheck_test
 
       - name: Build check
         working-directory: ./app
@@ -156,6 +191,16 @@ jobs:
           --health-timeout 5s
           --health-retries 10
 
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - name: Checkout code
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -172,11 +217,11 @@ jobs:
         run: npm ci --prefer-offline --no-audit
 
       - name: Restore Jest cache
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: worker/.jest-cache
-          key: node-v22-jest-worker-${{ hashFiles('worker/jest.config.js', 'worker/package-lock.json') }}
-          restore-keys: node-v22-jest-worker-
+          key: node-v24-jest-worker-${{ hashFiles('worker/jest.config.js', 'worker/package-lock.json') }}
+          restore-keys: node-v24-jest-worker-
 
       - name: Type check
         working-directory: ./worker
@@ -192,9 +237,29 @@ jobs:
         env:
           NODE_ENV: test
           EXECUTION_USAGE_TEST_DATABASE_URL: postgresql://postgres@localhost:5432/execution_usage_test
+          MONITOR_CYCLE_TEST_DATABASE_URL: postgresql://postgres@localhost:5432/postgres
+
+      - name: Run database integration tests
+        working-directory: ./worker
+        run: npm run test:db
+        env:
+          NODE_ENV: test
+          TEST_DATABASE_URL: postgresql://postgres@localhost:5432/postgres
+
+      - name: Verify execution admission against PostgreSQL
+        working-directory: ./worker
+        run: npm test -- --rootDir . --setupFilesAfterEnv ./jest.setup.ts --runInBand --runTestsByPath test/execution-admission.db.spec.ts
+        env:
+          TEST_DATABASE_URL: postgresql://postgres@localhost:5432/execution_usage_test
+
+      - name: Verify queue fairness against Redis
+        working-directory: ./worker
+        run: npm test -- --rootDir . --setupFilesAfterEnv ./jest.setup.ts --runInBand --runTestsByPath test/execution-fairness.redis.spec.ts
+        env:
+          TEST_REDIS_URL: redis://localhost:6379
 
       - name: Upload coverage
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
           name: worker-coverage
@@ -217,7 +282,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
-          node-version: "20"
+          node-version: "24"
           cache: "npm"
           cache-dependency-path: cli/package-lock.json
 
@@ -235,7 +300,15 @@ jobs:
 
       - name: Run tests
         working-directory: ./cli
-        run: npm test
+        run: npm run test:cov -- --maxWorkers=2
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: cli-coverage
+          path: cli/coverage
+          retention-days: 7
 
       - name: Build package
         working-directory: ./cli
@@ -337,6 +410,7 @@ jobs:
 
   summary:
     name: Quality Checks Summary
+    timeout-minutes: 5
     runs-on: ubuntu-latest
     needs: [migration-safety, app-quality-checks, worker-quality-checks, cli-quality-checks, e2e-quality-checks, deploy-validation]
     if: always()

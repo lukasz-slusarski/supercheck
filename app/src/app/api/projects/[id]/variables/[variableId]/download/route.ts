@@ -1,3 +1,4 @@
+import { isUuid } from "@/lib/uuid";
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/utils/db";
 import { projectVariables } from "@/db/schema";
@@ -20,8 +21,9 @@ export async function GET(
     const projectId = resolvedParams.id;
     const variableId = resolvedParams.variableId;
 
-    const { userId } = await requireUserAuthContext();
+    const { userId } = await requireUserAuthContext((await params).id);
 
+    if (!isUuid((await params).id)) return NextResponse.json({ error: "Project not found" }, { status: 404 });
     const permCtx = await resolveProjectPermissionContext(userId, projectId);
     if (!permCtx) {
       return NextResponse.json(
@@ -38,6 +40,7 @@ export async function GET(
     }
 
     // Get the variable
+    if (!isUuid((await params).variableId)) return NextResponse.json({ error: "Variable not found" }, { status: 404 });
     const [variable] = await db
       .select()
       .from(projectVariables)

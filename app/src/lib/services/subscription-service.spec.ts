@@ -20,6 +20,7 @@ jest.mock("@/utils/db", () => ({
     query: {
       organization: { findFirst: jest.fn() },
       planLimits: { findFirst: jest.fn() },
+      executionEntitlements: { findFirst: jest.fn() },
     },
     update: jest.fn(() => ({
       set: jest.fn(() => ({
@@ -385,6 +386,7 @@ describe("SubscriptionService", () => {
 
           expect(result.maxMonitors).toBe(999999);
           expect(result.playwrightMinutesIncluded).toBe(999999);
+          expect(result.jobDataRetentionDays).toBe(180);
         });
       });
     });
@@ -900,7 +902,7 @@ describe("SubscriptionService", () => {
             expect.any(String),
             expect.objectContaining({
               headers: expect.objectContaining({
-                "Polar-Version": "2026-04",
+                "Polar-Version": "2026-10",
               }),
             }),
           );

@@ -21,7 +21,7 @@ export enum ExitCode {
 export class CLIError extends Error {
   public readonly exitCode: ExitCode
 
-  constructor(message: string, exitCode: ExitCode = ExitCode.GeneralError) {
+  constructor(message: string, exitCode: ExitCode = ExitCode.GeneralError, public readonly details?: unknown) {
     super(message)
     this.name = 'CLIError'
     this.exitCode = exitCode
@@ -47,7 +47,8 @@ export class ApiRequestError extends CLIError {
   public readonly responseBody?: unknown
 
   constructor(message: string, statusCode?: number, responseBody?: unknown) {
-    super(message, ExitCode.ApiError)
+    // A rejected credential is an auth failure on every command, not just the ones that check for it.
+    super(message, statusCode === 401 ? ExitCode.AuthError : ExitCode.ApiError)
     this.name = 'ApiRequestError'
     this.statusCode = statusCode
     this.responseBody = responseBody

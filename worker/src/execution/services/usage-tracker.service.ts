@@ -1,3 +1,7 @@
+import {
+  hasActiveExecutionPlan,
+  MIN_RESERVED_RUN_MS,
+} from './execution-admission.service';
 import { ceilUsageCostCents } from '../../common/utils/usage-cost';
 import { v7 as uuidv7 } from 'uuid';
 import {
@@ -18,7 +22,7 @@ import {
 } from './execution-usage-receipts';
 
 // Polar API version pinned to match stable quarterly release
-const POLAR_API_VERSION = '2026-04';
+const POLAR_API_VERSION = '2026-10';
 
 // Check if Polar is enabled (cloud mode)
 function isSelfHosted(): boolean {
@@ -43,6 +47,16 @@ function isPolarEnabled(): boolean {
  * The spending limit check (shouldBlockExecution) runs BEFORE execution
  * starts and provides a "best effort" check based on current recorded usage.
  */
+/** Reasons that mean billing could not be checked (not that billing blocks the organization). */
+export const BILLING_VERIFICATION_FAILED = 'Unable to verify';
+/** Shown when a trial's monitor allowance does not cover this monitor. */
+export const TRIAL_BROWSER_ALLOWANCE_EXHAUSTED =
+  'Trial browser allowance is used up';
+const TRIAL_MONITOR_ALLOWANCE_EXCEEDED =
+  'Monitor exceeds the trial monitor allowance';
+export const BILLING_NOT_CONFIGURED =
+  'Cloud billing enforcement is not configured';
+
 @Injectable()
 export class UsageTrackerService implements OnModuleInit, OnModuleDestroy {
   private lastMigrationWarningAt = Number.NEGATIVE_INFINITY;
@@ -69,11 +83,52 @@ export class UsageTrackerService implements OnModuleInit, OnModuleDestroy {
     if (this.recoveryTimer) clearInterval(this.recoveryTimer);
   }
 
+  /**
+   * Whether this execution was admitted under a free trial. The reservation records the tier the run
+   * was admitted under, so a customer who subscribes (or whose trial ends) while it runs is still
+   * settled the way it was admitted. Without a reservation, fall back to the organization's current state.
+   */
+  private async isLimitedRun(
+    organizationId: string,
+    runId?: string,
+  ): Promise<boolean> {
+    if (runId) {
+      const reservation = await this.db.query.executionReservations.findFirst({
+        where: and(
+          eq(schema.executionReservations.runId, runId),
+          eq(schema.executionReservations.organizationId, organizationId),
+        ),
+        columns: { tier: true },
+      });
+      if (reservation) return reservation.tier === 'trial';
+    }
+    return this.isLimitedOrganization(organizationId);
+  }
+
+  private async isLimitedOrganization(
+    organizationId: string,
+  ): Promise<boolean> {
+    const entitlement = await this.db.query.executionEntitlements.findFirst({
+      where: eq(schema.executionEntitlements.organizationId, organizationId),
+    });
+    if (!entitlement) return false;
+    const org = await this.db.query.organization.findFirst({
+      where: eq(schema.organization.id, organizationId),
+    });
+    return !!org && !hasActiveExecutionPlan(org);
+  }
+
   async completeRunWithUsage(
     input: ExecutionUsageCompletion,
     persistResult: (tx: ExecutionUsageTransaction) => Promise<void>,
   ): Promise<void> {
-    if (!isPolarEnabled()) {
+    // No Polar billing, or no evidence the execution container ever ran:
+    // persist the result without a receipt so nothing is charged.
+    if (!isPolarEnabled() || !(input.durationMs > 0)) {
+      await this.db.transaction(persistResult);
+      return;
+    }
+    if (await this.isLimitedRun(input.organizationId, input.runId)) {
       await this.db.transaction(persistResult);
       return;
     }
@@ -111,7 +166,12 @@ export class UsageTrackerService implements OnModuleInit, OnModuleDestroy {
       const receipt = await this.db.query.executionUsageReceipts.findFirst({
         where: eq(schema.executionUsageReceipts.id, id),
       });
-      if (!receipt || receipt.settledAt) return;
+      if (
+        !receipt ||
+        receipt.settledAt ||
+        receipt.metadata?.requiresAllocationReconciliation === true
+      )
+        return;
       const k6 = receipt.eventType === 'k6_execution';
       await this.recordUsageEvent(
         receipt.organizationId,
@@ -182,6 +242,14 @@ export class UsageTrackerService implements OnModuleInit, OnModuleDestroy {
       if (!Number.isFinite(executionTimeMs) || executionTimeMs < 0) {
         throw new Error('Invalid Playwright execution duration');
       }
+      if (
+        isPolarEnabled() &&
+        (await this.isLimitedRun(
+          organizationId,
+          typeof metadata?.runId === 'string' ? metadata.runId : undefined,
+        ))
+      )
+        return { blocked: false };
       // Match the four-decimal ledger precision before updating either sink.
       // No whole-minute minimum: a five-second check uses 0.0833 minutes.
       const minutes = Math.round((executionTimeMs / 60_000) * 10_000) / 10_000;
@@ -239,6 +307,14 @@ export class UsageTrackerService implements OnModuleInit, OnModuleDestroy {
       ) {
         throw new Error('Invalid K6 execution usage');
       }
+      if (
+        isPolarEnabled() &&
+        (await this.isLimitedRun(
+          organizationId,
+          typeof metadata?.runId === 'string' ? metadata.runId : undefined,
+        ))
+      )
+        return { blocked: false };
       // Calculate VU minutes: ceil(VUs * duration in minutes)
       const durationMinutes = durationMs / 1000 / 60;
       const vuMinutes = Math.ceil(virtualUsers * durationMinutes);
@@ -670,19 +746,76 @@ export class UsageTrackerService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * A trial may run only its first `allowance` monitors (oldest first, paused
+   * ones excluded), the same rule as the paid plan quota. Checked at execution,
+   * not only at creation, so existing monitors cannot exceed it.
+   */
+  private async checkTrialMonitorAllowance(
+    organizationId: string,
+    allowance: number,
+    monitorId?: string,
+    browserRemainingMs?: number,
+  ): Promise<{ blocked: boolean; reason?: string }> {
+    // A browser check that cannot get even the smallest run is held, so the missing-region cycle
+    // closes as skipped instead of recording the unrun check as downtime.
+    if (
+      browserRemainingMs !== undefined &&
+      browserRemainingMs < MIN_RESERVED_RUN_MS
+    )
+      return { blocked: true, reason: TRIAL_BROWSER_ALLOWANCE_EXHAUSTED };
+    if (!monitorId) return { blocked: false };
+    const eligible = await this.db
+      .select({ id: schema.monitors.id })
+      .from(schema.monitors)
+      .where(
+        and(
+          eq(schema.monitors.organizationId, organizationId),
+          sql`${schema.monitors.status} <> 'paused'`,
+        ),
+      )
+      .orderBy(asc(schema.monitors.createdAt), asc(schema.monitors.id))
+      .limit(allowance);
+    return eligible.some((monitor) => monitor.id === monitorId)
+      ? { blocked: false }
+      : { blocked: true, reason: TRIAL_MONITOR_ALLOWANCE_EXCEEDED };
+  }
+
+  /**
    * Check if execution should be blocked before starting
    * Call this before starting a new execution
    */
   async shouldBlockExecution(
     organizationId: string,
-    options: { checkSpendingLimit?: boolean } = {},
+    options: { checkSpendingLimit?: boolean; monitorId?: string } = {},
   ): Promise<{ blocked: boolean; reason?: string }> {
     if (isSelfHosted()) return { blocked: false };
     if (!process.env.POLAR_ACCESS_TOKEN) {
-      return {
-        blocked: true,
-        reason: 'Cloud billing enforcement is not configured',
-      };
+      try {
+        const org = await this.db.query.organization.findFirst({
+          where: eq(schema.organization.id, organizationId),
+        });
+        if (org && !hasActiveExecutionPlan(org)) {
+          const entitlement =
+            await this.db.query.executionEntitlements.findFirst({
+              where: eq(
+                schema.executionEntitlements.organizationId,
+                organizationId,
+              ),
+            });
+          if (entitlement && entitlement.expiresAt.getTime() > Date.now())
+            return this.checkTrialMonitorAllowance(
+              organizationId,
+              entitlement.maxMonitors,
+              options.monitorId,
+              options.checkSpendingLimit
+                ? entitlement.playwrightBudgetMs - entitlement.playwrightUsedMs
+                : undefined,
+            );
+        }
+      } catch {
+        // Only an explicit, verifiable grant can run without the standard plan configuration.
+      }
+      return { blocked: true, reason: BILLING_NOT_CONFIGURED };
     }
 
     try {
@@ -691,17 +824,53 @@ export class UsageTrackerService implements OnModuleInit, OnModuleDestroy {
       const org = await this.db.query.organization.findFirst({
         where: eq(schema.organization.id, organizationId),
       });
-      const hasAccess =
-        org &&
-        org.polarCustomerId &&
-        (org.subscriptionPlan === 'plus' || org.subscriptionPlan === 'pro') &&
-        (org.subscriptionStatus === 'active' ||
-          org.subscriptionStatus === 'past_due' ||
-          (org.subscriptionStatus === 'canceled' &&
-            org.subscriptionEndsAt &&
-            org.subscriptionEndsAt.getTime() > Date.now()));
+      const hasAccess = hasActiveExecutionPlan(org);
       if (!hasAccess || !org) {
+        const entitlement = org
+          ? await this.db.query.executionEntitlements.findFirst({
+              where: eq(
+                schema.executionEntitlements.organizationId,
+                organizationId,
+              ),
+            })
+          : undefined;
+        if (entitlement && entitlement.expiresAt.getTime() > Date.now())
+          return this.checkTrialMonitorAllowance(
+            organizationId,
+            entitlement.maxMonitors,
+            options.monitorId,
+            options.checkSpendingLimit
+              ? entitlement.playwrightBudgetMs - entitlement.playwrightUsedMs
+              : undefined,
+          );
         return { blocked: true, reason: 'An active subscription is required' };
+      }
+      if (options.monitorId) {
+        const limits = await this.db.query.planLimits.findFirst({
+          where: eq(schema.planLimits.plan, org.subscriptionPlan!),
+        });
+        if (!limits)
+          return {
+            blocked: true,
+            reason: `${BILLING_VERIFICATION_FAILED} monitor quota`,
+          };
+        const eligible = await this.db
+          .select({ id: schema.monitors.id })
+          .from(schema.monitors)
+          .where(
+            and(
+              eq(schema.monitors.organizationId, organizationId),
+              sql`${schema.monitors.status} <> 'paused'`,
+            ),
+          )
+          .orderBy(asc(schema.monitors.createdAt), asc(schema.monitors.id))
+          .limit(limits.maxMonitors);
+        if (!eligible.some((monitor) => monitor.id === options.monitorId)) {
+          return {
+            blocked: true,
+            reason: 'Monitor exceeds the current plan quota',
+          };
+        }
       }
       if (options.checkSpendingLimit === false) return { blocked: false };
       return await this.checkSpendingLimit(organizationId, org);
@@ -711,7 +880,7 @@ export class UsageTrackerService implements OnModuleInit, OnModuleDestroy {
       );
       return {
         blocked: true,
-        reason: 'Unable to verify the organization spending limit',
+        reason: `${BILLING_VERIFICATION_FAILED} the organization spending limit`,
       };
     }
   }

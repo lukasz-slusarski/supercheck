@@ -35,6 +35,8 @@ import { K6Logo } from "@/components/logo/k6-logo";
 
 interface SubscriptionData {
   organizationId?: string;
+  /** Present for an organization that has (or had) a free trial and no paid plan. */
+  trial?: { active: boolean; daysRemaining: number; expiresAt: string } | null;
   subscription: {
     plan: "plus" | "pro" | "unlimited" | null;
     status: "active" | "canceled" | "past_due" | "none";
@@ -129,9 +131,9 @@ interface SpendingData {
 }
 
 const planDetails: Record<string, { name: string; color: string }> = {
-  plus: { name: "Plus", color: "bg-blue-500" },
-  pro: { name: "Pro", color: "bg-purple-500" },
-  unlimited: { name: "Unlimited", color: "bg-green-500" },
+  plus: { name: "Plus", color: "bg-secondary text-secondary-foreground" },
+  pro: { name: "Pro", color: "bg-primary text-primary-foreground" },
+  unlimited: { name: "Unlimited", color: "bg-green-500 text-white" },
 };
 
 interface SubscriptionTabProps {
@@ -277,7 +279,10 @@ export function SubscriptionTab({ currentUserRole }: SubscriptionTabProps) {
     );
   }
 
+  const expired = Boolean(data.trial && !data.trial.active) || data.subscription.accessReason === "canceled_expired" ||
+    (!data.subscription.plan && Boolean(data.subscription.subscriptionEndsAt || data.subscription.status === "canceled"));
   const hasSubscription = data.subscription.plan !== null;
+  const onTrial = !hasSubscription && Boolean(data.trial?.active);
   const plan = data.subscription.plan
     ? planDetails[data.subscription.plan]
     : null;
@@ -318,9 +323,10 @@ export function SubscriptionTab({ currentUserRole }: SubscriptionTabProps) {
                 {plan ? `${plan.name} Plan` : "No active plan"}
               </h3>
               <Badge
-                className={`${plan ? `${plan.color} text-white` : "bg-muted text-muted-foreground"} text-sm`}
+                className={`${plan ? plan.color : "bg-muted text-muted-foreground"} text-sm`}
               >
                 {data.subscription.status === "past_due" ? "Payment overdue"
+                  : expired ? "Subscription ended"
                   : data.subscription.status === "canceled" && hasSubscription ? "Cancellation scheduled"
                   : data.subscription.status === "none" ? "Not subscribed"
                   : data.subscription.status}
@@ -339,7 +345,7 @@ export function SubscriptionTab({ currentUserRole }: SubscriptionTabProps) {
                   </PopoverTrigger>
                   <PopoverContent side="top" className="w-80 space-y-1.5 text-xs text-muted-foreground">
                     <p>This monthly subscription and its allowances cover this organization only.</p>
-                    <p>K6 usage is peak VUs × execution minutes, rounded up per run. AI credits are a hard limit.</p>
+                    <p>k6 usage is peak VUs × execution minutes, rounded up per run. AI credits are a hard limit.</p>
                     <p>Discounts, credits, and plan-change proration can change your invoice. Invoices and payment details are in Manage Subscription.</p>
                   </PopoverContent>
                 </Popover>
@@ -416,7 +422,7 @@ export function SubscriptionTab({ currentUserRole }: SubscriptionTabProps) {
         )}
         {!hasSubscription && canManageSubscription && (
           <Button asChild>
-            <Link href="/subscribe">Choose a plan</Link>
+            <Link href="/subscribe">{expired ? "Resubscribe" : "Choose a plan"}</Link>
           </Button>
         )}
       </div>
@@ -440,14 +446,21 @@ export function SubscriptionTab({ currentUserRole }: SubscriptionTabProps) {
         </p>
       )}
 
-      {!hasSubscription && (
+      {onTrial && (
         <p className="text-sm text-muted-foreground">
-          Choose a plan to view paid usage and resource allowances.
+          Free trial: {data.trial?.daysRemaining} {data.trial?.daysRemaining === 1 ? "day" : "days"} left. The allowances below
+          are for the whole trial. Choose a plan to keep everything running when it ends.
+        </p>
+      )}
+
+      {!hasSubscription && !onTrial && (
+        <p className="text-sm text-muted-foreground">
+          {expired ? "Your subscription has ended. Choose a plan to restore access. Existing data remains subject to the retention policy." : "Choose a plan to view paid usage and resource allowances."}
         </p>
       )}
 
       {/* Usage & Resources - Combined Compact Grid */}
-      {hasSubscription && (
+      {(hasSubscription || onTrial) && (
         <div className="grid gap-4 md:grid-cols-2">
           {/* Usage This Period */}
           <Card>
@@ -475,7 +488,7 @@ export function SubscriptionTab({ currentUserRole }: SubscriptionTabProps) {
                 icon={
                   <K6Logo width={18} height={18} className="text-[#7d64ff]" />
                 }
-                label="K6 Virtual User Minutes"
+                label="k6 Virtual User Minutes"
                 used={data.usage.k6VuMinutes.used}
                 included={data.usage.k6VuMinutes.included}
                 overage={data.usage.k6VuMinutes.overage}
@@ -555,7 +568,7 @@ export function SubscriptionTab({ currentUserRole }: SubscriptionTabProps) {
 // Usage is metered to four decimals. Keep them for sub-unit values (a
 // five-second run is 0.0833 minutes); two are enough to read larger totals.
 function formatUsage(value: number) {
-  return value.toLocaleString(undefined, {
+  return value.toLocaleString("en-US", {
     maximumFractionDigits: Math.abs(value) < 1 ? 4 : 2,
   });
 }

@@ -1,5 +1,8 @@
 "use server";
 
+import { headers } from "next/headers";
+import { getClientIP } from "@/lib/session-security";
+import { allowStatusPageSubscription } from "@/lib/status-page-subscription-rate-limit";
 import { db } from "@/utils/db";
 import {
   statusPages,
@@ -9,23 +12,25 @@ import {
   statusPageIncidentSubscriptions,
   incidents,
 } from "@/db/schema";
-import { eq, and, inArray, isNull, isNotNull, count } from "drizzle-orm";
+import { eq, and, inArray, isNull, isNotNull, count, sql } from "drizzle-orm";
 import { z } from "zod";
 import { revalidatePath } from "next/cache";
 import { EmailService } from "@/lib/email-service";
 import { renderStatusPageVerificationEmail } from "@/lib/email-renderer";
 import { generateWebhookSecret } from "@/lib/webhook-utils";
+import { sendWebhookChallenge } from "@/lib/incident-notifications/webhook-verification";
 import { checkSubscriberLimit } from "@/lib/middleware/plan-enforcement";
+import { insertWithinPlanLimit } from "@/lib/middleware/plan-limit-lock";
 
 const subscribeSchema = z.union([
   // Email subscription
   z.object({
     statusPageId: z.string().uuid(),
-    email: z.string().email("Please enter a valid email address"),
+    email: z.string().trim().toLowerCase().email("Please enter a valid email address"),
     subscribeToAllComponents: z.boolean().default(true),
-    selectedComponentIds: z.array(z.string().uuid()).optional(),
+    selectedComponentIds: z.array(z.string().uuid()).max(100).optional(),
     subscribeToAllIncidents: z.boolean().default(true),
-    selectedIncidentIds: z.array(z.string().uuid()).optional(),
+    selectedIncidentIds: z.array(z.string().uuid()).max(100).optional(),
     subscriptionMode: z.literal("email").optional().default("email"),
   }),
   // Webhook subscription
@@ -35,9 +40,9 @@ const subscribeSchema = z.union([
     subscriptionMode: z.literal("webhook"),
     description: z.string().max(500).optional(),
     subscribeToAllComponents: z.boolean().default(true),
-    selectedComponentIds: z.array(z.string().uuid()).optional(),
+    selectedComponentIds: z.array(z.string().uuid()).max(100).optional(),
     subscribeToAllIncidents: z.boolean().default(true),
-    selectedIncidentIds: z.array(z.string().uuid()).optional(),
+    selectedIncidentIds: z.array(z.string().uuid()).max(100).optional(),
   }),
   // Slack subscription
   z.object({
@@ -45,9 +50,9 @@ const subscribeSchema = z.union([
     endpoint: z.string().url("Please enter a valid Slack webhook URL"),
     subscriptionMode: z.literal("slack"),
     subscribeToAllComponents: z.boolean().default(true),
-    selectedComponentIds: z.array(z.string().uuid()).optional(),
+    selectedComponentIds: z.array(z.string().uuid()).max(100).optional(),
     subscribeToAllIncidents: z.boolean().default(true),
-    selectedIncidentIds: z.array(z.string().uuid()).optional(),
+    selectedIncidentIds: z.array(z.string().uuid()).max(100).optional(),
   }),
 ]);
 
@@ -196,6 +201,60 @@ async function enforceSubscriberLimit(params: {
   return checkSubscriberLimit(params.organizationId, currentSubscriberCount);
 }
 
+/**
+ * Insert an immediately-verified subscriber (webhook/Slack) without letting
+ * concurrent requests exceed the per-status-page subscriber limit.
+ */
+async function insertVerifiedSubscriberWithinLimit(params: {
+  statusPageId: string;
+  organizationId: string | null;
+  values: typeof statusPageSubscribers.$inferInsert;
+}) {
+  const insert = async (executor: Pick<typeof db, "insert">) => {
+    const [row] = await executor
+      .insert(statusPageSubscribers)
+      .values(params.values)
+      .returning();
+    return row;
+  };
+
+  if (!params.organizationId) {
+    return { ok: true as const, row: await insert(db) };
+  }
+
+  return insertWithinPlanLimit({
+    organizationId: params.organizationId,
+    resource: "subscribers",
+    lockKey: params.statusPageId,
+    check: checkSubscriberLimit,
+    countRows: async (tx) => {
+      const [row] = await tx
+        .select({ value: count() })
+        .from(statusPageSubscribers)
+        .where(
+          and(
+            eq(statusPageSubscribers.statusPageId, params.statusPageId),
+            isNull(statusPageSubscribers.purgeAt),
+            isNotNull(statusPageSubscribers.verifiedAt)
+          )
+        );
+      return row?.value ?? 0;
+    },
+    insert,
+  });
+}
+
+function subscriberLimitFailure(
+  result: { ok: false; busy?: true; check?: { error?: string } }
+) {
+  return {
+    success: false as const,
+    message: result.busy
+      ? "Too many concurrent requests. Please retry shortly."
+      : result.check?.error || "Subscriber limit reached for this status page.",
+  };
+}
+
 async function syncComponentSubscriptions(params: {
   subscriberId: string;
   statusPageId: string;
@@ -329,10 +388,15 @@ function isIncidentInterestRequested(params: {
   );
 }
 
-export async function subscribeToStatusPage(data: SubscribeInput) {
+export async function subscribeToStatusPage(data: SubscribeInput): Promise<{ success: boolean; message: string; requiresVerification?: boolean; subscriberId?: string; webhookSecret?: string }> {
   try {
     // Validate input
     const validatedData = subscribeSchema.parse(data);
+    if (!await allowStatusPageSubscription(getClientIP(await headers()), validatedData.statusPageId)) {
+      return { success: false, message: "Too many subscription requests. Please try again later." };
+    }
+
+    if (validatedData.subscribeToAllComponents === false && !validatedData.selectedComponentIds?.length && !validatedData.selectedIncidentIds?.length) return { success: false, message: "Choose at least one component or incident." };
 
     // Check if status page exists and is published
     const statusPage = await db.query.statusPages.findFirst({
@@ -351,6 +415,11 @@ export async function subscribeToStatusPage(data: SubscribeInput) {
         success: false,
         message: "This status page is not currently accepting subscriptions",
       };
+    }
+
+    if (validatedData.selectedComponentIds?.length) {
+      const selected = await db.select({ id: statusPageComponents.id }).from(statusPageComponents).where(and(eq(statusPageComponents.statusPageId, statusPage.id), eq(statusPageComponents.showcase, true), inArray(statusPageComponents.id, validatedData.selectedComponentIds)));
+      if (selected.length !== new Set(validatedData.selectedComponentIds).size) return { success: false, message: "A selected component is unavailable." };
     }
 
     // Respect page-level subscription toggle
@@ -440,7 +509,7 @@ export async function subscribeToStatusPage(data: SubscribeInput) {
     if (error instanceof z.ZodError) {
       return {
         success: false,
-        message: error.errors[0]?.message || "Invalid input",
+        message: error.issues[0]?.message || "Invalid input",
       };
     }
 
@@ -461,7 +530,7 @@ async function handleEmailSubscription(
     where: (subscribers, { and, eq }) =>
       and(
         eq(subscribers.statusPageId, statusPage.id as string),
-        eq(subscribers.email, data.email as string)
+        sql`lower(${subscribers.email}) = ${data.email as string}`
       ),
   });
 
@@ -537,8 +606,9 @@ async function handleEmailSubscription(
     
     if (existingSubscriber.verifiedAt) {
       return {
-        success: false,
-        message: "This email is already subscribed to updates",
+        success: true,
+        message: "Please check your email to verify your subscription.",
+        requiresVerification: true,
       };
     } else {
       // If exists but not verified, update the verification token and resend
@@ -704,7 +774,7 @@ async function handleWebhookSubscription(
       };
     }
 
-    // Delete old unverified webhook if exists
+    // Retry verification for an existing pending webhook.
     if (existingSubscriber && !existingSubscriber.verifiedAt) {
       await db
         .update(statusPageSubscribers)
@@ -728,24 +798,18 @@ async function handleWebhookSubscription(
         selectedIncidentIds: data.selectedIncidentIds,
       });
 
+      const challenge = await sendWebhookChallenge({
+        subscriberId: existingSubscriber.id,
+        endpoint: endpoint,
+        statusPageId: statusPage.id as string,
+      });
       return {
         success: true,
-        message: "Webhook subscription updated successfully",
+        requiresVerification: !challenge.verified,
+        message: challenge.verified
+          ? "Webhook subscription verified and updated successfully"
+          : `Webhook subscription saved, but endpoint verification failed: ${challenge.error}. Resend the challenge from Subscribers once the endpoint is ready.`,
         subscriberId: existingSubscriber.id,
-      };
-    }
-
-    const limitCheck = await enforceSubscriberLimit({
-      statusPageId: statusPage.id as string,
-      organizationId: statusPage.organizationId as string | null,
-    });
-
-    if (!limitCheck.allowed) {
-      return {
-        success: false,
-        message:
-          limitCheck.error ||
-          "Subscriber limit reached for this status page.",
       };
     }
 
@@ -753,21 +817,31 @@ async function handleWebhookSubscription(
     const unsubscribeToken = generateHexToken();
     const webhookSecret = generateWebhookSecret();
 
-    // Create webhook subscriber (immediately verified - no email verification needed)
-    const [subscriber] = await db
-      .insert(statusPageSubscribers)
-      .values({
+    // Create the webhook subscriber pending proof of endpoint ownership.
+    const inserted = await insertVerifiedSubscriberWithinLimit({
+      statusPageId: statusPage.id as string,
+      organizationId: statusPage.organizationId as string | null,
+      values: {
         statusPageId: statusPage.id as string,
         endpoint: data.endpoint as string,
         mode: "webhook",
         unsubscribeToken,
         webhookSecret, // Persist the webhook secret for HMAC verification
         skipConfirmationNotification: false,
-        verifiedAt: new Date(), // Webhooks are immediately verified
+        verifiedAt: null,
         createdAt: new Date(),
         updatedAt: new Date(),
-      })
-      .returning();
+      },
+    });
+    if (!inserted.ok) {
+      return subscriberLimitFailure(inserted);
+    }
+    const subscriber = inserted.row;
+    const challenge = await sendWebhookChallenge({
+      subscriberId: subscriber.id,
+      endpoint,
+      statusPageId: statusPage.id as string,
+    });
 
     await syncComponentSubscriptions({
       subscriberId: subscriber.id,
@@ -788,7 +862,10 @@ async function handleWebhookSubscription(
 
     return {
       success: true,
-      message: "Webhook subscription successful! Your endpoint will receive incident notifications.",
+      requiresVerification: !challenge.verified,
+      message: challenge.verified
+        ? "Webhook subscription verified! Your endpoint will receive incident notifications."
+        : `Webhook subscription saved, but endpoint verification failed: ${challenge.error}. Resend the challenge from Subscribers once the endpoint is ready.`,
       subscriberId: subscriber.id,
       webhookSecret, // Return secret for documentation purposes
     };
@@ -874,27 +951,14 @@ async function handleSlackSubscription(
       };
     }
 
-    const limitCheck = await enforceSubscriberLimit({
-      statusPageId: statusPage.id as string,
-      organizationId: statusPage.organizationId as string | null,
-    });
-
-    if (!limitCheck.allowed) {
-      return {
-        success: false,
-        message:
-          limitCheck.error ||
-          "Subscriber limit reached for this status page.",
-      };
-    }
-
     // Generate secure tokens
     const unsubscribeToken = generateHexToken();
 
     // Create Slack subscriber (immediately verified - no email verification needed)
-    const [subscriber] = await db
-      .insert(statusPageSubscribers)
-      .values({
+    const inserted = await insertVerifiedSubscriberWithinLimit({
+      statusPageId: statusPage.id as string,
+      organizationId: statusPage.organizationId as string | null,
+      values: {
         statusPageId: statusPage.id as string,
         endpoint,
         mode: "slack",
@@ -903,8 +967,12 @@ async function handleSlackSubscription(
         verifiedAt: new Date(), // Slack subscriptions are immediately verified
         createdAt: new Date(),
         updatedAt: new Date(),
-      })
-      .returning();
+      },
+    });
+    if (!inserted.ok) {
+      return subscriberLimitFailure(inserted);
+    }
+    const subscriber = inserted.row;
 
     await syncComponentSubscriptions({
       subscriberId: subscriber.id,

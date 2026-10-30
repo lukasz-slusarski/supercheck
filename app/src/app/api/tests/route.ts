@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { isTestPriority, MAX_SCRIPT_LENGTH } from "@/lib/validations/common";
 import { db } from "@/utils/db";
 import { tests, testTags, tags } from "@/db/schema";
 import { desc, eq, and, inArray, like, count } from "drizzle-orm";
@@ -6,7 +7,7 @@ import { checkPermissionWithContext } from "@/lib/rbac/middleware";
 import { requireAuthContext, isAuthError } from "@/lib/auth-context";
 import { subscriptionService, SubscriptionAccessDeniedError } from "@/lib/services/subscription-service";
 import type { TestType } from "@/db/schema/types";
-import { validateScriptTypeMatch, normalizeTestType } from "@/lib/script-type-validator";
+import { validateTestScript, normalizeTestType } from "@/lib/script-type-validator";
 import { decodeStoredTestScript, encodeStoredTestScript } from "@/lib/test-script";
 
 /**
@@ -50,6 +51,14 @@ export async function GET(request: NextRequest) {
     const pageParam = parseInt(searchParams.get("page") || "1", 10);
     const searchQuery = searchParams.get("search") || "";
     const typeFilter = searchParams.get("type") || "";
+    const priorityFilter = searchParams.get("priority");
+
+    if (priorityFilter !== null && !isTestPriority(priorityFilter)) {
+      return NextResponse.json(
+        { error: "Priority must be one of: low, medium, high" },
+        { status: 400 }
+      );
+    }
 
     // Validate and constrain pagination params
     const limit = Math.min(Math.max(1, limitParam), 1000); // 1-1000
@@ -71,6 +80,10 @@ export async function GET(request: NextRequest) {
     if (typeFilter.trim()) {
       // Cast to TestType - the API will just return empty results for invalid types
       whereConditions.push(eq(tests.type, typeFilter.trim() as TestType));
+    }
+
+    if (isTestPriority(priorityFilter)) {
+      whereConditions.push(eq(tests.priority, priorityFilter));
     }
 
     // Get total count for pagination (parallel with main query)
@@ -196,6 +209,17 @@ export async function POST(request: NextRequest) {
     await subscriptionService.blockUntilSubscribed(context.organizationId);
     await subscriptionService.requireValidPolarCustomer(context.organizationId);
 
+    // Authorize before spending CPU on script validation.
+    // PERFORMANCE: Use checkPermissionWithContext to avoid duplicate DB queries
+    const canCreate = checkPermissionWithContext("test", "create", context);
+
+    if (!canCreate) {
+      return NextResponse.json(
+        { error: "Insufficient permissions to create tests" },
+        { status: 403 }
+      );
+    }
+
     const body = await request.json();
     const { title, description, priority, type, script } = body;
 
@@ -207,13 +231,27 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    if (priority !== undefined && !isTestPriority(priority)) {
+      return NextResponse.json(
+        { error: "Priority must be one of: low, medium, high" },
+        { status: 400 }
+      );
+    }
+
+    if (typeof script === "string" && script.length > MAX_SCRIPT_LENGTH) {
+      return NextResponse.json(
+        { error: `Script cannot exceed ${MAX_SCRIPT_LENGTH} characters` },
+        { status: 413 }
+      );
+    }
+
     const resolvedType: TestType = normalizeTestType(type);
 
     // Validate script-type compatibility if a script is provided
     if (typeof script === "string" && script.length > 0) {
       // Decode base64 if needed for validation
       const decodedScript = decodeStoredTestScript(script);
-      const typeValidation = validateScriptTypeMatch(decodedScript, resolvedType);
+      const typeValidation = validateTestScript(decodedScript, resolvedType);
       if (!typeValidation.valid) {
         return NextResponse.json(
           {
@@ -227,16 +265,6 @@ export async function POST(request: NextRequest) {
 
     // Use current project context
     const targetProjectId = context.project.id;
-
-    // PERFORMANCE: Use checkPermissionWithContext to avoid duplicate DB queries
-    const canCreate = checkPermissionWithContext("test", "create", context);
-
-    if (!canCreate) {
-      return NextResponse.json(
-        { error: "Insufficient permissions to create tests" },
-        { status: 403 }
-      );
-    }
 
     // Create the test
     const [newTest] = await db

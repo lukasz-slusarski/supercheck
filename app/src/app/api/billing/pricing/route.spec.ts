@@ -70,8 +70,8 @@ describe("Billing pricing configuration", () => {
   });
   it("exposes the revised allowances while retaining affordable overage", async () => {
     const plans = [
-      { plan: "plus", sreInvestigationUnitsIncluded: "25.0000" },
-      { plan: "pro", sreInvestigationUnitsIncluded: "100.0000" },
+      { plan: "plus", sreInvestigationUnitsIncluded: "200.0000" },
+      { plan: "pro", sreInvestigationUnitsIncluded: "1000.0000" },
     ];
     (db.select as jest.Mock)
       .mockReturnValueOnce({ from: () => ({ where: async () => plans }) })
@@ -79,9 +79,9 @@ describe("Billing pricing configuration", () => {
     const body = await (await GET()).json();
     expect(body.plans.map((plan: { price: number; features: { sreInvestigationUnits: number }; overagePricing: { sreInvestigationUnits: number } }) => [
       plan.price, plan.features.sreInvestigationUnits, plan.overagePricing.sreInvestigationUnits,
-    ])).toEqual([[49, 25, 0.5], [149, 100, 0.5]]);
+    ])).toEqual([[49, 200, 0.1], [149, 1000, 0.1]]);
     expect(body.plans.map((plan: { overagePricing: { k6VuMinutes: number } }) => plan.overagePricing.k6VuMinutes))
-      .toEqual([0.005, 0.0025]);
+      .toEqual([0.002, 0.001]);
     expect(body).not.toHaveProperty("enterpriseStartingPrice");
     expect(body.faqs).toContainEqual(expect.objectContaining({
       answer: expect.stringContaining("Get in touch at hello@supercheck.io"),
@@ -110,3 +110,37 @@ describe("Billing pricing configuration", () => {
   });
 
 });
+
+describe("trial advertising on the pricing endpoint", () => {
+  const original = process.env.TRIAL_ENABLED;
+  afterEach(() => {
+    if (original === undefined) delete process.env.TRIAL_ENABLED;
+    else process.env.TRIAL_ENABLED = original;
+  });
+
+  async function pricing() {
+    (db.select as jest.Mock)
+      .mockReturnValueOnce({ from: () => ({ where: async () => [{ plan: "plus" }, { plan: "pro" }] }) })
+      .mockReturnValueOnce({ from: () => ({ where: async () => [] }) });
+    const response = await GET();
+    expect(response.status).toBe(200);
+    return response.json() as Promise<{ trial?: { durationDays: number; highlights: string[] }; faqs: Array<{ question: string }> }>;
+  }
+
+  it("offers no trial and no trial questions while trials are not enabled", async () => {
+    delete process.env.TRIAL_ENABLED;
+    const body = await pricing();
+    expect(body.trial).toBeUndefined();
+    expect(body.faqs.map((faq) => faq.question).join("\n")).not.toMatch(/free trial/i);
+    expect(body.faqs.length).toBeGreaterThan(0);
+  });
+
+  it("offers the trial and its questions once trials are enabled", async () => {
+    process.env.TRIAL_ENABLED = "true";
+    const body = await pricing();
+    expect(body.trial?.durationDays).toBeGreaterThan(0);
+    expect(body.trial?.highlights.length).toBeGreaterThan(0);
+    expect(body.faqs.map((faq) => faq.question)).toContain("Is there a free trial?");
+  });
+});
+

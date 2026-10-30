@@ -12,6 +12,7 @@ export type { MonitoringLocation, LocationConfig };
  */
 export function buildLocationMetadataMap(
   locations: Array<{
+    isEnabled?: boolean;
     code: string;
     name: string;
     region: string | null;
@@ -23,7 +24,7 @@ export function buildLocationMetadataMap(
   for (const loc of locations) {
     map[loc.code] = {
       code: loc.code,
-      name: loc.name,
+      name: loc.isEnabled === false ? `${loc.name} (inactive)` : loc.name,
       region: loc.region || "",
       coordinates: loc.coordinates ?? undefined,
       flag: loc.flag ?? undefined,
@@ -69,14 +70,8 @@ export function calculateAggregatedStatus(
     return "down";
   }
 
-  // Use location codes as-is (dynamic locations, no legacy normalization needed)
-  const locations = rawLocations;
-
-  // Only aggregate over locations that actually have results.
-  // When some locations are disabled (no workers), their results won't exist
-  // and they should not count as "down" in the aggregation.
-  const resultKeys = Object.keys(locationStatuses);
-  const effectiveLocations = resultKeys.length > 0 ? resultKeys : locations;
+  // Missing configured locations cannot satisfy an all-locations check.
+  const effectiveLocations = Array.from(new Set(rawLocations));
 
   const upCount = effectiveLocations.filter(
     (loc) => locationStatuses[loc] === true
@@ -144,4 +139,16 @@ export function getLocationHealthColor(healthPercentage: number): string {
   if (healthPercentage >= 90) return "text-yellow-600 bg-yellow-100";
   if (healthPercentage >= 80) return "text-orange-600 bg-orange-100";
   return "text-red-600 bg-red-100";
+}
+
+/** Unknown historical codes remain readable without inventing geography or status. */
+export function getLocationDisplayMetadata(
+  code: string,
+  metadata: Record<string, LocationMetadata>,
+): LocationMetadata {
+  return metadata[code] ?? {
+    code,
+    name: code.replace(/[-_]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase()),
+    region: "",
+  };
 }

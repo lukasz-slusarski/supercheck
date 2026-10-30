@@ -1,5 +1,6 @@
 import { expect, test } from "../../fixtures/roles.fixture";
 import { requireRbacUser } from "../../utils/env";
+import { waitForHydration } from "../../utils/hydration";
 
 type SreService = {
   id: string;
@@ -41,6 +42,7 @@ test.describe("AI SRE service catalog @aisre @critical", () => {
       const updatedDescription = `Updated service ${suffix}`;
 
       await page.goto("/services", { waitUntil: "load" });
+      await waitForHydration(page);
       await page.getByTestId("add-service-btn").click();
       const dialog = page.getByRole("dialog", { name: "Add service" });
       await expect(dialog).toBeVisible();
@@ -63,6 +65,7 @@ test.describe("AI SRE service catalog @aisre @critical", () => {
 
       const row = page.getByRole("row").filter({ hasText: name });
       await expect(page.getByRole("columnheader")).toHaveText([
+        "Service ID",
         "Service",
         "Env",
         "Description",
@@ -97,10 +100,13 @@ test.describe("AI SRE service catalog @aisre @critical", () => {
       await expect(page.getByRole("heading", { name })).toBeVisible();
 
       await page.goto("/services", { waitUntil: "load" });
+      await waitForHydration(page);
       const persistedRow = page.getByRole("row").filter({ hasText: name });
+      await expect(persistedRow).toBeVisible();
       await persistedRow
         .getByRole("button", { name: `Open actions for ${name}` })
         .click();
+      await expect(page.getByRole("menu")).toBeVisible();
       await page.getByRole("menuitem", { name: "Archive service" }).click();
       const archiveDialog = page.getByRole("alertdialog", {
         name: "Archive service?",
@@ -216,6 +222,13 @@ test.describe("AI SRE investigation surfaces @aisre @critical", () => {
       .last();
     await expect(assistantMessage).toBeVisible({ timeout: 60_000 });
     await expect(assistantMessage).not.toBeEmpty();
+    // The console only adds the session to its in-memory history once the
+    // thread finishes and resolves the conversation. New chat unmounts the
+    // thread, so wait for that handoff (Archive only renders once the
+    // conversation id exists) before leaving the chat.
+    await expect(
+      page.getByRole("button", { name: "Archive chat", exact: true }),
+    ).toBeVisible({ timeout: 60_000 });
 
     await page.getByRole("button", { name: "New chat", exact: true }).click();
     await expect(page.getByLabel("User message")).toHaveCount(0);
@@ -296,10 +309,22 @@ test.describe("AI SRE investigation surfaces @aisre @critical", () => {
     await expect(page.getByText("Read-only", { exact: true })).toBeVisible();
   });
 
-  test("rejects an invalid incident context", async ({ page }) => {
-    const response = await page.goto("/copilot?incident=invalid");
-    expect(response?.status()).toBe(404);
-  });
+  for (const query of [
+    "incident=invalid",
+    "incident=",
+    "incident=invalid&incident=invalid",
+  ]) {
+    test(`rejects an invalid incident context (${query})`, async ({ page }) => {
+      await page.goto(`/copilot?${query}`);
+      // Next.js can return HTTP 200 when notFound() follows streamed headers.
+      await expect(
+        page.getByRole("heading", { name: "Page Not Found", exact: true }),
+      ).toBeVisible();
+      await expect(
+        page.getByPlaceholder("Describe a symptom or paste evidence..."),
+      ).toHaveCount(0);
+    });
+  }
 
   test("uses the dedicated Copilot screen on mobile without an AI popup", async ({
     page,

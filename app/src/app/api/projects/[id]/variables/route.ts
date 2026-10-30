@@ -1,3 +1,4 @@
+import { isUuid } from "@/lib/uuid";
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/utils/db";
 import { projectVariables } from "@/db/schema";
@@ -17,11 +18,12 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const { userId } = await requireUserAuthContext();
+    const { userId } = await requireUserAuthContext((await params).id);
     const resolvedParams = await params;
     const projectId = resolvedParams.id;
 
     // Resolve permission context (2-3 DB queries total, reused for all checks)
+    if (!isUuid((await params).id)) return NextResponse.json({ error: "Project not found" }, { status: 404 });
     const permCtx = await resolveProjectPermissionContext(userId, projectId);
     if (!permCtx) {
       return NextResponse.json(
@@ -102,9 +104,10 @@ export async function POST(
     const resolvedParams = await params;
     const projectId = resolvedParams.id;
 
-    const { userId } = await requireUserAuthContext();
+    const { userId } = await requireUserAuthContext((await params).id);
 
     // Resolve permission context (2-3 DB queries, replaces separate project + permission lookups)
+    if (!isUuid((await params).id)) return NextResponse.json({ error: "Project not found" }, { status: 404 });
     const permCtx = await resolveProjectPermissionContext(userId, projectId);
     if (!permCtx) {
       return NextResponse.json(

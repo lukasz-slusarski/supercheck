@@ -1,23 +1,31 @@
 import { afterEach, beforeEach, describe, expect, it, jest } from '@jest/globals'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
 
-let resources: Record<string, unknown[]> = {}
-const confirm = jest.fn<(...args: unknown[]) => Promise<boolean>>(async () => false)
+let resources: Record<string, unknown> = {}
+let requirementsError: Error | undefined
+const confirm = jest.fn<(...args: unknown[]) => Promise<void>>()
 const install = jest.fn<(...args: unknown[]) => Promise<void>>(async () => undefined)
 const messages: string[] = []
 const log = (message: string) => messages.push(message)
 jest.unstable_mockModule('../../api/authenticated-client.js', () => ({
   createAuthenticatedClient: () => ({
+    getBaseUrl: () => 'https://app.supercheck.io',
     get: async (path: string) => ({ data: path === '/api/context'
       ? { organization: { id: 'org' }, project: { id: 'project' } }
       : resources[path] ?? [] }),
   }),
 }))
-jest.unstable_mockModule('../../config/loader.js', () => ({ tryLoadConfig: async () => null }))
+let existingConfig: unknown = null
+jest.unstable_mockModule('../../config/loader.js', () => ({ tryLoadConfig: async () => existingConfig }))
 jest.unstable_mockModule('../../utils/resources.js', () => ({
   fetchAllPages: async (_client: unknown, path: string) => resources[path] ?? [],
+  fetchRemoteRequirements: async () => {
+    if (requirementsError) throw requirementsError
+    return resources['/api/requirements'] ?? []
+  },
+  fetchStatusPagesWithComponents: async () => resources['/api/status-pages'] ?? [],
 }))
 jest.unstable_mockModule('../../utils/spinner.js', () => ({
   withSpinner: async (_text: string, fn: () => Promise<unknown>) => fn(),
@@ -30,6 +38,7 @@ jest.unstable_mockModule('../../utils/logger.js', () => ({
   logger: { info: log, warn: log, success: log, error: log, header: log, debug: jest.fn(), newline: jest.fn() },
 }))
 const { pullCommand } = await import('../pull.js')
+const { setRevealSecrets } = await import('../../utils/redact.js')
 const remoteTest = { id: '019a0000-0000-7000-8000-000000000001', title: 'Homepage', type: 'browser', script: '// @title Homepage\n' }
 let cwd: string
 let cwdSpy: ReturnType<typeof jest.spyOn>
@@ -43,7 +52,7 @@ beforeEach(() => {
   resources = { '/api/monitors': [{ id: 'monitor', name: 'Website', type: 'website' }],
     '/api/notification-providers': [{ id: 'provider', name: 'Discord', type: 'discord', config: {} }] }
   messages.length = 0
-  confirm.mockReset().mockResolvedValue(false)
+  confirm.mockReset().mockRejectedValue(new Error('ABORTED'))
   install.mockClear()
   for (const option of ['force', 'testsOnly', 'configOnly', 'dryRun']) pullCommand.setOptionValue(option, false)
 })
@@ -54,12 +63,12 @@ afterEach(() => {
 
 describe('pull output and local file effects', () => {
   it('identifies config resources when the remote has no tests and safely defaults to no', async () => {
-    await pull()
+    await expect(pull()).rejects.toThrow('ABORTED')
     expect(output()).toContain('1 monitor(s), 1 notification provider(s)')
     expect(output()).toContain('No remote test scripts to pull.')
     expect(output()).toContain('replace supercheck.config.ts')
     expect(output()).not.toContain('write test scripts')
-    expect(confirm).toHaveBeenCalledWith('Continue?', { default: false })
+    expect(confirm).toHaveBeenCalledWith('Continue?', expect.objectContaining({ default: false, changes: expect.any(Array), context: expect.any(Object) }))
     expect(existsSync(resolve(cwd, 'supercheck.config.ts'))).toBe(false)
   })
 
@@ -69,7 +78,7 @@ describe('pull output and local file effects', () => {
     { flags: [], writesConfig: true, writesTests: true },
   ])('describes only the selected writes: $flags', async ({ flags, writesConfig, writesTests }) => {
     resources['/api/tests'] = [remoteTest]
-    await pull(...flags)
+    await expect(pull(...flags)).rejects.toThrow('ABORTED')
     expect(output().includes('replace supercheck.config.ts')).toBe(writesConfig)
     expect(output().includes('write test scripts')).toBe(writesTests)
     expect(output()).toContain('Pull only copies remote resources to local files.')
@@ -82,12 +91,37 @@ describe('pull output and local file effects', () => {
     expect(confirm).not.toHaveBeenCalled()
   })
 
+  it('refuses to pull when the config declares requirements but the server has no requirements API', async () => {
+    const { ApiRequestError } = await import('../../utils/errors.js')
+    const configPath = resolve(cwd, 'supercheck.config.ts')
+    writeFileSync(configPath, 'keep me')
+    existingConfig = { config: { project: { organization: 'org', project: 'project' }, requirements: [{ title: 'Login' }] }, configPath }
+    requirementsError = new ApiRequestError('Not Found', 404)
+    try {
+      await expect(pull('--force')).rejects.toThrow('does not support requirements')
+      expect(readFileSync(configPath, 'utf-8')).toBe('keep me')
+    } finally {
+      existingConfig = null
+      requirementsError = undefined
+    }
+  })
+
+  it('writes @tags from the list item when the detail response carries no tags', async () => {
+    const { id } = remoteTest
+    resources['/api/tests'] = [{ id, title: 'Homepage', type: 'browser', tags: [{ id: 't', name: 'core' }] }]
+    resources[`/api/tests/${id}`] = { id, title: 'Homepage', type: 'browser', script: "test('home', async () => {})\n" }
+    await pull('--tests-only', '--force')
+    const folder = resolve(cwd, '_supercheck_/playwright')
+    const file = readdirSync(folder).find((name) => name.includes(id))!
+    expect(readFileSync(resolve(folder, file), 'utf-8')).toContain('// @tags core')
+  })
+
   it('preserves local-only scripts when pulling config resources', async () => {
     const folder = resolve(cwd, '_supercheck_/playwright')
     mkdirSync(folder, { recursive: true })
     const path = resolve(folder, 'local-only.019a0000-0000-7000-8000-000000000002.pw.ts')
     writeFileSync(path, 'local-only script')
-    confirm.mockResolvedValue(true)
+    confirm.mockResolvedValue(undefined)
     await pull()
     expect(readFileSync(path, 'utf-8')).toBe('local-only script')
     expect(readFileSync(resolve(cwd, 'supercheck.config.ts'), 'utf-8')).toContain('Website')
@@ -112,7 +146,7 @@ describe('pull output and local file effects', () => {
 
   it('discloses dependency installation before confirmation', async () => {
     unlinkSync(resolve(cwd, 'package.json'))
-    await pull()
+    await expect(pull()).rejects.toThrow('ABORTED')
     expect(output()).toContain('create package.json, install dependencies, and create tsconfig.supercheck.json if missing')
     expect(install).not.toHaveBeenCalled()
   })
@@ -131,3 +165,46 @@ describe('pull output and local file effects', () => {
     expect(confirm).not.toHaveBeenCalled()
   })
 })
+
+
+describe('pull write boundaries', () => {
+  it('refuses a symlinked config without changing its target', async () => {
+    const outside = mkdtempSync(resolve(tmpdir(), 'supercheck-outside-'))
+    const target = resolve(outside, 'config.ts')
+    writeFileSync(target, 'outside sentinel')
+    symlinkSync(target, resolve(cwd, 'supercheck.config.ts'))
+    try {
+      await expect(pull('--config-only', '--force')).rejects.toThrow(/outside|symlink/i)
+      expect(readFileSync(target, 'utf8')).toBe('outside sentinel')
+    } finally { rmSync(outside, { recursive: true, force: true }) }
+  })
+
+  it.each(['https://user:pw@example.com/p?token=abc&public=yes', 'HTTPS://user:pw@example.com/p?token=abc&public=yes', 'Https://user@example.com/p?token=abc&public=yes'])('masks monitor URL credentials in generated files: %s', async (target) => {
+    resources = { '/api/monitors': [{ id: 'monitor', name: 'Secret', type: 'http_request', target }] }
+    await pull('--config-only', '--force')
+    const text = readFileSync(resolve(cwd, 'supercheck.config.ts'), 'utf8')
+    expect(text).not.toContain('user:pw')
+    expect(text).not.toContain('user@example.com')
+    expect(text).not.toContain('token=abc')
+    expect(text).toContain('public=yes')
+    expect(text).toContain('REDACTED')
+  })
+})
+
+  it('masks request credentials and warns before a pulled config can be deployed', async () => {
+    resources = { '/api/monitors': [{ id: 'monitor', name: 'Secret header', type: 'http_request', target: 'https://example.com', config: { headers: { Authorization: 'Bearer private-value' } } }] }
+    await pull('--config-only', '--force')
+    const text = readFileSync(resolve(cwd, 'supercheck.config.ts'), 'utf8')
+    expect(text).not.toContain('private-value')
+    expect(text).toContain('[REDACTED]')
+    expect(output()).toContain('restore them securely')
+  })
+
+  it('reveals URL credentials only with an explicit secrets preference', async () => {
+    resources = { '/api/monitors': [{ id: 'monitor', name: 'Secret', type: 'http_request', target: 'https://user:pw@example.com/?token=abc' }] }
+    setRevealSecrets(true)
+    try {
+      await pull('--config-only', '--force')
+      expect(readFileSync(resolve(cwd, 'supercheck.config.ts'), 'utf8')).toContain('user:pw@example.com/?token=abc')
+    } finally { setRevealSecrets(false) }
+  })

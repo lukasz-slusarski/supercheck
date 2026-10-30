@@ -1,3 +1,4 @@
+import { isUuid } from "@/lib/uuid";
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/utils/db";
 import { projectVariables } from "@/db/schema";
@@ -29,12 +30,13 @@ export async function POST(
     try {
       // Use requireUserAuthContext() instead of withRateLimit's built-in
       // requireAuth() so that CLI Bearer-token requests are supported.
-      ({ userId } = await requireUserAuthContext());
+      ({ userId } = await requireUserAuthContext((await params).id));
 
       const resolvedParams = await params;
       projectId = resolvedParams.id;
       variableId = resolvedParams.variableId;
 
+      if (!isUuid((await params).id)) return NextResponse.json({ error: "Project not found" }, { status: 404 });
       const permCtx = await resolveProjectPermissionContext(userId, projectId);
       if (!permCtx) {
         return NextResponse.json(
@@ -67,6 +69,7 @@ export async function POST(
       }
 
       // Check if variable exists and belongs to the project
+      if (!isUuid((await params).variableId)) return NextResponse.json({ error: "Variable not found" }, { status: 404 });
       const [existingVariable] = await db
         .select()
         .from(projectVariables)

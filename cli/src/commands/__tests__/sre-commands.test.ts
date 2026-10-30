@@ -2,6 +2,7 @@ import { jest, describe, it, expect, beforeEach } from '@jest/globals'
 
 const mockGet = jest.fn<(...args: unknown[]) => Promise<{ data: unknown }>>()
 const mockPost = jest.fn<(...args: unknown[]) => Promise<{ data: unknown }>>()
+const mockPatch = jest.fn<(...args: unknown[]) => Promise<{ data: unknown }>>()
 const mockOutput = jest.fn<(...args: unknown[]) => void>()
 const mockNarrative = jest.fn<(...args: unknown[]) => void>()
 let outputFormat = 'table'
@@ -16,12 +17,14 @@ jest.unstable_mockModule('../../api/authenticated-client.js', () => ({
   createAuthenticatedClient: () => ({
     get: mockGet,
     post: mockPost,
+    patch: mockPatch,
   }),
 }))
 
 jest.unstable_mockModule('../../output/formatter.js', () => ({
   output: mockOutput,
   outputDetail: mockOutputDetail,
+  outputMutation: mockOutputDetail,
   outputNarrative: mockNarrative,
   outputPagination: jest.fn(),
   getOutputFormat: () => outputFormat,
@@ -35,6 +38,7 @@ jest.unstable_mockModule('../../utils/logger.js', () => ({
     error: mockError,
     warn: jest.fn(),
     newline: jest.fn(),
+    header: jest.fn(),
   },
 }))
 
@@ -107,9 +111,47 @@ describe('AI SRE CLI Commands', () => {
 
       await incidentCommand.parseAsync(['node', 'incident', 'resolve', '018f0000-0000-7000-8000-000000000001', '--comment', 'Fix applied', '--force'])
 
-      expect(mockPost).toHaveBeenCalledWith('/api/sre/incidents/018f0000-0000-7000-8000-000000000001/resolve', { comment: 'Fix applied' })
+      expect(mockPost).toHaveBeenCalledWith('/api/sre/incidents/018f0000-0000-7000-8000-000000000001/resolve', { comment: 'Fix applied' }, { retries: 0 })
       expect(mockSuccess).toHaveBeenCalledWith('Incident resolved')
       expect(mockOutputDetail).toHaveBeenCalledWith(expect.objectContaining({ success: true }))
+    })
+  })
+
+  describe('incident resolve safeguards', () => {
+    const id = '018f0000-0000-7000-8000-000000000001'
+
+    it('reports an already-resolved incident instead of claiming success', async () => {
+      mockPost.mockResolvedValueOnce({ data: { success: true, alreadyResolved: true, message: 'Incident #1 was already resolved' } })
+      await incidentCommand.parseAsync(['node', 'incident', 'resolve', id, '--comment', 'x', '--force'])
+      expect(mockSuccess).not.toHaveBeenCalled()
+      expect(mockInfo).toHaveBeenCalledWith('Incident #1 was already resolved')
+    })
+
+    it('refuses to resolve non-interactively without --force', async () => {
+      const original = Object.getOwnPropertyDescriptor(process.stdin, 'isTTY')
+      Object.defineProperty(process.stdin, 'isTTY', { value: false, configurable: true })
+      try {
+        await expect(incidentCommand.parseAsync(['node', 'incident', 'resolve', id, '--comment', 'x']))
+          .rejects.toMatchObject({ exitCode: 3 })
+        expect(mockPost).not.toHaveBeenCalled()
+      } finally {
+        if (original) Object.defineProperty(process.stdin, 'isTTY', original)
+        else delete (process.stdin as { isTTY?: boolean }).isTTY
+      }
+    })
+  })
+
+  describe('sre input validation', () => {
+    it.each(['abc', '0', '5'])('rejects invalid --idle-timeout %s', async (value) => {
+      await expect(sreCommand.parseAsync(['node', 'sre', 'ask', 'q', '--idle-timeout', value]))
+        .rejects.toMatchObject({ exitCode: 3 })
+      expect(mockPostSse).not.toHaveBeenCalled()
+    })
+
+    it('rejects incident numbers beyond the 32-bit server range', async () => {
+      await expect(sreCommand.parseAsync(['node', 'sre', 'triage', '2147483648']))
+        .rejects.toMatchObject({ exitCode: 3 })
+      expect(mockGet).not.toHaveBeenCalled()
     })
   })
 
@@ -170,8 +212,8 @@ describe('AI SRE CLI Commands', () => {
       const directionColumn = options.columns.find(({ header }) => header === 'Direction')
       const relatedServiceColumn = options.columns.find(({ header }) => header === 'Related Service ID')
 
-      expect(directionColumn?.format?.(undefined, mockDeps[0])).toBe('downstream')
-      expect(directionColumn?.format?.(undefined, mockDeps[1])).toBe('upstream')
+      expect(directionColumn?.format?.(undefined, mockDeps[0])).toBe('upstream (depends on)')
+      expect(directionColumn?.format?.(undefined, mockDeps[1])).toBe('downstream (depended on by)')
       expect(relatedServiceColumn?.format?.(undefined, mockDeps[0])).toBe('payment-api')
       expect(relatedServiceColumn?.format?.(undefined, mockDeps[1])).toBe('frontend-api')
     })
@@ -187,16 +229,16 @@ describe('AI SRE CLI Commands', () => {
       await sreCommand.parseAsync(['node', 'sre', command, '1'])
       expect(mockGet).toHaveBeenCalledWith('/api/sre/incidents', { incidentNumber: '1' })
       if (command === 'brief') {
-        expect(mockPostSse).toHaveBeenCalledWith('/api/sre/evidence-brief/stream', { incidentId }, expect.any(Function), expect.any(Number))
+        expect(mockPostSse).toHaveBeenCalledWith('/api/sre/evidence-brief/stream', { incidentId }, expect.any(Function), expect.objectContaining({ idleTimeoutMs: 60_000 }))
       } else {
-        expect(mockPost).toHaveBeenCalledWith(`/api/sre/${command}`, expect.objectContaining({ incidentId }))
+        expect(mockPost).toHaveBeenCalledWith(`/api/sre/${command}`, expect.objectContaining({ incidentId }), expect.objectContaining({ retries: 0 }))
       }
     })
 
     it('resolves the incident number for Copilot', async () => {
       mockGet.mockResolvedValueOnce({ data: { incidents: [{ id: incidentId, incidentNumber: 1 }] } })
       await sreCommand.parseAsync(['node', 'sre', 'ask', 'What failed?', '--incident', '1'])
-      expect(mockPostSse).toHaveBeenCalledWith('/api/sre/chat', expect.objectContaining({ incidentId }), expect.any(Function), expect.any(Number))
+      expect(mockPostSse).toHaveBeenCalledWith('/api/sre/chat', expect.objectContaining({ incidentId }), expect.any(Function), expect.objectContaining({ idleTimeoutMs: 60_000 }))
     })
 
     it.each(['get', 'timeline', 'resolve'])('resolves the displayed incident number for incident %s', async (command) => {
@@ -205,7 +247,7 @@ describe('AI SRE CLI Commands', () => {
       mockPost.mockResolvedValueOnce({ data: { success: true } })
       await incidentCommand.parseAsync(['node', 'incident', command, '1', ...(command === 'resolve' ? ['--comment', 'Fixed', '--force'] : [])])
       if (command === 'resolve') {
-        expect(mockPost).toHaveBeenCalledWith(`/api/sre/incidents/${incidentId}/resolve`, { comment: 'Fixed' })
+        expect(mockPost).toHaveBeenCalledWith(`/api/sre/incidents/${incidentId}/resolve`, { comment: 'Fixed' }, { retries: 0 })
       } else {
         expect(mockGet).toHaveBeenCalledWith(`/api/sre/incidents/${incidentId}${command === 'timeline' ? '/timeline' : ''}`)
       }
@@ -228,7 +270,7 @@ describe('AI SRE CLI Commands', () => {
 
       await sreCommand.parseAsync(['node', 'sre', 'triage', '018f0000-0000-7000-8000-000000000001'])
 
-      expect(mockPost).toHaveBeenCalledWith('/api/sre/triage', { incidentId: '018f0000-0000-7000-8000-000000000001' })
+      expect(mockPost).toHaveBeenCalledWith('/api/sre/triage', { incidentId: '018f0000-0000-7000-8000-000000000001' }, { timeout: 90_000, retries: 0 })
       expect(mockOutputDetail).toHaveBeenCalledWith(expect.objectContaining({ status: 'completed' }))
       expect(mockNarrative).toHaveBeenCalledWith('Triage summary', 'Triage complete')
     })
@@ -241,7 +283,7 @@ describe('AI SRE CLI Commands', () => {
       expect(mockPost).toHaveBeenCalledWith('/api/sre/investigate', {
         incidentId: '018f0000-0000-7000-8000-000000000001',
         useLiveConnectors: true,
-      })
+      }, { retries: 0 })
       expect(mockOutputDetail).toHaveBeenCalledWith(expect.objectContaining({ id: 'run-1', status: 'accepted' }))
     })
 
@@ -285,7 +327,7 @@ describe('AI SRE CLI Commands', () => {
           useLiveConnectorTools: true,
         },
         expect.any(Function),
-        expect.any(Number),
+        expect.objectContaining({ idleTimeoutMs: 60_000 }),
       )
     })
 
@@ -298,7 +340,7 @@ describe('AI SRE CLI Commands', () => {
         '/api/sre/evidence-brief/stream',
         { incidentId: '018f0000-0000-7000-8000-000000000001' },
         expect.any(Function),
-        expect.any(Number),
+        expect.objectContaining({ idleTimeoutMs: 60_000 }),
       )
     })
   })
@@ -362,4 +404,71 @@ describe('AI SRE CLI Commands', () => {
       await expect(testCommand.parseAsync(['node', 'test', 'status', 'test-1'])).rejects.toMatchObject({ exitCode: 1 })
     })
   })
+
+  describe('test tag commands', () => {
+    const TEST_ID = '019a0000-0000-7000-8000-000000000001'
+    const projectTags = [{ id: 'tag-smoke', name: 'Smoke' }, { id: 'tag-web', name: 'web' }]
+
+    it('test tag add keeps current tags and posts the merged set to the test', async () => {
+      mockGet.mockImplementation(async (path) => ({ data: path === '/api/tags' ? projectTags : [{ id: 'tag-web', name: 'web' }] }))
+      mockPost.mockResolvedValueOnce({ data: projectTags })
+      await testCommand.parseAsync(['node', 'test', 'tag', 'add', TEST_ID, 'smoke'])
+      expect(mockPost).toHaveBeenCalledWith(`/api/tests/${TEST_ID}/tags`, { tagIds: ['tag-web', 'tag-smoke'] })
+      expect(mockSuccess).toHaveBeenCalledWith(`Test ${TEST_ID} now has 2 tag(s)`)
+      mockGet.mockReset()
+    })
+
+    it('test tag remove posts the remaining set', async () => {
+      mockGet.mockImplementation(async (path) => ({ data: path === '/api/tags' ? projectTags : projectTags }))
+      mockPost.mockResolvedValueOnce({ data: [projectTags[1]] })
+      await testCommand.parseAsync(['node', 'test', 'tag', 'remove', TEST_ID, 'SMOKE'])
+      expect(mockPost).toHaveBeenCalledWith(`/api/tests/${TEST_ID}/tags`, { tagIds: ['tag-web'] })
+      mockGet.mockReset()
+    })
+
+    it('encodes the test id in the tag path', async () => {
+      mockGet.mockImplementation(async (path) => ({ data: path === '/api/tags' ? projectTags : [] }))
+      mockPost.mockResolvedValueOnce({ data: [] })
+      await testCommand.parseAsync(['node', 'test', 'tag', 'add', 'a/b', 'smoke'])
+      expect(mockPost).toHaveBeenCalledWith('/api/tests/a%2Fb/tags', { tagIds: ['tag-smoke'] })
+      mockGet.mockReset()
+    })
+  })
+
+  it.each(['create', 'update'])('test %s --file strips pulled @title/@priority/@tags annotations before sending', async (action) => {
+    const { mkdtempSync, rmSync, writeFileSync } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const dir = mkdtempSync(join(tmpdir(), 'supercheck-test-file-'))
+    const file = join(dir, 'home.pw.ts')
+    writeFileSync(file, "// @title Home\n// @priority high\n// @tags core\nimport { test } from '@playwright/test'\ntest('home', async () => {})\n")
+    const send = action === 'create' ? mockPost : mockPatch
+    send.mockResolvedValueOnce({ data: {} })
+    const args = action === 'create' ? ['create', '--title', 'Home'] : ['update', '019a0000-0000-7000-8000-000000000001']
+    try {
+      await testCommand.parseAsync(['node', 'test', ...args, '--file', file, '--type', 'browser'])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+    const [, body] = send.mock.calls.at(-1) as [string, { script: string }]
+    const script = Buffer.from(body.script, 'base64').toString('utf8')
+    expect(script).toContain("test('home'")
+    expect(script).not.toMatch(/@title|@priority|@tags/)
+  })
+
+  describe('test priority flags', () => {
+    it('test list sends a lowercase priority filter and rejects an unknown one', async () => {
+      mockGet.mockResolvedValueOnce({ data: { data: [], pagination: { total: 0, page: 1, limit: 50, totalPages: 1 } } })
+      await testCommand.parseAsync(['node', 'test', 'list', '--priority', 'HIGH'])
+      expect(mockGet).toHaveBeenCalledWith('/api/tests', expect.objectContaining({ priority: 'high' }))
+      await expect(testCommand.parseAsync(['node', 'test', 'list', '--priority', 'urgent'])).rejects.toThrow('Invalid priority')
+    })
+
+    it('test update --priority --dry-run previews the payload without sending it', async () => {
+      await testCommand.parseAsync(['node', 'test', 'update', '019a0000-0000-7000-8000-000000000001', '--priority', 'Low', '--dry-run'])
+      expect(mockOutputDetail).toHaveBeenCalledWith(expect.objectContaining({ dryRun: true, payload: expect.objectContaining({ priority: 'low' }) }))
+      expect(mockPost).not.toHaveBeenCalled()
+    })
+  })
 })
+

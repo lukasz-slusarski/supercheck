@@ -13,6 +13,26 @@ describe("queue location refresh", () => {
   const setupCapacityManagement = jest.fn().mockResolvedValue(undefined);
   const invalidateQueueEventHub = jest.fn().mockResolvedValue(undefined);
   const invalidateBullBoard = jest.fn();
+  const getActiveWorkerQueueNames = jest.fn();
+  const reserveSlot = jest.fn();
+  const enqueue = jest.fn();
+  const getExecutionPolicy = jest.fn();
+  const expire = jest.fn();
+  const persist = jest.fn();
+  const flowAddBulk = jest.fn();
+  const flowClose = jest.fn();
+  const persistMonitorCycle = jest.fn().mockResolvedValue({ created: true });
+  const abortMonitorCycle = jest.fn().mockResolvedValue(undefined);
+  const MonitorCycleClosedError = class extends Error { cycleId = "c"; status = "closed"; };
+  const set = jest.fn().mockResolvedValue("OK");
+  const pipeline = jest.fn(() => {
+    const results: Array<[null, string | number]> = [];
+    return {
+      type: (_key: string) => results.push([null, "hash"]),
+      persist: (key: string) => { persist(key); results.push([null, 1]); },
+      exec: async () => results,
+    };
+  });
 
   beforeEach(async () => {
     jest.resetModules();
@@ -25,7 +45,13 @@ describe("queue location refresh", () => {
     subscribers = [];
     subscriptionError = false;
     jobCounts = new Map();
+    flowClose.mockResolvedValue(undefined);
+    flowAddBulk.mockImplementation(async (flows: unknown[]) => flows.map(() => ({ job: { getState: async () => "waiting" } })));
     scan.mockResolvedValue(["0", []]);
+    getActiveWorkerQueueNames.mockResolvedValue(new Set());
+    reserveSlot.mockResolvedValue(0);
+    enqueue.mockResolvedValue({ id: "run" });
+    getExecutionPolicy.mockResolvedValue({ tier: "paid", priority: 0, runningCapacity: 5, queuedCapacity: 50 });
     jest.doMock("ioredis", () => ({
       __esModule: true,
       default: class extends EventEmitter {
@@ -51,12 +77,20 @@ describe("queue location refresh", () => {
         }
         scan = scan;
         publish = publish;
+        ttl = jest.fn().mockResolvedValue(-1);
+        expire = expire;
+        persist = persist;
+        type = jest.fn().mockResolvedValue("hash");
+        pipeline = pipeline;
+        set = set;
         quit = jest.fn().mockResolvedValue("OK");
       },
     }));
     jest.doMock("bullmq", () => ({
+      FlowProducer: class extends EventEmitter { addBulk = flowAddBulk; close = flowClose; },
       Queue: class extends EventEmitter {
         constructor(public name: string, public opts: object) { super(); }
+        add = enqueue;
         close = jest.fn().mockResolvedValue(undefined);
         clean = jest.fn().mockResolvedValue([]);
         trimEvents = jest.fn().mockResolvedValue(0);
@@ -79,6 +113,8 @@ describe("queue location refresh", () => {
     }) }));
     jest.doMock("./capacity-manager", () => ({
       setupCapacityManagement,
+      CapacityReservationUnavailableError: class extends Error {},
+      getCapacityManager: jest.fn(async () => ({ reserveSlot, trackJobOrganization: jest.fn(), releaseRunningSlot: jest.fn(), addToQueue: jest.fn().mockResolvedValue(1) })),
       reconcileCapacityCounters: jest.fn().mockResolvedValue(undefined),
       resetCapacityManager: jest.fn(),
     }));
@@ -89,6 +125,17 @@ describe("queue location refresh", () => {
     jest.doMock("./queue-event-hub", () => ({ invalidateQueueEventHub }));
     jest.doMock("./bull-board/state", () => ({ invalidateBullBoard }));
     jest.doMock("./monitor-location-routing", () => ({}));
+    jest.doMock("./monitor-cycles", () => ({
+      ...jest.requireActual("./monitor-cycles"),
+      persistMonitorCycle,
+      abortMonitorCycle,
+      MonitorCycleClosedError,
+    }));
+    jest.doMock("./execution/execution-policy", () => ({
+      getExecutionPolicy,
+      assertExecutionWorkload: jest.fn().mockResolvedValue(undefined),
+    }));
+    jest.doMock("./worker-registry", () => ({ getActiveWorkerQueueNames }));
     queueModule = await import("./queue");
   });
 
@@ -97,6 +144,16 @@ describe("queue location refresh", () => {
     jest.useRealTimers();
     jest.restoreAllMocks();
     Reflect.deleteProperty(globalThis, "__SUPERCHECK_QUEUE_SINGLETON__");
+  });
+
+  it.each(["addTestToQueue", "addJobToQueue", "addK6TestToQueue", "addK6JobToQueue"] as const)("%s stamps authoritative tier and priority after caller input", async (producer) => {
+    reserveSlot.mockResolvedValue(1);
+    getExecutionPolicy.mockResolvedValue({ tier: "trial", priority: 1, runningCapacity: 1, queuedCapacity: 10 });
+    getActiveWorkerQueueNames.mockResolvedValue(new Set(["k6-eu-central"]));
+    const task = { runId: "run", testId: "test", jobId: "job", organizationId: "org", projectId: "project", location: "eu-central", code: "code", script: "code", tests: [{ id: "test", script: "code" }], testScripts: [{ id: "test", script: "code" }], _executionTier: "paid" };
+    await queueModule[producer](task);
+    expect(enqueue).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ _executionTier: "trial" }), { jobId: "run", priority: 1 });
+    expect(getExecutionPolicy).toHaveBeenCalledWith("org");
   });
 
   it("adds locations while preserving global, scheduler, and existing regional clients", async () => {
@@ -158,6 +215,7 @@ describe("queue location refresh", () => {
     await jest.advanceTimersByTimeAsync(30_000);
     expect(euQueue.close).toHaveBeenCalledTimes(1);
     expect((await queueModule.getCapacityQueues()).k6Queues["eu-central"]).toBeUndefined();
+    expect(invalidateBullBoard).toHaveBeenCalled();
   });
 
   it("restores disabled-region admitted work for capacity accounting after an app restart", async () => {
@@ -170,6 +228,162 @@ describe("queue location refresh", () => {
     expect(retained).toBeDefined();
     expect(setupCapacityManagement.mock.calls[0][0].k6Queues["eu-central"]).toBe(retained);
     expect(setupCapacityManagement.mock.calls[0][1].k6Events["eu-central"]).toBeDefined();
+  });
+
+  it("never restores the k6 scheduler as execution capacity", async () => {
+    scan.mockResolvedValue(["0", ["bull:k6-job-scheduler:delayed"]]);
+    jobCounts.set("k6-job-scheduler", { delayed: 1 });
+    expect((await queueModule.getCapacityQueues()).k6Queues["job-scheduler"]).toBeUndefined();
+  });
+
+  it.each(["addK6TestToQueue", "addK6JobToQueue"] as const)(
+    "%s rejects an offline location before reserving capacity", async (method) => {
+      await expect(queueModule[method]({
+        runId: "run-1", testId: "test-1", organizationId: "org-1",
+        projectId: "project-1", script: "", tests: [], location: "eu-central",
+      })).rejects.toMatchObject({ code: "queue_unavailable" });
+      expect(reserveSlot).not.toHaveBeenCalled();
+    },
+  );
+
+  it("fails closed when worker heartbeat lookup fails", async () => {
+    getActiveWorkerQueueNames.mockRejectedValue(new Error("redis unavailable"));
+    await expect(queueModule.addK6TestToQueue({
+      runId: "run-1", testId: "test-1", organizationId: "org-1",
+      projectId: "project-1", script: "", tests: [], location: "global",
+    })).rejects.toMatchObject({ code: "queue_unavailable" });
+    expect(reserveSlot).not.toHaveBeenCalled();
+  });
+
+  it("never expires BullMQ control keys or unfinished job payloads during cleanup", async () => {
+    await queueModule.getQueues();
+    scan.mockResolvedValue(["0", ["bull:playwright-global:id", "bull:playwright-global:paused", "bull:playwright-global:marker", "bull:playwright-global:run-1"]]);
+    await jest.advanceTimersByTimeAsync(12 * 60 * 60 * 1000);
+    expect(expire).not.toHaveBeenCalled();
+    expect(persist).toHaveBeenCalledWith("bull:playwright-global:run-1");
+  });
+
+  it("repairs legacy job expiry in a retained disabled region after restart", async () => {
+    enabledCodes = [];
+    scan.mockImplementation(async (_cursor: string, _match: string, pattern: string) =>
+      ["0", pattern === "bull:k6-*:*" || pattern === "bull:k6-retired:*" ? ["bull:k6-retired:run-1"] : []]);
+    jobCounts.set("k6-retired", { waiting: 1 });
+    await queueModule.getQueues();
+    expect(persist).toHaveBeenCalledWith("bull:k6-retired:run-1");
+  });
+
+  it("publishes all regional monitor jobs in one transaction with one expected-location snapshot", async () => {
+    enabledCodes = ["eu-central", "us-east"];
+    const { monitorExecutionQueue } = await queueModule.getQueues();
+    const task = { monitorId: "monitor-1", type: "website" as const, target: "https://example.com" };
+    const group = await queueModule.enqueueMonitorLocationJobs(monitorExecutionQueue, task, enabledCodes, { attempts: 3 });
+    expect(flowAddBulk).toHaveBeenCalledTimes(1);
+    const flows = flowAddBulk.mock.calls[0][0];
+    expect(flows.map((flow: { queueName: string }) => flow.queueName)).toEqual(["monitor-eu-central", "monitor-us-east"]);
+    for (const flow of flows) {
+      expect(flow.data).toMatchObject({ executionGroupId: group, expectedLocations: enabledCodes });
+      expect(flow.opts.jobId).not.toContain(":");
+    }
+    expect(flowClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("surfaces an individual Redis enqueue script failure and closes the flow", async () => {
+    const { monitorExecutionQueue } = await queueModule.getQueues();
+    flowAddBulk.mockResolvedValue([{ job: { getState: async () => "unknown" } }]);
+    await expect(queueModule.enqueueMonitorLocationJobs(monitorExecutionQueue,
+      { monitorId: "monitor-1", type: "website", target: "https://example.com" },
+      enabledCodes, { attempts: 3 })).rejects.toThrow("incomplete cycle enqueue");
+    expect(flowClose).toHaveBeenCalledTimes(1);
+    expect(set).toHaveBeenCalledWith(expect.stringMatching(/^monitor:aggr:aborted:/), "1", "EX", 604800);
+  });
+
+  describe("missing-cycle closure", () => {
+    const task = { monitorId: "monitor-1", type: "website" as const, target: "https://example.com" };
+    const cycle = (overrides: Record<string, unknown> = {}) => ({
+      key: "repeat:abc:1000",
+      configuredLocations: ["eu-central", "us-east", "ap-south"],
+      policy: { strategy: "majority" as const, threshold: 50 },
+      abortOnFailure: true,
+      ...overrides,
+    });
+    afterEach(() => { delete process.env.MISSING_CYCLE_CLOSURE_ENABLED; });
+
+    it("leaves publication untouched while the flag is off", async () => {
+      enabledCodes = ["eu-central", "us-east"];
+      const { monitorExecutionQueue } = await queueModule.getQueues();
+      await queueModule.enqueueMonitorLocationJobs(monitorExecutionQueue, task, enabledCodes, { attempts: 3 }, cycle());
+      expect(persistMonitorCycle).not.toHaveBeenCalled();
+      expect(flowAddBulk.mock.calls[0][0][0].opts.jobId).toMatch(/^monitor-1-[0-9a-f-]{36}-eu-central$/);
+    });
+
+    it("persists the configured-region snapshot before publishing, under a stable bullmq-safe id", async () => {
+      process.env.MISSING_CYCLE_CLOSURE_ENABLED = "true";
+      enabledCodes = ["eu-central", "us-east"];
+      const { monitorExecutionQueue } = await queueModule.getQueues();
+      const order: string[] = [];
+      persistMonitorCycle.mockImplementation(async () => { order.push("persist"); return { created: true }; });
+      flowAddBulk.mockImplementation(async (flows: unknown[]) => { order.push("publish"); return flows.map(() => ({ job: { getState: async () => "waiting" } })); });
+      const first = await queueModule.enqueueMonitorLocationJobs(monitorExecutionQueue, task, enabledCodes, { attempts: 3 }, cycle());
+      const retry = await queueModule.enqueueMonitorLocationJobs(monitorExecutionQueue, task, enabledCodes, { attempts: 3 }, cycle());
+      expect(order.slice(0, 2)).toEqual(["persist", "publish"]);
+      expect(retry).toBe(first);
+      expect(first).not.toContain(":");
+      // Skipped (offline) regions stay in the snapshot so they count as missing at the deadline.
+      expect(persistMonitorCycle).toHaveBeenCalledWith(expect.objectContaining({
+        id: first,
+        monitorId: "monitor-1",
+        configuredLocations: ["eu-central", "us-east", "ap-south"],
+      }));
+      for (const flow of flowAddBulk.mock.calls[0][0]) expect(flow.data.executionGroupId).toBe(first);
+    });
+
+    it("uses distinct cycles for different scheduled runs", async () => {
+      process.env.MISSING_CYCLE_CLOSURE_ENABLED = "true";
+      enabledCodes = ["eu-central"];
+      const { monitorExecutionQueue } = await queueModule.getQueues();
+      flowAddBulk.mockImplementation(async (flows: unknown[]) => flows.map(() => ({ job: { getState: async () => "waiting" } })));
+      const a = await queueModule.enqueueMonitorLocationJobs(monitorExecutionQueue, task, enabledCodes, {}, cycle({ key: "repeat:abc:1000" }));
+      const b = await queueModule.enqueueMonitorLocationJobs(monitorExecutionQueue, task, enabledCodes, {}, cycle({ key: "repeat:abc:2000" }));
+      expect(a).not.toBe(b);
+    });
+
+    it("keeps the cycle open for a scheduler retry and never sets the sticky abort marker", async () => {
+      process.env.MISSING_CYCLE_CLOSURE_ENABLED = "true";
+      const { monitorExecutionQueue } = await queueModule.getQueues();
+      flowAddBulk.mockResolvedValue([{ job: { getState: async () => "unknown" } }]);
+      await expect(queueModule.enqueueMonitorLocationJobs(monitorExecutionQueue, task, enabledCodes, {}, cycle({ abortOnFailure: false }))).rejects.toThrow("incomplete cycle enqueue");
+      expect(abortMonitorCycle).not.toHaveBeenCalled();
+      expect(set).not.toHaveBeenCalled();
+    });
+
+    it("aborts when the cycle cannot be persisted or Redis setup fails after a final attempt", async () => {
+      process.env.MISSING_CYCLE_CLOSURE_ENABLED = "true";
+      const { monitorExecutionQueue } = await queueModule.getQueues();
+      persistMonitorCycle.mockRejectedValueOnce(new Error("database unavailable"));
+      await expect(queueModule.enqueueMonitorLocationJobs(monitorExecutionQueue, task, enabledCodes, {}, cycle())).rejects.toThrow("database unavailable");
+      expect(abortMonitorCycle).toHaveBeenCalledTimes(1);
+      expect(flowAddBulk).not.toHaveBeenCalled();
+      expect(set).not.toHaveBeenCalled();
+    });
+
+    it("refuses to publish into a cycle that already closed and leaves its outcome alone", async () => {
+      process.env.MISSING_CYCLE_CLOSURE_ENABLED = "true";
+      const { monitorExecutionQueue } = await queueModule.getQueues();
+      persistMonitorCycle.mockRejectedValueOnce(new MonitorCycleClosedError());
+      await expect(queueModule.enqueueMonitorLocationJobs(monitorExecutionQueue, task, enabledCodes, {}, cycle())).rejects.toBeInstanceOf(MonitorCycleClosedError);
+      expect(flowAddBulk).not.toHaveBeenCalled();
+      expect(abortMonitorCycle).not.toHaveBeenCalled();
+      expect(set).not.toHaveBeenCalled();
+    });
+
+    it("aborts the cycle when no retry remains so it can never close as downtime", async () => {
+      process.env.MISSING_CYCLE_CLOSURE_ENABLED = "true";
+      const { monitorExecutionQueue } = await queueModule.getQueues();
+      flowAddBulk.mockResolvedValue([{ job: { getState: async () => "unknown" } }]);
+      await expect(queueModule.enqueueMonitorLocationJobs(monitorExecutionQueue, task, enabledCodes, {}, cycle())).rejects.toThrow("incomplete cycle enqueue");
+      expect(abortMonitorCycle).toHaveBeenCalledTimes(1);
+      expect(set).not.toHaveBeenCalled();
+    });
   });
 
   it("applies a remote notification without publishing it again", async () => {

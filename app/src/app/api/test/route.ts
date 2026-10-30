@@ -1,6 +1,7 @@
+import { getExecutionPolicy, type ExecutionPolicy } from "@/lib/execution/execution-policy";
 import { NextRequest, NextResponse } from "next/server";
 import crypto from "crypto";
-import { eq } from "drizzle-orm";
+import { eq, and, inArray } from "drizzle-orm";
 import {
   addK6TestToQueue,
   addTestToQueue,
@@ -15,7 +16,11 @@ import { resolveProjectVariables, extractVariableNames, type VariableResolutionR
 import { isK6Script, validateK6Script } from "@/lib/k6-validator";
 import { db } from "@/utils/db";
 import { runs, type K6Location } from "@/db/schema";
-import { resolveProjectK6Location } from "@/lib/location-registry";
+import {
+  assertProjectSupportsBrowser,
+  LocationWorkloadUnavailableError,
+  resolveProjectK6Location,
+} from "@/lib/location-registry";
 import { polarUsageService } from "@/lib/services/polar-usage.service";
 import { buildBillingBlockedResponse } from "@/lib/billing-errors";
 import { checkExecutionRateLimit } from "@/lib/execution-rate-limiter";
@@ -23,8 +28,10 @@ import {
   buildExecutionQueueErrorResponse,
   buildExecutionRateLimitResponse,
   getSafeExecutionQueueErrorDetails,
+  buildExecutionPolicyFailureResponse,
 } from "@/lib/execution-api-responses";
 import { requireSameOriginRequest } from "@/lib/security/same-origin";
+import { MAX_SCRIPT_LENGTH } from "@/lib/validations/common";
 
 function buildReportProxyUrl(entityId: string): string {
   return `/api/test-results/${encodeURIComponent(entityId)}/report/index.html?forceIframe=true`;
@@ -50,7 +57,13 @@ export async function POST(request: NextRequest) {
 	      );
 	    }
 
-	    const spendingBlock = await polarUsageService.shouldBlockUsage(organizationId);
+	    let executionPolicy: ExecutionPolicy;
+    try {
+        executionPolicy = await getExecutionPolicy(organizationId);
+      } catch (error) {
+        return buildExecutionPolicyFailureResponse(error);
+      }
+      const spendingBlock = executionPolicy.tier === "paid" ? await polarUsageService.shouldBlockUsage(organizationId) : { blocked: false };
 	    if (spendingBlock.blocked) {
 	      return NextResponse.json(
 	        buildBillingBlockedResponse(spendingBlock.reason),
@@ -84,6 +97,13 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    if (code.length > MAX_SCRIPT_LENGTH) {
+      return NextResponse.json(
+        { error: `Script cannot exceed ${MAX_SCRIPT_LENGTH} characters` },
+        { status: 413 }
+      );
+    }
+
     // Validate the script first - only queue if validation passes
     console.log("Validating script before queuing...");
     try {
@@ -109,7 +129,7 @@ export async function POST(request: NextRequest) {
       console.error("Validation service error:", errorMessage);
       return NextResponse.json({
         error: "Script validation failed",
-        validationError: `Validation service error: ${errorMessage}`,
+        validationError: "Validation service error",
         isValidationError: true,
       }, { status: 500 });
     }
@@ -137,6 +157,18 @@ export async function POST(request: NextRequest) {
           },
           { status: 400 }
         );
+      }
+    }
+
+
+    if (!isPerformanceTest) {
+      try {
+        await assertProjectSupportsBrowser(project.id);
+      } catch (error) {
+        // Only the expected error is user-facing; anything else (e.g. a database
+        // failure) must not leak details and is handled by the route's outer catch.
+        if (!(error instanceof LocationWorkloadUnavailableError)) throw error;
+        return NextResponse.json({ error: error.message }, { status: 400 });
       }
     }
 
@@ -267,7 +299,7 @@ export async function POST(request: NextRequest) {
             await db
               .update(runs)
               .set({ status: queueResult.status })
-              .where(eq(runs.id, runIdForQueue));
+              .where(and(eq(runs.id, runIdForQueue), eq(runs.status, 'queued')));
           } catch (statusError) {
             console.error(
               `[Test API] Failed to persist admitted run status for ${runIdForQueue}:`,
@@ -296,7 +328,7 @@ export async function POST(request: NextRequest) {
             await db
               .update(runs)
               .set({ status: queueResult.status })
-              .where(eq(runs.id, runIdForQueue));
+              .where(and(eq(runs.id, runIdForQueue), eq(runs.status, 'queued')));
           } catch (statusError) {
             console.error(
               `[Test API] Failed to persist admitted run status for ${runIdForQueue}:`,
@@ -349,7 +381,7 @@ export async function POST(request: NextRequest) {
               completedAt: new Date(),
               errorDetails: getSafeExecutionQueueErrorDetails(error),
             })
-            .where(eq(runs.id, runIdForQueue));
+            .where(and(eq(runs.id, runIdForQueue), inArray(runs.status, ['queued', 'running'])));
         } catch (statusError) {
           console.error(
             `[Test API] Failed to finalize rejected run ${runIdForQueue}:`,
@@ -369,8 +401,7 @@ export async function POST(request: NextRequest) {
     }
 
     // Return a stable internal report proxy URL for backward compatibility.
-    // Playwright playground reports are keyed by ephemeral testId (worker
-    // stores reports.entityId = testId); k6 reports are keyed by run id.
+    // Reports are run-owned; the proxy resolves legacy playground testId aliases.
     // /api/test-results authorizes playground testIds via runs.metadata.testId.
     const reportEntityId = isPerformanceTest
       ? runIdForQueue || testId

@@ -79,6 +79,7 @@ module.exports = defineConfig({
       {
         outputFolder: htmlReportDir,
         open: 'never',
+        mergeFiles: true,
       },
     ], // Always generate HTML reports for S3 upload
     ['list'], // Console output for debugging
@@ -100,7 +101,11 @@ module.exports = defineConfig({
   },
 
   /* Suite timeout: max time for ALL tests combined to complete */
-  globalTimeout: 300000, // 5 minutes total
+  // 5 minutes total. A limited (trial) run sets PLAYWRIGHT_GLOBAL_TIMEOUT_MS to the time it reserved.
+  globalTimeout: (() => {
+    const reserved = Number.parseInt(process.env.PLAYWRIGHT_GLOBAL_TIMEOUT_MS || '', 10);
+    return Number.isSafeInteger(reserved) && reserved >= 1000 ? Math.min(reserved, 300000) : 300000;
+  })(),
 
   /* Optimized settings for Supercheck execution environment */
   use: {
@@ -113,9 +118,9 @@ module.exports = defineConfig({
     timezoneId: 'UTC',
 
     /* Artifact collection strategy - configurable via environment variables */
-    trace: process.env.PLAYWRIGHT_TRACE || 'retain-on-failure',
+    trace: process.env.PLAYWRIGHT_TRACE || 'retain-on-failure-and-retries',
     screenshot: process.env.PLAYWRIGHT_SCREENSHOT || 'on',
-    video: process.env.PLAYWRIGHT_VIDEO || 'retain-on-failure',
+    video: process.env.PLAYWRIGHT_VIDEO || 'retain-on-failure-and-retries',
 
     /* Browser optimization for resource efficiency - browser-specific args moved to projects */
 
@@ -141,6 +146,8 @@ module.exports = defineConfig({
       grepInvert: /@(mobile|iphone|firefox|webkit|safari)\b/i,
       use: {
         ...devices['Desktop Chrome'],
+        // 1.64 forwards screen from device descriptors; pinned for parity, revisit deliberately.
+        screen: undefined,
         // Override with optimized settings
         viewport: { width: 1280, height: 720 }, // Standard viewport for consistent results
         // Enable headless mode for better performance
@@ -157,6 +164,8 @@ module.exports = defineConfig({
       grep: /@firefox\b/i,
       use: {
         ...devices['Desktop Firefox'],
+        // Firefox 157 defaults to a larger screen; preserve the pre-upgrade viewport-sized screen.
+        screen: { width: 1280, height: 720 },
         viewport: { width: 1280, height: 720 },
         headless: true,
         // Firefox-specific launch options
@@ -179,6 +188,8 @@ module.exports = defineConfig({
       grep: /@(webkit|safari)\b/i,
       use: {
         ...devices['Desktop Safari'],
+        // 1.64 forwards screen from device descriptors; pinned for parity, revisit deliberately.
+        screen: undefined,
         viewport: { width: 1280, height: 720 },
         headless: true,
         // WebKit-specific launch options
@@ -196,6 +207,8 @@ module.exports = defineConfig({
       grep: /@(mobile|iphone)\b/i,
       use: {
         ...devices['iPhone 13'],
+        // 1.64 forwards screen from device descriptors; pinned for parity, revisit deliberately.
+        screen: undefined,
         headless: true,
       },
     },

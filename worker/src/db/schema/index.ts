@@ -30,6 +30,7 @@ export * from './monitor';
 
 // Monitor aggregates for long-term metrics
 export * from './monitor-aggregates';
+export * from './monitor-cycles';
 
 // Notification and alert tables
 export * from './notification';
@@ -54,3 +55,6 @@ export * from './billing';
 
 // AI SRE service topology, incidents, evidence, connectors, and chat
 export * from './sre';
+
+export * from './execution-entitlements';
+export * from './run-callback';

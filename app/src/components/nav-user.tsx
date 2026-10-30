@@ -13,8 +13,12 @@ import {
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useTheme } from "next-themes";
-import { Moon, Sun, User, Monitor } from "lucide-react";
+import { Moon, Sun, User, Monitor, Plug, Code } from "lucide-react";
+import Link from "next/link";
+import { useAppConfig } from "@/hooks/use-app-config";
 import { useProjectContextSafe, clearProjectsCache } from "@/hooks/use-project-context";
+import { resetChatwootSession } from "@/components/support/chatwoot-widget";
+import { LeaveOrganizationDialog } from "@/components/leave-organization-dialog";
 import { clearQueryCache } from "@/lib/query-provider";
 
 export function NavUser() {
@@ -22,6 +26,7 @@ export function NavUser() {
   const user = session?.user;
   const hasData = user !== undefined && user !== null;
   const { theme, setTheme } = useTheme();
+  const { isMcpEnabled } = useAppConfig();
 
   const isMounted = useSyncExternalStore(
     () => () => {},
@@ -37,6 +42,7 @@ export function NavUser() {
     // Clear all caches to prevent data leakage between sessions
     clearProjectsCache();
     clearQueryCache();
+    resetChatwootSession(); // Drop the support-chat contact so the next user never sees this conversation
     await signOut();
     // Sign-out crosses an authentication boundary. Replace the history entry
     // with a same-origin document navigation to avoid reusing private UI state.
@@ -99,7 +105,24 @@ export function NavUser() {
           <span className="ml-auto">{theme === "light" && <span className="inline-block w-2 h-2 rounded-full bg-primary" />}</span>
         </DropdownMenuItem>
 
+        {isMcpEnabled && (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem asChild>
+              <Link href="/connected-apps" data-testid="connected-apps-link">
+                <Plug className="h-4 w-4 mr-2" />Connected apps
+              </Link>
+            </DropdownMenuItem>
+          </>
+        )}
+
         <DropdownMenuSeparator />
+        <DropdownMenuItem asChild>
+          <a href={process.env.NEXT_PUBLIC_SOURCE_URL || "https://github.com/supercheck-io/supercheck"} target="_blank" rel="noopener noreferrer">
+            <Code className="h-4 w-4 mr-2" />Source code
+          </a>
+        </DropdownMenuItem>
+        <LeaveOrganizationDialog />
         <DropdownMenuItem onClick={handleLogout} data-testid="sign-out-button">Log out</DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>

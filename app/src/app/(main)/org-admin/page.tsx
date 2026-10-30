@@ -14,6 +14,11 @@ import { TableBadge } from "@/components/ui/table-badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
+import {
   Dialog,
   DialogContent,
   DialogDescription,
@@ -32,14 +37,18 @@ import {
   RadioTower,
   Cable,
   SquareLibrary,
+  ChevronDown,
 } from "lucide-react";
 import { toast } from "sonner";
 import { AuditLogsTable } from "@/components/admin/audit-logs-table";
 import { CliTokensTable } from "@/components/admin/cli-tokens-table";
 import { MembersTable } from "@/components/org-admin/members-table";
 import { ProjectsTable } from "@/components/org-admin/projects-table";
+import { TabSectionHeader } from "@/components/org-admin/tab-section-header";
+import type { Project } from "@/components/org-admin/project-columns";
 import { ProjectLocationsDialog } from "@/components/org-admin/project-locations-dialog";
 import { SubscriptionTab } from "@/components/org-admin/subscription-tab";
+import { TrialLoadTesting } from "@/components/org-admin/trial-load-testing";
 import { MemberAccessDialog } from "@/components/members/MemberAccessDialog";
 import { PrivateAgentsAdminView } from "@/components/sre/private-agents/private-agents-admin-view";
 import { ConnectorAdminView } from "@/components/sre/connectors/connector-admin-view";
@@ -114,17 +123,6 @@ interface PendingInvitation {
   inviterEmail: string;
 }
 
-interface Project {
-  id: string;
-  name: string;
-  slug?: string;
-  description?: string;
-  isDefault: boolean;
-  status: "active" | "archived" | "deleted";
-  createdAt: string;
-  membersCount: number;
-}
-
 interface OrgDetails {
   id: string;
   name: string;
@@ -165,11 +163,7 @@ type SrePrivateAgentsResponse =
   | { success: false; error: string; agents: [] };
 
 const ADMIN_SETUP_FETCH_TIMEOUT_MS = 15000;
-const SRE_SETUP_TABS = new Set([
-  "integrations",
-  "diagnostic-recipes",
-  "private-agents",
-]);
+const SRE_SETUP_TABS = new Set(["integrations", "private-agents"]);
 
 async function fetchAdminSetupJson<T>(url: string): Promise<T> {
   const controller = new AbortController();
@@ -237,7 +231,6 @@ function OrgAdminDashboardContent() {
             "cli-tokens",
             "audit",
             "integrations",
-            "diagnostic-recipes",
             "private-agents",
             "subscription",
           ]
@@ -247,7 +240,6 @@ function OrgAdminDashboardContent() {
             "cli-tokens",
             "audit",
             "integrations",
-            "diagnostic-recipes",
             "private-agents",
           ],
     [isCloudHosted],
@@ -257,8 +249,8 @@ function OrgAdminDashboardContent() {
   const normalizedRequestedTab =
     requestedTab === "sre-setup"
       ? "private-agents"
-      : requestedTab === "runbooks"
-        ? "diagnostic-recipes"
+      : requestedTab === "runbooks" || requestedTab === "diagnostic-recipes"
+        ? "integrations"
         : requestedTab;
   const safeTab =
     normalizedRequestedTab && allowedTabs.includes(normalizedRequestedTab)
@@ -266,6 +258,13 @@ function OrgAdminDashboardContent() {
       : "projects";
 
   const [activeTab, setActiveTab] = useState(safeTab);
+  const requestedSavedQueries =
+    searchParams.get("section") === "saved-queries" ||
+    requestedTab === "runbooks" ||
+    requestedTab === "diagnostic-recipes";
+  const [savedQueriesOpen, setSavedQueriesOpen] = useState(
+    requestedSavedQueries,
+  );
 
   const { details: orgDetails, isLoading: detailsLoading } = useOrgDetails();
   const {
@@ -332,7 +331,6 @@ function OrgAdminDashboardContent() {
   const [diagnosticLoadError, setDiagnosticLoadError] = useState<string | null>(
     null,
   );
-  const [diagnosticLoading, setDiagnosticLoading] = useState(false);
   const [diagnosticLoaded, setDiagnosticLoaded] = useState(
     Boolean(cachedDiagnostic),
   );
@@ -353,19 +351,14 @@ function OrgAdminDashboardContent() {
   const hasData = orgDetails !== null;
   const isInitialLoading = !isMounted || (!hasData && detailsLoading);
 
-  // Note: membersCount is not available from the API currently.
-  // The Project interface requires it, but the /api/projects endpoint
-  // doesn't return per-project member counts. Setting to 0 for now.
-  // TODO: Add members count to /api/projects response if needed.
   const projects: Project[] = orgProjects.map((p) => ({
     id: p.id,
     name: p.name,
     slug: p.slug,
     description: p.description,
     isDefault: p.isDefault,
-    status: "active" as const,
     createdAt: p.createdAt,
-    membersCount: 0,
+    membersCount: p.membersCount ?? 0,
   }));
 
   const [showInviteDialog, setShowInviteDialog] = useState(false);
@@ -415,7 +408,7 @@ function OrgAdminDashboardContent() {
   useEffect(() => {
     setBreadcrumbs([
       { label: "Home", href: "/", isCurrentPage: false },
-      { label: "Organization Admin", href: "/org-admin", isCurrentPage: true },
+      { label: "Organization", href: "/org-admin", isCurrentPage: true },
     ]);
     return () => setBreadcrumbs([]);
   }, [setBreadcrumbs]);
@@ -423,6 +416,10 @@ function OrgAdminDashboardContent() {
   useEffect(() => {
     setActiveTab(safeTab);
   }, [safeTab]);
+
+  useEffect(() => {
+    setSavedQueriesOpen(requestedSavedQueries);
+  }, [requestedSavedQueries]);
 
   useEffect(() => {
     if (requestedTab === "services") {
@@ -436,6 +433,7 @@ function OrgAdminDashboardContent() {
     ) {
       const params = new URLSearchParams(searchParams.toString());
       params.set("tab", safeTab);
+      if (requestedSavedQueries) params.set("section", "saved-queries");
       router.replace(`${pathname}?${params.toString()}`, { scroll: false });
     }
   }, [
@@ -443,6 +441,7 @@ function OrgAdminDashboardContent() {
     normalizedRequestedTab,
     pathname,
     requestedTab,
+    requestedSavedQueries,
     router,
     safeTab,
     searchParams,
@@ -491,12 +490,11 @@ function OrgAdminDashboardContent() {
   }, [activeTab, integrationsLoaded, projectId, queryClient]);
 
   useEffect(() => {
-    if (activeTab !== "diagnostic-recipes" || diagnosticLoaded) {
+    if (activeTab !== "integrations" || !savedQueriesOpen || diagnosticLoaded) {
       return;
     }
 
     let isCancelled = false;
-    setDiagnosticLoading(true);
 
     queryClient
       .fetchQuery({
@@ -517,19 +515,16 @@ function OrgAdminDashboardContent() {
       })
       .catch((error) => {
         if (isCancelled) return;
-        console.error("Error loading diagnostic recipes:", error);
+        console.error("Error loading saved queries:", error);
         setDiagnosticQueries([]);
-        setDiagnosticLoadError("Failed to fetch diagnostic recipes");
+        setDiagnosticLoadError("Failed to fetch saved queries");
         setDiagnosticLoaded(true);
-      })
-      .finally(() => {
-        if (!isCancelled) setDiagnosticLoading(false);
       });
 
     return () => {
       isCancelled = true;
     };
-  }, [activeTab, diagnosticLoaded, projectId, queryClient]);
+  }, [activeTab, savedQueriesOpen, diagnosticLoaded, projectId, queryClient]);
 
   useEffect(() => {
     if (activeTab !== "private-agents" || privateAgentsLoaded) {
@@ -585,11 +580,22 @@ function OrgAdminDashboardContent() {
       params.set("tab", value);
     }
     params.delete("action");
+    params.delete("section");
+    setSavedQueriesOpen(false);
 
     const nextUrl = params.toString()
       ? `${pathname}?${params.toString()}`
       : pathname;
     router.replace(nextUrl, { scroll: false });
+  };
+
+  const handleSavedQueriesOpenChange = (open: boolean) => {
+    setSavedQueriesOpen(open);
+    const params = new URLSearchParams(searchParams.toString());
+    params.set("tab", "integrations");
+    if (open) params.set("section", "saved-queries");
+    else params.delete("section");
+    router.replace(`${pathname}?${params.toString()}`, { scroll: false });
   };
 
   const handleSreSetupChanged = () => {
@@ -598,6 +604,7 @@ function OrgAdminDashboardContent() {
       queryKey: getSreEvidenceGraphQueryKey(projectId),
     });
     setSreSetupLoaded(false);
+    setDiagnosticLoaded(false);
   };
 
   const handleRenameOrganization = async () => {
@@ -608,8 +615,8 @@ function OrgAdminDashboardContent() {
     try {
       updateOrganizationNameSchema.parse({ name: trimmedName });
     } catch (error) {
-      if (error instanceof z.ZodError && error.errors.length > 0) {
-        toast.error(error.errors[0].message);
+      if (error instanceof z.ZodError && error.issues.length > 0) {
+        toast.error(error.issues[0].message);
         return;
       }
       toast.error("Please enter a valid organization name");
@@ -655,8 +662,8 @@ function OrgAdminDashboardContent() {
     } catch (error) {
       if (error instanceof Error) {
         const zodError = error as z.ZodError;
-        if (zodError.errors && zodError.errors.length > 0) {
-          toast.error(zodError.errors[0].message);
+        if (zodError.issues && zodError.issues.length > 0) {
+          toast.error(zodError.issues[0].message);
           return;
         }
       }
@@ -730,8 +737,8 @@ function OrgAdminDashboardContent() {
     } catch (error) {
       if (error instanceof Error) {
         const zodError = error as z.ZodError;
-        if (zodError.errors && zodError.errors.length > 0) {
-          toast.error(zodError.errors[0].message);
+        if (zodError.issues && zodError.issues.length > 0) {
+          toast.error(zodError.issues[0].message);
           return;
         }
       }
@@ -802,7 +809,7 @@ function OrgAdminDashboardContent() {
           <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
             <div>
               <h1 className="text-2xl font-bold tracking-tight">
-                Organization Admin
+                Organization
               </h1>
               <p className="text-muted-foreground text-sm">
                 Manage projects, members, tokens, Private Agents, and audit
@@ -864,13 +871,6 @@ function OrgAdminDashboardContent() {
                 <span className="hidden sm:inline">Integrations</span>
               </TabsTrigger>
               <TabsTrigger
-                value="diagnostic-recipes"
-                className="flex items-center gap-2"
-              >
-                <SquareLibrary className="h-4 w-4" />
-                <span className="hidden sm:inline">Diagnostic Recipes</span>
-              </TabsTrigger>
-              <TabsTrigger
                 value="private-agents"
                 className="flex items-center gap-2"
               >
@@ -889,6 +889,11 @@ function OrgAdminDashboardContent() {
             </TabsList>
 
             <TabsContent value="projects" className="space-y-4">
+              <TabSectionHeader
+                icon={<FolderOpen />}
+                title="Projects"
+                description="Organize tests, monitors, and runs into projects."
+              />
               {projectsLoading && projects.length === 0 ? (
                 <TabLoadingSpinner message="Loading projects..." />
               ) : (
@@ -1062,6 +1067,11 @@ function OrgAdminDashboardContent() {
             </TabsContent>
 
             <TabsContent value="members" className="space-y-4">
+              <TabSectionHeader
+                icon={<Users />}
+                title="Members"
+                description="Invite people and manage their roles and project access."
+              />
               {membersLoading ? (
                 <TabLoadingSpinner message="Loading members..." />
               ) : (
@@ -1090,12 +1100,14 @@ function OrgAdminDashboardContent() {
                   onMemberUpdate={() => {
                     invalidateMembers();
                     invalidateStats();
+                    // Role and project-access changes move the per-project member counts.
+                    invalidateProjects();
                   }}
                   onInviteMember={() => setShowInviteDialog(true)}
                   canInviteMembers={canInviteMembers(
                     normalizeRole(currentUserRole),
                   )}
-                  projects={projects.filter((p) => p.status === "active")}
+                  projects={projects}
                 />
               )}
 
@@ -1104,7 +1116,7 @@ function OrgAdminDashboardContent() {
                 open={showInviteDialog}
                 onOpenChange={setShowInviteDialog}
                 mode="invite"
-                projects={projects.filter((p) => p.status === "active")}
+                projects={projects}
                 onSubmit={async (memberData) => {
                   setInviting(true);
                   try {
@@ -1146,6 +1158,11 @@ function OrgAdminDashboardContent() {
             </TabsContent>
 
             <TabsContent value="integrations" className="space-y-4">
+              <TabSectionHeader
+                icon={<Cable />}
+                title="Integrations"
+                description="Connect read-only evidence sources Copilot can use during investigations."
+              />
               {integrationsLoading && !integrationsLoaded ? (
                 <TabLoadingSpinner message="Loading integrations..." />
               ) : (
@@ -1159,20 +1176,45 @@ function OrgAdminDashboardContent() {
                   onSetupChanged={handleSreSetupChanged}
                 />
               )}
-            </TabsContent>
-
-            <TabsContent value="diagnostic-recipes" className="space-y-4">
-              {diagnosticLoading && !diagnosticLoaded ? (
-                <TabLoadingSpinner message="Loading diagnostic recipes..." />
-              ) : (
-                <DiagnosticQueriesAdminView
-                  initialQueries={diagnosticQueries}
-                  setupOptions={diagnosticSetupOptions}
-                  loadError={diagnosticLoadError}
-                  setupStatus={sreSetupStatus}
-                  onSetupChanged={handleSreSetupChanged}
-                />
-              )}
+              <Collapsible
+                open={savedQueriesOpen}
+                onOpenChange={handleSavedQueriesOpenChange}
+                className="space-y-3"
+              >
+                <CollapsibleTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    className="h-auto w-full justify-between gap-3 whitespace-normal rounded-lg border p-4 text-left"
+                  >
+                    <span className="flex min-w-0 items-center gap-2">
+                      <SquareLibrary className="h-4 w-4 shrink-0 text-muted-foreground" />
+                      Saved queries
+                      <TableBadge compact>Optional</TableBadge>
+                    </span>
+                    <ChevronDown
+                      className={`h-4 w-4 shrink-0 transition-transform ${savedQueriesOpen ? "rotate-180" : ""}`}
+                    />
+                  </Button>
+                </CollapsibleTrigger>
+                <CollapsibleContent className="space-y-4">
+                  <p className="text-sm text-muted-foreground">
+                    Reuse read-only queries for common investigation questions.
+                    Investigations work without them.
+                  </p>
+                  {!diagnosticLoaded ? (
+                    <TabLoadingSpinner message="Loading saved queries..." />
+                  ) : (
+                    <DiagnosticQueriesAdminView
+                      initialQueries={diagnosticQueries}
+                      setupOptions={diagnosticSetupOptions}
+                      loadError={diagnosticLoadError}
+                      setupStatus={sreSetupStatus}
+                      onSetupChanged={handleSreSetupChanged}
+                    />
+                  )}
+                </CollapsibleContent>
+              </Collapsible>
             </TabsContent>
 
             <TabsContent value="private-agents" className="space-y-4">
@@ -1182,17 +1224,27 @@ function OrgAdminDashboardContent() {
                 <PrivateAgentsAdminView
                   initialAgents={privateAgents}
                   loadError={privateAgentsLoadError}
+                  onSetupChanged={handleSreSetupChanged}
                 />
               )}
             </TabsContent>
 
             <TabsContent value="audit" className="space-y-4">
+              <TabSectionHeader
+                icon={<UserSearch />}
+                title="Audit"
+                description="Review administrative and security activity in your organization."
+              />
               <AuditLogsTable />
             </TabsContent>
 
             {isCloudHosted && (
               <TabsContent value="subscription" className="space-y-4">
-                <SubscriptionTab key={orgDetails?.id} currentUserRole={currentUserRole} />
+                <SubscriptionTab
+                  key={orgDetails?.id}
+                  currentUserRole={currentUserRole}
+                />
+                <TrialLoadTesting canManage={userCanRenameOrg} />
               </TabsContent>
             )}
           </Tabs>

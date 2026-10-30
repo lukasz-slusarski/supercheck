@@ -8,9 +8,6 @@ import {
   Globe,
   BellRing,
   SquarePlus,
-  DatabaseIcon,
-  ClipboardListIcon,
-  FileIcon,
   Code,
   SquareLibrary,
   BookOpenText,
@@ -233,7 +230,7 @@ const data = {
   ],
   OrgAdmin: [
     {
-      title: "Admin",
+      title: "Organization",
       url: "/org-admin",
       icon: UserCog,
     },
@@ -245,23 +242,6 @@ const data = {
       url: "https://supercheck.io/docs/app/welcome",
       icon: BookOpenText,
       badge: releaseVersionBadge,
-    },
-  ],
-  documents: [
-    {
-      name: "Data Library",
-      url: "#",
-      icon: DatabaseIcon,
-    },
-    {
-      name: "Reports",
-      url: "#",
-      icon: ClipboardListIcon,
-    },
-    {
-      name: "Word Assistant",
-      url: "#",
-      icon: FileIcon,
     },
   ],
 };

@@ -1,3 +1,5 @@
+import catalog from "./billing/plan-catalog.json";
+
 /**
  * Feature flags and configuration for conditional features
  * Handles self-hosted vs cloud-hosted modes
@@ -159,12 +161,12 @@ export const getPolarProducts = (): {
  */
 export const PLAN_PRICING = {
   plus: {
-    monthlyPriceCents: 4900, // $49/month
-    name: "Plus",
+    monthlyPriceCents: catalog.plus.monthlyPriceCents,
+    name: catalog.plus.name,
   },
   pro: {
-    monthlyPriceCents: 14900, // $149/month
-    name: "Pro",
+    monthlyPriceCents: catalog.pro.monthlyPriceCents,
+    name: catalog.pro.name,
   },
   unlimited: {
     monthlyPriceCents: 0, // Free (self-hosted)
@@ -194,7 +196,7 @@ export const getPlanPricing = (plan: "plus" | "pro" | "unlimited") => {
  * Protected endpoints (cloud mode only):
  * - /sign-in/email
  * - /sign-up/email
- * - /forget-password
+ * - /request-password-reset
  */
 export const isCaptchaEnabled = (): boolean => {
   // CAPTCHA is explicitly disabled for self-hosted deployments

@@ -1,11 +1,12 @@
+import { isUuid } from "@/lib/uuid";
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/utils/db";
 import { projectVariables } from "@/db/schema";
 import { eq, and } from "drizzle-orm";
 import { resolveProjectPermissionContext, checkPermissionWithContext } from "@/lib/rbac/middleware";
-import { requireUserAuthContext, isAuthError } from "@/lib/auth-context";
+import { requireUserAuthContext, isAuthError, authErrorStatus } from "@/lib/auth-context";
 import { updateVariableSchema, createFileVariableSchema, keySchema, MAX_FILE_SIZE, ALLOWED_FILE_MIME_TYPES, resolveFileMimeType, type VariableType } from "@/lib/validations/variable";
-import { encryptValue, decryptValue } from "@/lib/encryption";
+import { encryptValue } from "@/lib/encryption";
 import { getS3Client } from "@/lib/s3-proxy";
 import { PutObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { z } from "zod";
@@ -21,8 +22,9 @@ export async function GET(
     const projectId = resolvedParams.id;
     const variableId = resolvedParams.variableId;
 
-    const { userId } = await requireUserAuthContext();
+    const { userId } = await requireUserAuthContext((await params).id);
 
+    if (!isUuid((await params).id)) return NextResponse.json({ error: "Project not found" }, { status: 404 });
     const permCtx = await resolveProjectPermissionContext(userId, projectId);
     if (!permCtx) {
       return NextResponse.json(
@@ -39,6 +41,7 @@ export async function GET(
     }
 
     // Get the variable
+    if (!isUuid((await params).variableId)) return NextResponse.json({ error: "Variable not found" }, { status: 404 });
     const [variable] = await db
       .select()
       .from(projectVariables)
@@ -101,7 +104,7 @@ export async function GET(
     if (isAuthError(error)) {
       return NextResponse.json(
         { error: error instanceof Error ? error.message : "Authentication required" },
-        { status: 401 }
+        { status: authErrorStatus(error) }
       );
     }
 
@@ -122,8 +125,9 @@ export async function PUT(
     const projectId = resolvedParams.id;
     const variableId = resolvedParams.variableId;
 
-    const { userId } = await requireUserAuthContext();
+    const { userId } = await requireUserAuthContext((await params).id);
 
+    if (!isUuid((await params).id)) return NextResponse.json({ error: "Project not found" }, { status: 404 });
     const permCtx = await resolveProjectPermissionContext(userId, projectId);
     if (!permCtx) {
       return NextResponse.json(
@@ -142,6 +146,7 @@ export async function PUT(
     try {
 
       // Check if variable exists and belongs to the project
+      if (!isUuid((await params).variableId)) return NextResponse.json({ error: "Variable not found" }, { status: 404 });
       const [existingVariable] = await db
         .select()
         .from(projectVariables)
@@ -256,25 +261,10 @@ export async function PUT(
           updateData.encryptedValue = encryptValue(existingVariable.value, projectId);
           updateData.value = "[ENCRYPTED]";
         } else {
-          if (!existingVariable.encryptedValue) {
-            return NextResponse.json(
-              {
-                error:
-                  "Cannot unmark as secret without providing a value. The encrypted value is unavailable.",
-              },
-              { status: 400 }
-            );
-          }
-
-          try {
-            updateData.value = decryptValue(existingVariable.encryptedValue, projectId);
-            updateData.encryptedValue = null;
-          } catch {
-            return NextResponse.json(
-              { error: "Cannot decrypt existing secret value" },
-              { status: 400 }
-            );
-          }
+          return NextResponse.json(
+            { error: "Provide a replacement value to convert a secret to plaintext. Use the audited decrypt action to reveal an existing secret." },
+            { status: 400 },
+          );
         }
       }
 
@@ -314,7 +304,7 @@ export async function PUT(
     if (isAuthError(error)) {
       return NextResponse.json(
         { error: error instanceof Error ? error.message : "Authentication required" },
-        { status: 401 }
+        { status: authErrorStatus(error) }
       );
     }
 
@@ -335,8 +325,9 @@ export async function DELETE(
     const projectId = resolvedParams.id;
     const variableId = resolvedParams.variableId;
 
-    const { userId } = await requireUserAuthContext();
+    const { userId } = await requireUserAuthContext((await params).id);
 
+    if (!isUuid((await params).id)) return NextResponse.json({ error: "Project not found" }, { status: 404 });
     const permCtx = await resolveProjectPermissionContext(userId, projectId);
     if (!permCtx) {
       return NextResponse.json(
@@ -353,6 +344,7 @@ export async function DELETE(
     }
 
     // Check if variable exists and belongs to the project
+    if (!isUuid((await params).variableId)) return NextResponse.json({ error: "Variable not found" }, { status: 404 });
     const [existingVariable] = await db
       .select()
       .from(projectVariables)
@@ -401,7 +393,7 @@ export async function DELETE(
     if (isAuthError(error)) {
       return NextResponse.json(
         { error: error instanceof Error ? error.message : "Authentication required" },
-        { status: 401 }
+        { status: authErrorStatus(error) }
       );
     }
 
@@ -471,7 +463,7 @@ async function handleFileVariableUpdate(
     const keyResult = keySchema.safeParse(key);
     if (!keyResult.success) {
       return NextResponse.json(
-        { error: keyResult.error.errors[0]?.message || "Invalid variable name" },
+        { error: keyResult.error.issues[0]?.message || "Invalid variable name" },
         { status: 400 }
       );
     }

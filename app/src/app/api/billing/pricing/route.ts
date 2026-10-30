@@ -1,4 +1,7 @@
+import catalog from "@/lib/billing/plan-catalog.json";
 import { PRICING_FAQS } from "@/lib/billing/pricing-copy";
+import { trialFaqs, trialHighlights, trialValues } from "@/lib/billing/trial-copy";
+import { isTrialEnabled } from "@/lib/execution/trial-limits";
 import { DEFAULT_OVERAGE_PRICING } from "@/lib/billing/pricing-defaults";
 import { NextResponse } from "next/server";
 import { db } from "@/utils/db";
@@ -7,26 +10,7 @@ import { eq, or } from "drizzle-orm";
 import { PLAN_PRICING } from "@/lib/feature-flags";
 import { getEnabledLocations } from "@/lib/location-registry";
 
-const PLAN_LIMIT_FALLBACKS = {
-  plus: {
-    playwrightMinutesIncluded: 3000,
-    k6VuMinutesIncluded: 20000,
-    aiCreditsIncluded: 100,
-    sreInvestigationUnitsIncluded: 25,
-    dataRetentionDays: 7,
-    aggregatedDataRetentionDays: 30,
-    jobDataRetentionDays: 30,
-  },
-  pro: {
-    playwrightMinutesIncluded: 10000,
-    k6VuMinutesIncluded: 75000,
-    aiCreditsIncluded: 300,
-    sreInvestigationUnitsIncluded: 100,
-    dataRetentionDays: 7,
-    aggregatedDataRetentionDays: 90,
-    jobDataRetentionDays: 90,
-  },
-} as const;
+const PLAN_LIMIT_FALLBACKS = { plus: catalog.plus.limits, pro: catalog.pro.limits };
 
 /**
  * GET /api/billing/pricing
@@ -84,21 +68,21 @@ export async function GET() {
         const planType = plan.plan as "plus" | "pro";
         const overage = overagePricingMap.get(planType);
 
-        // Hardcoded pricing information (managed in Polar)
+        // Presentation comes from the shared catalog; Polar owns the charge.
         const planInfo = {
           plus: {
             id: "plus",
             name: PLAN_PRICING.plus.name,
             price: PLAN_PRICING.plus.monthlyPriceCents / 100,
             interval: "month",
-            description: "For small teams and growing projects",
+            description: catalog.plus.description,
           },
           pro: {
             id: "pro",
             name: PLAN_PRICING.pro.name,
             price: PLAN_PRICING.pro.monthlyPriceCents / 100,
             interval: "month",
-            description: "For growing production teams",
+            description: catalog.pro.description,
           },
         }[planType];
 
@@ -129,7 +113,7 @@ export async function GET() {
             ? {
                 playwrightMinutes: overage.playwrightMinutePriceCents / 100,
                 k6VuMinutes: (overage.k6VuMinutePriceCentsOverride ?? overage.k6VuMinutePriceCents) / 100,
-                aiCredits: overage.aiCreditPriceCents / 100,
+                aiCredits: DEFAULT_OVERAGE_PRICING[planType].aiCredits, // No paid AI overage.
                 sreInvestigationUnits:
                   overage.sreInvestigationUnitPriceCents / 100,
               }
@@ -144,8 +128,8 @@ export async function GET() {
         features: [
           {
             name: "Monitors",
-            plus: plans.find((p) => p.plan === "plus")?.maxMonitors ?? "25",
-            pro: plans.find((p) => p.plan === "pro")?.maxMonitors ?? "100",
+            plus: plans.find((p) => p.plan === "plus")?.maxMonitors ?? "50",
+            pro: plans.find((p) => p.plan === "pro")?.maxMonitors ?? "200",
             enterprise: "Custom",
           },
           {
@@ -236,8 +220,8 @@ export async function GET() {
         features: [
           {
             name: "Public Status Pages",
-            plus: plans.find((p) => p.plan === "plus")?.maxStatusPages ?? "3",
-            pro: plans.find((p) => p.plan === "pro")?.maxStatusPages ?? "15",
+            plus: plans.find((p) => p.plan === "plus")?.maxStatusPages ?? "5",
+            pro: plans.find((p) => p.plan === "pro")?.maxStatusPages ?? "20",
             enterprise: "Custom",
           },
           {
@@ -250,10 +234,10 @@ export async function GET() {
             name: "Subscribers per Page",
             plus:
               plans.find((p) => p.plan === "plus")?.maxStatusPageSubscribers ??
-              "500",
+              "1000",
             pro:
               plans.find((p) => p.plan === "pro")?.maxStatusPageSubscribers ??
-              "5,000",
+              "10000",
             enterprise: "Custom",
           },
         ],
@@ -307,7 +291,11 @@ export async function GET() {
       },
     ];
 
-    const faqs = PRICING_FAQS;
+    // Advertise the trial only while trials are actually granted (the same switch as signup): a page that
+    // promises a free trial the signup flow will not give is worse than no mention at all.
+    const trialOffered = isTrialEnabled();
+    const trialQuestions = new Set(trialFaqs().map((faq) => faq.question));
+    const faqs = trialOffered ? PRICING_FAQS : PRICING_FAQS.filter((faq) => !trialQuestions.has(faq.question));
 
     // Build overage pricing data from database
     const plusOverage = overagePricingMap.get("plus");
@@ -321,7 +309,7 @@ export async function GET() {
         k6VuMinutes: plusOverage
           ? (plusOverage.k6VuMinutePriceCentsOverride ?? plusOverage.k6VuMinutePriceCents) / 100
           : DEFAULT_OVERAGE_PRICING.plus.k6VuMinutes,
-        aiCredits: plusOverage ? plusOverage.aiCreditPriceCents / 100 : DEFAULT_OVERAGE_PRICING.plus.aiCredits,
+        aiCredits: DEFAULT_OVERAGE_PRICING.plus.aiCredits,
         sreInvestigationUnits: plusOverage
           ? plusOverage.sreInvestigationUnitPriceCents / 100
           : DEFAULT_OVERAGE_PRICING.plus.sreInvestigationUnits,
@@ -331,7 +319,7 @@ export async function GET() {
           ? proOverage.playwrightMinutePriceCents / 100
           : DEFAULT_OVERAGE_PRICING.pro.playwrightMinutes,
         k6VuMinutes: proOverage ? (proOverage.k6VuMinutePriceCentsOverride ?? proOverage.k6VuMinutePriceCents) / 100 : DEFAULT_OVERAGE_PRICING.pro.k6VuMinutes,
-        aiCredits: proOverage ? proOverage.aiCreditPriceCents / 100 : DEFAULT_OVERAGE_PRICING.pro.aiCredits,
+        aiCredits: DEFAULT_OVERAGE_PRICING.pro.aiCredits,
         sreInvestigationUnits: proOverage
           ? proOverage.sreInvestigationUnitPriceCents / 100
           : DEFAULT_OVERAGE_PRICING.pro.sreInvestigationUnits,
@@ -342,6 +330,7 @@ export async function GET() {
       plans: pricingPlans,
       featureComparison,
       faqs,
+      trial: trialOffered ? { durationDays: trialValues().durationDays, highlights: trialHighlights() } : undefined,
       overagePricing: overagePricingResponse,
     });
   } catch (error) {

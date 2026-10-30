@@ -1,3 +1,12 @@
+jest.mock("@/lib/billing/usage-sync-lease", () => ({
+  withUsageSyncLease: jest.fn(async (run) => run(() => {})),
+}));
+jest.mock("./subscription-reconciliation", () => ({ reconcilePolarSubscriptions: jest.fn() }));
+jest.mock("@/lib/billing/reconciliation-status", () => ({ getBillingReconciliationStatus: jest.fn().mockResolvedValue({ requiresAttention: false }) }));
+import { POLAR_API_VERSION } from "@/lib/billing/polar-client";
+import { withUsageSyncLease } from "@/lib/billing/usage-sync-lease";
+import { reconcilePolarSubscriptions } from "./subscription-reconciliation";
+import { failStuckSreInvestigationRuns, reconcileUnbilledSreInvestigations } from "@/lib/sre/investigation-billing";
 /** @jest-environment node */
 
 jest.mock("@/utils/db", () => ({
@@ -39,6 +48,7 @@ jest.mock("drizzle-orm", () => ({
   sql: jest.fn(() => ({ op: "sql" })),
   gt: jest.fn((left, right) => ({ op: "gt", left, right })),
   lte: jest.fn((left, right) => ({ op: "lte", left, right })),
+  notInArray: jest.fn((left, right) => ({ op: "notInArray", left, right })),
   ne: jest.fn((left, right) => ({ op: "ne", left, right })),
   isNull: jest.fn((value) => ({ op: "isNull", value })),
   isNotNull: jest.fn((value) => ({ op: "isNotNull", value })),
@@ -62,8 +72,8 @@ jest.mock("@/lib/logger/index", () => ({
   })),
 }));
 
-jest.mock("@polar-sh/sdk", () => ({
-  Polar: jest.fn(() => ({})),
+jest.mock("@polar-sh/sdk/2026-10", () => ({
+  createPolar: jest.fn(() => ({})),
 }));
 jest.mock("./subscription-service", () => ({ subscriptionService: { getOrganizationPlanSafe: jest.fn() } }));
 
@@ -101,6 +111,7 @@ describe("PolarUsageService retry idempotency", () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    jest.mocked(withUsageSyncLease).mockImplementation(async (run) => run(() => {}));
   });
 
   afterAll(() => {
@@ -275,7 +286,7 @@ describe("PolarUsageService retry idempotency", () => {
     expect(fetchMock.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal);
     expect(fetchMock.mock.calls[0]?.[1]?.headers).toEqual(
       expect.objectContaining({
-        "Polar-Version": "2026-04",
+        "Polar-Version": "2026-10",
       }),
     );
 
@@ -287,34 +298,59 @@ describe("PolarUsageService retry idempotency", () => {
       }),
     );
 
-    const lockQueries = transaction.mock.calls.map(([strings]) =>
-      Array.from(strings as TemplateStringsArray).join(""),
-    );
-    expect(lockQueries).toEqual(
-      expect.arrayContaining([
-        expect.stringContaining("pg_try_advisory_xact_lock"),
-      ]),
-    );
-    expect(mockPostgresClient.begin).toHaveBeenCalledTimes(2);
+    expect(withUsageSyncLease).toHaveBeenCalledTimes(2);
+    expect(mockPostgresClient.begin).not.toHaveBeenCalled();
   });
 
-  it("skips safely when another scheduler owns the transaction lock", async () => {
-    const transaction = jest.fn().mockResolvedValue([{ locked: false }]);
-    mockPostgresClient.begin.mockImplementation(
-      async (callback: (sql: typeof transaction) => Promise<unknown>) =>
-        callback(transaction),
-    );
-
+  it("skips safely when another scheduler owns the renewable lease", async () => {
+    jest.mocked(withUsageSyncLease).mockResolvedValueOnce(null);
     await expect(polarUsageService.syncPendingEvents()).resolves.toEqual({
-      processed: 0,
-      succeeded: 0,
-      failed: 0,
-      errors: [],
+      processed: 0, succeeded: 0, failed: 0, errors: [],
+    });
+    expect(mockDb.query.usageEvents.findMany).not.toHaveBeenCalled();
+    expect(mockPostgresClient.begin).not.toHaveBeenCalled();
+  });
+
+  it("aborts recovery when the subscription scan loses its lease", async () => {
+    jest.mocked(withUsageSyncLease).mockImplementationOnce(async (run) => run(() => {
+      throw new Error("Usage sync lease lost");
+    }));
+    jest.mocked(reconcilePolarSubscriptions).mockImplementationOnce(async (assertOwned) => {
+      assertOwned();
     });
 
+    await expect(polarUsageService.syncPendingEvents()).resolves.toMatchObject({
+      processed: 0, errors: ["Usage sync lease lost"],
+    });
+    expect(failStuckSreInvestigationRuns).not.toHaveBeenCalled();
+    expect(reconcileUnbilledSreInvestigations).not.toHaveBeenCalled();
     expect(mockDb.query.usageEvents.findMany).not.toHaveBeenCalled();
-    expect(mockPostgresClient.begin).toHaveBeenCalledTimes(1);
   });
+
+  it("drains multiple batches while keeping one lease", async () => {
+    const sender = jest.spyOn(polarUsageService as unknown as { syncEventToPolar(id: string): Promise<boolean> }, "syncEventToPolar").mockResolvedValue(true);
+    mockDb.query.usageEvents.findMany.mockReset().mockResolvedValueOnce([{ id: "a" }, { id: "b" }]).mockResolvedValueOnce([{ id: "c" }]);
+    mockDb.selectDistinct.mockReturnValue({ from: () => ({ leftJoin: () => ({ where: async () => [] }) }) });
+    try {
+      await expect(polarUsageService.syncPendingEvents(2)).resolves.toMatchObject({ processed: 3, succeeded: 3, failed: 0 });
+      expect(sender.mock.calls.map(([id]) => id)).toEqual(["a", "b", "c"]);
+      expect(withUsageSyncLease).toHaveBeenCalledTimes(1);
+    } finally { sender.mockRestore(); }
+  });
+
+  it("stops a drain at its time budget without attempting the remaining events", async () => {
+    let now = Date.now();
+    const clock = jest.spyOn(Date, "now").mockImplementation(() => now);
+    const sender = jest.spyOn(polarUsageService as unknown as { syncEventToPolar(id: string): Promise<boolean> }, "syncEventToPolar")
+      .mockImplementation(async () => { now += 60_000; return true; });
+    mockDb.query.usageEvents.findMany.mockReset().mockResolvedValue([{ id: "a" }, { id: "b" }]);
+    mockDb.selectDistinct.mockReturnValue({ from: () => ({ leftJoin: () => ({ where: async () => [] }) }) });
+    try {
+      await expect(polarUsageService.syncPendingEvents(2)).resolves.toMatchObject({ processed: 1, succeeded: 1 });
+      expect(sender).toHaveBeenCalledTimes(1);
+    } finally { sender.mockRestore(); clock.mockRestore(); }
+  });
+
   it.each([
     ["inserted", { inserted: 1 }, true],
     ["duplicate", { inserted: 0, duplicates: 1 }, true],
@@ -368,4 +404,100 @@ describe("PolarUsageService retry idempotency", () => {
     }));
   });
 
+});
+
+describe("PolarUsageService ingestion contract", () => {
+  const originalFetch = global.fetch;
+  afterAll(() => {
+    global.fetch = originalFetch;
+  });
+
+  async function syncOnce(
+    response: { ok: boolean; status: number; body?: unknown; text?: string },
+    eventType = "playwright_execution",
+  ) {
+    jest.clearAllMocks();
+    jest.mocked(withUsageSyncLease).mockImplementation(async (run) => run(() => {}));
+    const event = {
+      id: "usage-event-9",
+      organizationId: "org-1",
+      eventType,
+      units: "3.0000",
+      unitType: "minutes",
+      metadata: {},
+      createdAt: new Date("2026-10-04T05:46:19.347Z"),
+      billingPeriodEnd: new Date(Date.now() + 86_400_000),
+    };
+    mockDb.query.usageEvents.findMany.mockResolvedValue([event]);
+    mockDb.query.usageEvents.findFirst.mockResolvedValue(event);
+    mockDb.query.organization.findFirst.mockResolvedValue({ polarCustomerId: "cus_1" });
+    const updateSet = jest.fn(() => ({ where: jest.fn().mockResolvedValue([]) }));
+    mockDb.update.mockReturnValue({ set: updateSet });
+    mockDb.selectDistinct.mockReturnValue({
+      from: jest.fn(() => ({ leftJoin: () => ({ where: jest.fn().mockResolvedValue([]) }) })),
+    });
+    const fetchMock = jest.fn().mockResolvedValue({
+      ok: response.ok,
+      status: response.status,
+      text: jest.fn().mockResolvedValue(response.text ?? ""),
+      json: jest.fn().mockResolvedValue(response.body),
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const result = await polarUsageService.syncPendingEvents();
+    return { result, fetchMock, updateSet };
+  }
+
+  it.each([
+    ["a newly inserted event", { inserted: 1 }],
+    ["an already received duplicate", { inserted: 0, duplicates: 1 }],
+  ])("marks the ledger row synced for %s", async (_name, body) => {
+    const { result, updateSet } = await syncOnce({ ok: true, status: 202, body });
+    expect(result).toMatchObject({ succeeded: 1, failed: 0 });
+    expect(updateSet).toHaveBeenCalledWith(expect.objectContaining({ syncedToPolar: true, syncError: null }));
+  });
+
+  it.each([
+    ["an empty acknowledgement", {}],
+    ["a null acknowledgement", null],
+    ["an array acknowledgement", []],
+    ["a string acknowledgement", "ok"],
+    ["more events than were sent", { inserted: 2 }],
+    ["an inserted and duplicate total above one", { inserted: 1, duplicates: 1 }],
+    ["zero inserted and zero duplicates", { inserted: 0, duplicates: 0 }],
+    ["a negative count", { inserted: -1 }],
+    ["a fractional count", { inserted: 0.5 }],
+    ["a stringly typed count", { inserted: "1" }],
+  ])("keeps the ledger row retryable for %s", async (_name, body) => {
+    const { result, updateSet } = await syncOnce({ ok: true, status: 202, body });
+    expect(result).toMatchObject({ succeeded: 0, failed: 1 });
+    expect(updateSet).not.toHaveBeenCalledWith(expect.objectContaining({ syncedToPolar: true }));
+    expect(updateSet).toHaveBeenCalledWith(expect.objectContaining({ syncError: "Polar did not acknowledge the usage event" }));
+  });
+
+  it.each([400, 401, 403, 404, 422, 429, 500, 502, 503])("keeps the ledger row retryable on HTTP %i", async (status) => {
+    const { result, updateSet } = await syncOnce({ ok: false, status, text: "rejected" });
+    expect(result).toMatchObject({ succeeded: 0, failed: 1 });
+    expect(updateSet).toHaveBeenCalledWith(expect.objectContaining({ syncError: `Polar API error (${status}): rejected` }));
+  });
+
+  it.each([
+    ["playwright_execution", "playwright_minutes"],
+    ["k6_execution", "k6_vu_minutes"],
+    ["ai_usage", "ai_credits"],
+    ["sre_investigation", "sre_investigations"],
+  ])("sends %s usage to the %s meter at the pinned version", async (eventType, meter) => {
+    const { fetchMock } = await syncOnce({ ok: true, status: 202, body: { inserted: 1 } }, eventType);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("https://sandbox-api.polar.sh/v1/events/ingest");
+    expect(init.method).toBe("POST");
+    expect(init.headers).toEqual({
+      Authorization: "Bearer sandbox-token",
+      "Content-Type": "application/json",
+      "Polar-Version": POLAR_API_VERSION,
+    });
+    const event = JSON.parse(init.body).events[0];
+    expect(event).toMatchObject({ customer_id: "cus_1", name: meter, external_id: "usage-event-9" });
+    expect(event.metadata).toMatchObject({ value: 3, event_id: "usage-event-9" });
+    expect(Object.keys(event)).not.toEqual(expect.arrayContaining(["customerId", "externalId"]));
+  });
 });

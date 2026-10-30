@@ -1,5 +1,8 @@
 import { NextResponse } from "next/server";
+import { getTrialSummary } from "@/lib/execution/trial-limits";
 import { requireUserAuthContext, isAuthError } from "@/lib/auth-context";
+import { getUserOrgRole } from "@/lib/rbac/middleware";
+import { Role } from "@/lib/rbac/permissions";
 import { subscriptionService } from "@/lib/services/subscription-service";
 import { db } from "@/utils/db";
 import {
@@ -18,12 +21,22 @@ import { getPlanPricing, isCloudHosted } from "@/lib/feature-flags";
  */
 export async function GET() {
   try {
-    const { organizationId } = await requireUserAuthContext();
+    const { userId, organizationId, isCliAuth } = await requireUserAuthContext();
+    if (isCliAuth) return NextResponse.json({ error: "Organization administration requires an interactive browser session; CLI tokens are project-scoped" }, { status: 403 });
 
     if (!organizationId) {
       return NextResponse.json(
         { error: "No active organization found" },
         { status: 400 }
+      );
+    }
+
+    // Subscription, spending and usage figures are for org admins and owners only.
+    const orgRole = await getUserOrgRole(userId, organizationId);
+    if (orgRole !== Role.ORG_ADMIN && orgRole !== Role.ORG_OWNER) {
+      return NextResponse.json(
+        { error: "Insufficient permissions" },
+        { status: 403 },
       );
     }
 
@@ -77,6 +90,8 @@ export async function GET() {
     // guard; expired cancellations must not look like an active paid plan.
     const access = await subscriptionService.getSubscriptionAccessStatus(organizationId);
     const effectivePlan = access.isActive ? access.plan : null;
+    // An organization on a free trial has no paid plan but does have allowances worth showing.
+    const trial = access.isActive ? undefined : await getTrialSummary(organizationId);
     const pricing = effectivePlan ? getPlanPricing(effectivePlan) : null;
     const periodStart = org.usagePeriodStart ?? org.subscriptionStartedAt;
     const periodEnd = org.usagePeriodEnd ?? org.subscriptionEndsAt;
@@ -86,6 +101,7 @@ export async function GET() {
 
     return NextResponse.json({
       organizationId,
+      trial: trial ?? null,
       subscription: {
         plan: effectivePlan,
         status: access.status ?? "none",

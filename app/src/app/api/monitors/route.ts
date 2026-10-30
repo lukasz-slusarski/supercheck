@@ -1,15 +1,20 @@
+import { monitorConfigForRead, monitorTargetForRead } from "@/lib/monitor-read-config";
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/utils/db";
 import {
   monitors,
   monitorNotificationSettings,
+  monitorTags,
   notificationProviders,
+  tags,
 } from "@/db/schema";
 import { eq, desc, and, sql, inArray } from "drizzle-orm";
 import { checkPermissionWithContext } from "@/lib/rbac/middleware";
 import { requireAuthContext, isAuthError } from "@/lib/auth-context";
+import { isUuid } from "@/lib/uuid";
 import {
-  createMonitorHandler,
+  insertMonitorRecord,
+  scheduleCreatedMonitor,
   updateMonitorHandler,
 } from "@/lib/monitor-service";
 import { logAuditEvent } from "@/lib/audit-logger";
@@ -19,8 +24,18 @@ import {
   sanitizeHostname,
 } from "@/lib/input-sanitizer";
 import { checkMonitorLimit } from "@/lib/middleware/plan-enforcement";
-import { subscriptionService } from "@/lib/services/subscription-service";
+import { trialIntervalErrorResponse } from "@/lib/execution/trial-interval-response";
+import { insertWithinPlanLimit } from "@/lib/middleware/plan-limit-lock";
+import {
+  subscriptionService,
+  SubscriptionAccessDeniedError,
+} from "@/lib/services/subscription-service";
 import { getProjectAvailableLocationCodes } from "@/lib/location-registry";
+import {
+  findUnsupportedMonitorLocations,
+  unsupportedMonitorLocationsMessage,
+} from "@/lib/monitor-location-routing";
+import type { LocationConfig } from "@/db/schema";
 import { createLogger } from "@/lib/logger/index";
 import { validateMonitorConfiguration } from "@/lib/monitor-validation";
 
@@ -31,6 +46,26 @@ const logger = createLogger({ module: "monitors-api" }) as {
   error: (data: unknown, msg?: string) => void;
 };
 
+const trialFrequencyError = trialIntervalErrorResponse;
+
+type MonitorTagSummary = { id: string; name: string; color: string | null };
+
+/** Tags of the listed monitors, so the CLI can round-trip monitor tags as code. */
+async function loadMonitorTags(monitorIds: string[]): Promise<Map<string, MonitorTagSummary[]>> {
+  const byMonitor = new Map<string, MonitorTagSummary[]>();
+  if (monitorIds.length === 0) return byMonitor;
+  const rows = await db
+    .select({ monitorId: monitorTags.monitorId, id: tags.id, name: tags.name, color: tags.color })
+    .from(monitorTags)
+    .innerJoin(tags, eq(monitorTags.tagId, tags.id))
+    .where(inArray(monitorTags.monitorId, monitorIds))
+    .orderBy(tags.name);
+  for (const { monitorId, ...tag } of rows) {
+    byMonitor.set(monitorId, [...(byMonitor.get(monitorId) ?? []), tag]);
+  }
+  return byMonitor;
+}
+
 export async function GET(request: Request) {
   try {
     // Require authentication and project context
@@ -38,6 +73,7 @@ export async function GET(request: Request) {
 
     // PERFORMANCE: Use checkPermissionWithContext to avoid 5-8 duplicate DB queries
     const canView = checkPermissionWithContext("monitor", "view", context);
+    const canUpdateMonitors = checkPermissionWithContext("monitor", "update", context);
 
     if (!canView) {
       return NextResponse.json(
@@ -95,9 +131,15 @@ export async function GET(request: Request) {
       const total = Number(countResult[0]?.count || 0);
 
       const totalPages = Math.ceil(total / limit);
+      const tagsByMonitor = await loadMonitorTags(monitorsList.map((m) => m.id));
 
       return NextResponse.json({
-        data: monitorsList,
+        data: monitorsList.map((monitor) => ({
+          ...monitor,
+          config: monitorConfigForRead(monitor.config, canUpdateMonitors),
+          target: monitorTargetForRead(monitor.target, canUpdateMonitors),
+          tags: tagsByMonitor.get(monitor.id) ?? [],
+        })),
         pagination: {
           page,
           limit,
@@ -117,10 +159,16 @@ export async function GET(request: Request) {
         .where(whereCondition)
         .orderBy(desc(monitors.id))
         .limit(DEFAULT_LIMIT);
+      const tagsByMonitor = await loadMonitorTags(monitorsList.map((m) => m.id));
 
       // Return standardized response format for React Query hooks
       return NextResponse.json({
-        data: monitorsList,
+        data: monitorsList.map((monitor) => ({
+          ...monitor,
+          config: monitorConfigForRead(monitor.config, canUpdateMonitors),
+          target: monitorTargetForRead(monitor.target, canUpdateMonitors),
+          tags: tagsByMonitor.get(monitor.id) ?? [],
+        })),
         pagination: {
           total: monitorsList.length,
           page: 1,
@@ -266,6 +314,9 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    const trialIntervalError = await trialFrequencyError(organizationId, rawData.frequencyMinutes ?? 5);
+    if (trialIntervalError) return trialIntervalError;
+
     // Validate target - all monitor types require a target except heartbeat and synthetic_test
     if (rawData.type === "synthetic_test") {
       // For synthetic monitors, validate testId in config
@@ -274,6 +325,19 @@ export async function POST(req: NextRequest) {
           {
             error: "testId is required in config for synthetic monitors",
             details: "Please select a test to monitor",
+          },
+          { status: 400 },
+        );
+      }
+      // The test lookup below runs before the full configuration validation, and a malformed id would fail
+      // it with a Postgres uuid error (a 500) instead of this 400.
+      // Check the value itself, not String(value): a one-element array stringifies to a valid-looking id but
+      // would still reach the uuid column as an array.
+      if (typeof rawData.config.testId !== "string" || !isUuid(rawData.config.testId)) {
+        return NextResponse.json(
+          {
+            error: "Invalid monitor configuration",
+            details: "config.testId must be a valid test ID for synthetic monitors",
           },
           { status: 400 },
         );
@@ -393,6 +457,17 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    const unsupportedCreate = await findUnsupportedMonitorLocations(
+      finalConfig.locationConfig,
+      rawData.type,
+    );
+    if (unsupportedCreate.length > 0) {
+      return NextResponse.json(
+        { error: unsupportedMonitorLocationsMessage(unsupportedCreate, rawData.type) },
+        { status: 400 },
+      );
+    }
+
     logger.debug({ finalConfig }, "[MONITOR_CREATE] Final config");
 
     // Use current project context
@@ -404,32 +479,6 @@ export async function POST(req: NextRequest) {
     if (!canCreate) {
       return NextResponse.json(
         { error: "Insufficient permissions to create monitors" },
-        { status: 403 },
-      );
-    }
-
-    // Check monitor limit for the organization's plan using proper SQL COUNT
-    const countResult = await db
-      .select({ count: sql<number>`count(*)` })
-      .from(monitors)
-      .where(eq(monitors.organizationId, organizationId));
-
-    const limitCheck = await checkMonitorLimit(
-      organizationId,
-      Number(countResult[0]?.count || 0),
-    );
-    if (!limitCheck.allowed) {
-      logger.warn(
-        { organizationId },
-        `Monitor limit reached: ${limitCheck.error}`,
-      );
-      return NextResponse.json(
-        {
-          error: limitCheck.error,
-          upgrade: limitCheck.upgrade,
-          currentPlan: limitCheck.currentPlan,
-          limit: limitCheck.limit,
-        },
         { status: 403 },
       );
     }
@@ -497,7 +546,47 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    const newMonitor = await createMonitorHandler(monitorData);
+    // Serialize count -> limit check -> insert per organization so concurrent
+    // requests cannot both pass the plan limit.
+    const inserted = await insertWithinPlanLimit({
+      organizationId,
+      resource: "monitors",
+      check: checkMonitorLimit,
+      countRows: async (tx) => {
+        const [row] = await tx
+          .select({ count: sql<number>`count(*)` })
+          .from(monitors)
+          .where(eq(monitors.organizationId, organizationId));
+        return Number(row?.count || 0);
+      },
+      insert: (executor) => insertMonitorRecord(monitorData, executor),
+    });
+    if (!inserted.ok && inserted.busy) {
+      return NextResponse.json(
+        { error: "Too many concurrent requests. Please retry shortly." },
+        { status: 503, headers: { "Retry-After": "2" } },
+      );
+    }
+    if (!inserted.ok) {
+      const limitCheck = inserted.check;
+      logger.warn(
+        { organizationId },
+        `Monitor limit reached: ${limitCheck.error}`,
+      );
+      return NextResponse.json(
+        {
+          error: limitCheck.error,
+          upgrade: limitCheck.upgrade,
+          currentPlan: limitCheck.currentPlan,
+          limit: limitCheck.limit,
+        },
+        { status: 403 },
+      );
+    }
+    const newMonitor = await scheduleCreatedMonitor(
+      inserted.row.newMonitor,
+      inserted.row.enabled,
+    );
 
     // Link notification providers if alert config is enabled
     if (
@@ -589,6 +678,12 @@ export async function POST(req: NextRequest) {
         { status: 401 },
       );
     }
+    if (error instanceof SubscriptionAccessDeniedError) {
+      return NextResponse.json(
+        { error: error.message, code: error.reason },
+        { status: 402 },
+      );
+    }
     logger.error({ err: error }, "Error creating monitor");
     return NextResponse.json(
       { error: "Failed to create monitor" },
@@ -610,6 +705,9 @@ export async function PUT(req: NextRequest) {
         { error: "Monitor ID is required" },
         { status: 400 },
       );
+    }
+    if (!isUuid(id)) {
+      return NextResponse.json({ error: "Monitor not found" }, { status: 404 });
     }
 
     // Verify monitor belongs to current project context
@@ -667,6 +765,11 @@ export async function PUT(req: NextRequest) {
           { status: 400 },
         );
       }
+    }
+
+    if (rawData.frequencyMinutes !== undefined) {
+      const trialIntervalError = await trialFrequencyError(monitorData[0].organizationId, rawData.frequencyMinutes);
+      if (trialIntervalError) return trialIntervalError;
     }
 
     const configurationValidation = validateMonitorConfiguration({
@@ -765,6 +868,24 @@ export async function PUT(req: NextRequest) {
       if (invalidLocations.length > 0) {
         return NextResponse.json(
           { error: `Invalid location codes: ${invalidLocations.join(", ")}` },
+          { status: 400 },
+        );
+      }
+    }
+
+    if (updateData.config || updateData.type) {
+      const effectiveType = updateData.type ?? monitorData[0]?.type;
+      const effectiveConfig = (updateData.config ?? monitorData[0]?.config) as
+        | { locationConfig?: LocationConfig | null }
+        | null
+        | undefined;
+      const unsupportedUpdate = await findUnsupportedMonitorLocations(
+        effectiveConfig?.locationConfig,
+        effectiveType,
+      );
+      if (unsupportedUpdate.length > 0) {
+        return NextResponse.json(
+          { error: unsupportedMonitorLocationsMessage(unsupportedUpdate, effectiveType) },
           { status: 400 },
         );
       }

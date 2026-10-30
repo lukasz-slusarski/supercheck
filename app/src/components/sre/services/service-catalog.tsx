@@ -11,6 +11,7 @@ import {
   type SreServiceListItem,
 } from "@/actions/sre-services";
 import type { SreOnboardingStatus } from "@/actions/sre-onboarding";
+import { PageHeader } from "@/components/shared/page-header";
 import { DashboardEmptyState } from "@/components/dashboard/dashboard-empty-state";
 import { ServiceFormDialog } from "@/components/sre/services/service-form-dialog";
 import {
@@ -109,21 +110,32 @@ export function ServiceCatalog({
   }
 
   return (
-    <div className="space-y-4">
+    <div className="mt-6 min-w-0 space-y-4 p-2">
+      {services.length === 0 && (
+        <PageHeader
+          title="Services"
+          description="Link monitors and jobs to services for investigation context."
+          className="mb-4 -mt-2"
+        />
+      )}
       {services.length === 0 ? (
         <DashboardEmptyState
           className="min-h-[420px]"
           title="No services registered"
-          description={permissions.canCreate ? "Add a service, then link its monitors and dependencies to give incidents useful context." : "No services have been added to this project yet. Ask a project editor or administrator to add one."}
+          description={
+            permissions.canCreate
+              ? "Add a service, then link its monitors and dependencies to give incidents useful context."
+              : "No services have been added to this project yet. Ask a project editor or administrator to add one."
+          }
           icon={<Boxes className="h-10 w-10" />}
           action={
             <div className="flex flex-col gap-2 sm:flex-row">
               {setupStatus && <SreSetupGuideDialog status={setupStatus} />}
               {permissions.canCreate && (
-              <Button onClick={handleAdd} data-testid="add-service-btn">
-                <Plus className="mr-2 h-4 w-4" />
-                Add service
-              </Button>
+                <Button onClick={handleAdd} data-testid="add-service-btn">
+                  <Plus className="mr-2 h-4 w-4" />
+                  Add service
+                </Button>
               )}
             </div>
           }
@@ -137,11 +149,25 @@ export function ServiceCatalog({
             <ServicesToolbar
               table={table}
               onAdd={permissions.canCreate ? handleAdd : undefined}
-              setupGuide={setupStatus ? <SreSetupGuideDialog status={setupStatus} /> : undefined}
+              setupGuide={
+                setupStatus ? (
+                  <SreSetupGuideDialog status={setupStatus} />
+                ) : undefined
+              }
             />
           )}
           entityLabel="services"
           meta={{
+            globalFilterColumns: [
+              "id",
+              "name",
+              "description",
+              "ownerTeam",
+              "tags",
+              "environment",
+              "tier",
+              "status",
+            ],
             canUpdate: permissions.canUpdate,
             canArchive: permissions.canArchive,
             onEdit: (service: SreServiceListItem) => {

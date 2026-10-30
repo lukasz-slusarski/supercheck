@@ -1,11 +1,14 @@
+import { waitForRun } from '../utils/wait.js'
+import { parseIntStrict } from '../utils/number.js'
 import { Command } from 'commander'
 import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { isAbsolute, relative, resolve, sep } from 'node:path'
 import { createAuthenticatedClient } from '../api/authenticated-client.js'
 import { loadConfig } from '../config/loader.js'
 import { discoverFiles } from '../utils/discovery.js'
 import { logger } from '../utils/logger.js'
-import { getOutputFormat, output, outputDetail, outputPagination } from '../output/formatter.js'
+import { getOutputFormat, output, outputDetail, outputMutation, outputPagination } from '../output/formatter.js'
+import { requirePriority } from '../utils/priority.js'
 import { CLIError, ExitCode } from '../utils/errors.js'
 import type { PaginatedResponse } from '../api/client.js'
 import { withSpinner } from '../utils/spinner.js'
@@ -15,7 +18,11 @@ import { createTempPlaywrightConfig } from '../utils/playwright.js'
 import { ensureDependenciesForTestType, DependencyError } from '../utils/deps.js'
 import { getSse } from '../utils/sse.js'
 import { decodeStoredTestScript, encodeStoredTestScript } from '../utils/script.js'
+import { stripTitleMetadata } from '../utils/slug.js'
 import type { ApiTestType } from '../utils/validation.js'
+import { addAssignedTags, getAssignedTags, removeAssignedTags } from '../utils/tag-assignment.js'
+
+export const requireTestPriority = requirePriority
 
 function normalizeTestType(input: string): string {
   return requireApiTestType(input, '--type')
@@ -47,7 +54,8 @@ type LocalTestFile = {
 }
 
 function toDisplayName(cwd: string, filePath: string): string {
-  const normalized = filePath.replace(cwd, '').replace(/^\//, '')
+  const local = relative(cwd, filePath)
+  const normalized = local === '..' || local.startsWith(`..${sep}`) || isAbsolute(local) ? filePath : local
   return normalized.startsWith('_supercheck_/') ? normalized.replace(/^_supercheck_\//, '') : normalized
 }
 
@@ -73,7 +81,8 @@ function collectLocalTests(
     const validationType = options.type
       ? requireApiTestType(options.type, '--type')
       : normalizeTestTypeForApi(type)
-    const script = readFileSync(filePath, 'utf-8')
+    let script: string
+    try { script = readFileSync(filePath, 'utf-8') } catch { throw new CLIError(`Cannot read local test: ${filePath}`, ExitCode.ConfigError) }
     return [{
       path: filePath,
       type: type as 'playwright' | 'k6',
@@ -134,11 +143,11 @@ async function validateLocalTests(client: ReturnType<typeof createAuthenticatedC
   }
 }
 
-async function runPlaywrightTests(paths: string[], cwd: string, testMatch?: string): Promise<void> {
+async function runPlaywrightTests(paths: string[], cwd: string, browser?: string, configPath?: string): Promise<void> {
   if (paths.length === 0) return
-  const tempConfig = createTempPlaywrightConfig(cwd, testMatch)
+  const tempConfig = createTempPlaywrightConfig(cwd, paths.map((path) => path.replace(/\\/g, '/')), browser, configPath)
   try {
-    const code = await runCommand('npx', ['playwright', 'test', '--config', tempConfig.path, ...paths], cwd)
+    const code = await runCommand('npx', ['playwright', 'test', '--config', tempConfig.path, ...(getOutputFormat() === 'json' ? ['--reporter=json'] : []), ...paths], cwd)
     if (code !== 0) {
       throw new CLIError(`Playwright tests failed with exit code ${code}`, ExitCode.GeneralError)
     }
@@ -166,7 +175,8 @@ testCommand
   .option('--limit <limit>', 'Items per page', '50')
   .option('--search <query>', 'Search by title')
   .option('--type <type>', 'Filter by type (browser, performance, api, database, custom)')
-  .action(async (options: { page: string; limit: string; search?: string; type?: string }) => {
+  .option('--priority <priority>', 'Filter by priority (low, medium, high)')
+  .action(async (options: { page: string; limit: string; search?: string; type?: string; priority?: string }) => {
     const client = createAuthenticatedClient()
 
     const params: Record<string, string> = {
@@ -175,6 +185,7 @@ testCommand
     }
     if (options.search) params.search = options.search
     if (options.type) params.type = normalizeTestType(options.type)
+    if (options.priority) params.priority = requireTestPriority(options.priority)
 
     const { data } = await withSpinner(
       'Fetching tests',
@@ -189,6 +200,7 @@ testCommand
         { key: 'id', header: 'ID' },
         { key: 'title', header: 'Title' },
         { key: 'type', header: 'Type' },
+        { key: 'priority', header: 'Priority' },
         { key: 'createdAt', header: 'Created' },
       ],
     })
@@ -221,8 +233,9 @@ testCommand
   .requiredOption('--file <path>', 'Path to the test script file')
   .option('--type <type>', 'Test type (browser, performance, api, database, custom)')
   .option('--description <description>', 'Test description')
+  .option('--priority <priority>', 'Test priority (low, medium, high)')
   .option('--dry-run', 'Show what would be sent without creating')
-  .action(async (options: { title: string; file: string; type?: string; description?: string; dryRun?: boolean }) => {
+  .action(async (options: { title: string; file: string; type?: string; description?: string; priority?: string; dryRun?: boolean }) => {
     const { readFileSync } = await import('node:fs')
     const { resolve } = await import('node:path')
 
@@ -232,7 +245,7 @@ testCommand
     try {
       script = readFileSync(filePath, 'utf-8')
     } catch {
-      throw new CLIError(`Cannot read file: ${filePath}`, ExitCode.GeneralError)
+      throw new CLIError(`Cannot read file: ${filePath}`, ExitCode.ConfigError)
     }
 
     const typeArg = options.type || inferTestType(options.file) || 'playwright'
@@ -243,7 +256,7 @@ testCommand
       throw new CLIError(typeMismatchError, ExitCode.ConfigError)
     }
 
-    const encodedScript = encodeStoredTestScript(script)
+    const encodedScript = encodeStoredTestScript(stripTitleMetadata(script))
 
     const body: Record<string, unknown> = {
       title: options.title,
@@ -251,11 +264,12 @@ testCommand
       type: normalizeTestType(typeArg),
     }
     if (options.description) body.description = options.description
+    if (options.priority !== undefined) body.priority = requireTestPriority(options.priority)
 
     if (options.dryRun) {
       const preview = { ...body, script: `<base64 ${encodedScript.length} chars>` }
       logger.header('Dry run \u2014 test create payload:')
-      logger.info(JSON.stringify(preview, null, 2))
+      outputDetail({ dryRun: true, payload: preview })
       return
     }
 
@@ -279,13 +293,15 @@ testCommand
   .option('--file <path>', 'Path to updated test script')
   .option('--type <type>', 'Test type (browser, performance, api, database, custom)')
   .option('--description <description>', 'Test description')
+  .option('--priority <priority>', 'Test priority (low, medium, high)')
   .option('--dry-run', 'Show what would be sent without updating')
-  .action(async (id: string, options: { title?: string; file?: string; type?: string; description?: string; dryRun?: boolean }) => {
+  .action(async (id: string, options: { title?: string; file?: string; type?: string; description?: string; priority?: string; dryRun?: boolean }) => {
     const client = createAuthenticatedClient()
 
     const body: Record<string, unknown> = {}
     if (options.title !== undefined) body.title = options.title
     if (options.description !== undefined) body.description = options.description
+    if (options.priority !== undefined) body.priority = requireTestPriority(options.priority)
     if (options.type !== undefined) body.type = requireApiTestType(options.type, '--type')
 
     if (options.file) {
@@ -325,11 +341,11 @@ testCommand
         }
       }
 
-      body.script = encodeStoredTestScript(raw)
+      body.script = encodeStoredTestScript(stripTitleMetadata(raw))
     }
 
     if (Object.keys(body).length === 0) {
-      logger.warn('No fields to update. Use --title, --file, or --description.')
+      logger.warn('No fields to update. Use --title, --file, --description, --type, or --priority.')
       return
     }
 
@@ -339,7 +355,7 @@ testCommand
         preview.script = `<base64 ${(preview.script as string).length} chars>`
       }
       logger.header('Dry run \u2014 test update payload:')
-      logger.info(JSON.stringify(preview, null, 2))
+      outputDetail({ dryRun: true, payload: preview })
       return
     }
 
@@ -358,11 +374,7 @@ testCommand
   .action(async (id: string, options: { force?: boolean }) => {
     if (!options.force) {
       const { confirmPrompt } = await import('../utils/prompt.js')
-      const confirmed = await confirmPrompt(`Delete test ${id}?`, { default: false })
-      if (!confirmed) {
-        logger.info('Aborted')
-        return
-      }
+      await confirmPrompt(`Delete test ${id}?`, { default: false })
     }
 
     const client = createAuthenticatedClient()
@@ -371,23 +383,26 @@ testCommand
       () => client.delete(`/api/tests/${id}`),
     )
     logger.success(`Test ${id} deleted`)
+    outputMutation({ id, deleted: true })
   })
 
 testCommand
   .command('run')
   .description('Run tests locally')
   .option('--file <path>', 'Local test file path')
+  .option('--offline', 'Run locally without credentials or server validation')
+  .option('--playwright-config <path>', 'Use an existing Playwright config')
   .option('--all', 'Run all local tests')
   .option('--type <type>', 'Test type filter (browser, performance)')
-  .action(async (options: { file?: string; all?: boolean; type?: string }) => {
+  .action(async (options: { file?: string; all?: boolean; type?: string; offline?: boolean; playwrightConfig?: string }) => {
 
     if (!options.file && !options.all) {
       throw new CLIError('Local runs require --file <path> or --all.', ExitCode.ConfigError)
     }
 
     const cwd = process.cwd()
-    const { config } = await loadConfig({ cwd })
-    const client = createAuthenticatedClient()
+    const { config } = await loadConfig({ cwd, offline: options.offline, allowMissing: options.offline })
+
     const patterns = {
       playwright: config.tests?.playwright?.testMatch,
       k6: config.tests?.k6?.testMatch,
@@ -404,9 +419,11 @@ testCommand
       return
     }
 
-    await withSpinner('Validating test scripts...', async () => {
-      await validateLocalTests(client, localTests)
-    }, { successText: 'Test scripts validated' })
+    if (!options.offline) await validateLocalTests(createAuthenticatedClient(), localTests)
+    else for (const test of localTests) {
+      const mismatch = validateScriptTypeMatch(test.script, test.validationType)
+      if (mismatch) throw new CLIError(mismatch, ExitCode.ConfigError)
+    }
 
     const playwrightTests = localTests.filter((t) => t.type === 'playwright').map((t) => t.path)
     const k6Tests = localTests.filter((t) => t.type === 'k6').map((t) => t.path)
@@ -414,7 +431,7 @@ testCommand
     // Pre-flight dependency checks
     try {
       if (playwrightTests.length > 0) {
-        ensureDependenciesForTestType(cwd, 'playwright')
+        ensureDependenciesForTestType(cwd, 'playwright', options.playwrightConfig ? null : config.tests?.playwright?.browser)
       }
       if (k6Tests.length > 0) {
         ensureDependenciesForTestType(cwd, 'k6')
@@ -428,7 +445,7 @@ testCommand
 
     if (playwrightTests.length > 0) {
       logger.header('Running Playwright tests')
-      await runPlaywrightTests(playwrightTests, cwd, config.tests?.playwright?.testMatch)
+      await runPlaywrightTests(playwrightTests, cwd, config.tests?.playwright?.browser, options.playwrightConfig)
     }
 
     if (k6Tests.length > 0) {
@@ -437,22 +454,43 @@ testCommand
     }
   })
 
+const TAG_COLUMNS = [
+  { key: 'id', header: 'ID' },
+  { key: 'name', header: 'Name' },
+  { key: 'color', header: 'Color' },
+]
+
 testCommand
   .command('tags <id>')
   .description('Get test tags')
   .action(async (id: string) => {
     const client = createAuthenticatedClient()
-    const { data } = await withSpinner(
-      'Fetching test tags',
-      () => client.get<Record<string, unknown>[]>(`/api/tests/${id}/tags`),
-    )
-    output(data, {
-      columns: [
-        { key: 'id', header: 'ID' },
-        { key: 'name', header: 'Name' },
-        { key: 'color', header: 'Color' },
-      ],
-    })
+    const data = await withSpinner('Fetching test tags', () => getAssignedTags(client, `/api/tests/${encodeURIComponent(id)}`))
+    output(data as unknown as Record<string, unknown>[], { columns: TAG_COLUMNS })
+  })
+
+const testTagCommand = testCommand
+  .command('tag')
+  .description('Assign or remove tags on a test')
+
+testTagCommand
+  .command('add <id> <tags...>')
+  .description('Add tags (names or IDs) to a test, keeping its existing tags')
+  .action(async (id: string, refs: string[]) => {
+    const client = createAuthenticatedClient()
+    const data = await withSpinner('Adding test tags', () => addAssignedTags(client, `/api/tests/${encodeURIComponent(id)}`, refs))
+    logger.success(`Test ${id} now has ${data.length} tag(s)`)
+    output(data as unknown as Record<string, unknown>[], { columns: TAG_COLUMNS })
+  })
+
+testTagCommand
+  .command('remove <id> <tags...>')
+  .description('Remove tags (names or IDs) from a test')
+  .action(async (id: string, refs: string[]) => {
+    const client = createAuthenticatedClient()
+    const data = await withSpinner('Removing test tags', () => removeAssignedTags(client, `/api/tests/${encodeURIComponent(id)}`, refs))
+    logger.success(`Test ${id} now has ${data.length} tag(s)`)
+    output(data as unknown as Record<string, unknown>[], { columns: TAG_COLUMNS })
   })
 
 testCommand
@@ -494,6 +532,7 @@ testCommand
     )
 
     const result = results[0]
+    if (getOutputFormat() === 'json') outputDetail({ ...result, type: typeArg })
     if (result?.valid) {
       logger.success(`Script is valid (${typeArg})`)
       if (result.warnings && result.warnings.length > 0) {
@@ -519,4 +558,21 @@ testCommand
         throw new CLIError(String(record.errorDetails ?? `Test ended with status: ${status}`), ExitCode.GeneralError)
       }
     }, Math.max(Number(options.idleTimeout) || 60, 10) * 1000)
+  })
+
+testCommand.command('execute <id>')
+  .description('Execute one deployed test in the cloud')
+  .option('--location <code>', 'Execution location for performance tests')
+  .option('--wait', 'Wait for the run to complete')
+  .option('--timeout <seconds>', 'Maximum wait time', '300')
+  .action(async (id: string, options: { location?: string; wait?: boolean; timeout: string }) => {
+    const timeout = parseIntStrict(options.timeout, '--timeout', { min: 1 }) * 1000
+    const client = createAuthenticatedClient()
+    const { data } = await client.post<Record<string, unknown>>(`/api/tests/${id}/execute`, { ...(options.location ? { location: options.location } : {}) }, { retries: 0 })
+    const runId = data.runId
+    if (typeof runId !== 'string') throw new CLIError('Execution returned no run ID. Inspect runs before retrying.', ExitCode.ApiError)
+    if (options.wait) {
+      try { outputDetail(await waitForRun(client, runId, timeout)) }
+      catch (error) { throw new CLIError(error instanceof Error ? error.message : 'Waiting failed', error instanceof CLIError ? error.exitCode : ExitCode.ApiError, { runId }) }
+    } else outputDetail({ ...data, runId, status: 'accepted' })
   })

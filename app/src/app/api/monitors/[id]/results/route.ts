@@ -1,6 +1,8 @@
+import { isUuid } from "@/lib/uuid";
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/utils/db";
 import { monitors, monitorResults } from "@/db/schema";
+import { monitorResultDetailsForRead } from "@/lib/monitor-read-config";
 import { eq, desc, and, gte, lt, sql } from "drizzle-orm";
 import { requireAuthContext, isAuthError } from '@/lib/auth-context';
 import { createLogger } from "@/lib/logger/index";
@@ -92,8 +94,16 @@ export async function GET(
 
   try {
     const authContext = await requireAuthContext();
+    const canView = checkPermissionWithContext("monitor", "view", authContext);
+    if (!canView) {
+      return NextResponse.json(
+        { error: "Insufficient permissions to view this monitor" },
+        { status: 403 }
+      );
+    }
     
-    // First, find the monitor to check permissions
+    // Find the monitor and verify its organization and project.
+    if (!isUuid((await routeContext.params).id)) return NextResponse.json({ error: "Monitor not found" }, { status: 404 });
     const monitor = await db.query.monitors.findFirst({
       where: eq(monitors.id, id),
     });
@@ -106,13 +116,6 @@ export async function GET(
       return NextResponse.json({ error: "Monitor not found" }, { status: 404 });
     }
 
-    const canView = checkPermissionWithContext("monitor", "view", authContext);
-    if (!canView) {
-      return NextResponse.json(
-        { error: "Insufficient permissions to view this monitor" },
-        { status: 403 }
-      );
-    }
 
     // Calculate offset for pagination
     const offset = (page - 1) * limit;
@@ -159,7 +162,7 @@ export async function GET(
     const hasPrevPage = page > 1;
 
     return NextResponse.json({
-      data: results,
+      data: results.map((result) => ({ ...result, details: monitorResultDetailsForRead(result.details) })),
       pagination: {
         page,
         limit,

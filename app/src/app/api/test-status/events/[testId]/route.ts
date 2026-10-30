@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { isUuid } from "@/lib/uuid";
 import { and, eq, sql } from "drizzle-orm";
 import { db } from "@/utils/db";
 import { tests, runs } from "@/db/schema";
@@ -73,14 +74,14 @@ export async function GET(request: Request) {
 
   // Check if this is a saved test OR a playground run
   // Saved tests exist in the tests table
-  const test = await db.query.tests.findFirst({
+  const test = isUuid(testId) ? await db.query.tests.findFirst({
     where: and(
       eq(tests.id, testId),
       eq(tests.organizationId, projectContext.organizationId),
       eq(tests.projectId, projectContext.project.id)
     ),
     columns: { id: true }
-  });
+  }) : undefined;
 
   // If not a saved test, check if it's a playground run
   // Playground runs store testId in metadata.testId
@@ -104,28 +105,60 @@ export async function GET(request: Request) {
     Connection: "keep-alive",
   };
 
+  let cleanupStream = () => {};
+  let cancelled = false;
   const stream = new ReadableStream({
     async start(controller) {
       const hub = getQueueEventHub();
       await hub.ready();
+      if (cancelled || request.signal.aborted) {
+        controller.close();
+        return;
+      }
 
       // Track whether the stream has been closed to prevent
       // 'Controller is already closed' errors from async callbacks
       let isClosed = false;
       let reconcileTimer: ReturnType<typeof setTimeout> | null = null;
 
+      let keepAlive: ReturnType<typeof setInterval> | undefined;
+      let unsubscribe = () => {};
+      let cleaned = false;
+      const cleanup = () => {
+        if (cleaned) return;
+        cleaned = true;
+        request.signal.removeEventListener("abort", cleanup);
+        isClosed = true;
+        clearInterval(keepAlive);
+        if (reconcileTimer) {
+          clearTimeout(reconcileTimer);
+          reconcileTimer = null;
+        }
+        unsubscribe();
+        try {
+          controller.close();
+        } catch {
+          // ignore
+        }
+      };
+
+      cleanupStream = cleanup;
+      request.signal.addEventListener("abort", cleanup);
+      if (isClosed || cancelled || request.signal.aborted) cleanup();
+
       const safeEnqueue = (data: Uint8Array) => {
-        if (isClosed) return;
+        if (isClosed || cancelled || request.signal.aborted) return;
         try {
           controller.enqueue(data);
         } catch {
           // Controller was closed between our check and enqueue
           isClosed = true;
+          cleanupStream();
         }
       };
 
       const send = async (event: NormalizedQueueEvent) => {
-        if (isClosed) return;
+        if (isClosed || cancelled || request.signal.aborted) return;
         if (!shouldStreamTestStatusEvent(event, testId)) {
           return;
         }
@@ -165,11 +198,12 @@ export async function GET(request: Request) {
         safeEnqueue(encoder.encode(serialize(payload)));
       };
 
-      const unsubscribe = hub.subscribe(send);
+      if (isClosed) return;
+      unsubscribe = hub.subscribe(send);
       safeEnqueue(encoder.encode(": connected\n\n"));
 
       const reconcilePersistedStatus = async () => {
-        if (isClosed) return;
+        if (isClosed || cancelled || request.signal.aborted) return;
 
         try {
           const report = await fetchInitialStatusReport(
@@ -211,7 +245,8 @@ export async function GET(request: Request) {
       const initialReport = await fetchInitialStatusReport(
         testId,
         projectContext.project.id
-      );
+      ).catch((error) => { cleanup(); throw error; });
+      if (isClosed) return;
       if (initialReport) {
         const initStatus = initialReport.status ?? "running";
         safeEnqueue(
@@ -238,26 +273,15 @@ export async function GET(request: Request) {
         STATUS_RECONCILE_INTERVAL_MS
       );
 
-      const keepAlive = setInterval(() => {
+      keepAlive = setInterval(() => {
         safeEnqueue(encoder.encode(": ping\n\n"));
       }, 30000);
 
-      const cleanup = () => {
-        isClosed = true;
-        clearInterval(keepAlive);
-        if (reconcileTimer) {
-          clearTimeout(reconcileTimer);
-          reconcileTimer = null;
-        }
-        unsubscribe();
-        try {
-          controller.close();
-        } catch {
-          // ignore
-        }
-      };
 
-      request.signal.addEventListener("abort", cleanup);
+    },
+    cancel() {
+      cancelled = true;
+      cleanupStream();
     },
   });
 

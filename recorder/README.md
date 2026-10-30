@@ -5,7 +5,7 @@
 The Supercheck Recorder turns real browser interactions into maintainable Playwright code. Built on Chrome Extensions Manifest V3 and Playwright CRX, it operates directly inside Chrome and Microsoft Edge without requiring external drivers or local runner setups. Record user flows, assert DOM states, inspect selectors, and save generated tests straight to your Supercheck projects with zero manual token copying.
 
 [![Chrome Web Store](https://img.shields.io/badge/Chrome_Web_Store-Supercheck_Recorder-blue?logo=googlechrome)](https://chromewebstore.google.com/detail/supercheck-recorder/gfmbcelfhhfmifdkccnbgdadibdfhioe)
-[![Edge Add-ons](https://img.shields.io/badge/Microsoft_Edge-Supercheck_Recorder-0078D7?logo=microsoftedge)](https://microsoftedge.microsoft.com/addons/detail/supercheck-recorder/0rdckc265vb9)
+[![Edge Add-ons](https://img.shields.io/badge/Microsoft_Edge-Supercheck_Recorder-0078D7?logo=microsoftedge)](https://microsoftedge.microsoft.com/addons/detail/supercheck-recorder/ngmlkgfgmdnfpddohcbfdgihennolnem)
 [![Documentation](https://img.shields.io/badge/Docs-supercheck.io-blue)](https://supercheck.io/docs/recorder)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
@@ -31,11 +31,11 @@ The Supercheck Recorder turns real browser interactions into maintainable Playwr
 Install the official extension from your browser's store:
 
 - **Google Chrome**: [Install from Chrome Web Store](https://chromewebstore.google.com/detail/supercheck-recorder/gfmbcelfhhfmifdkccnbgdadibdfhioe)
-- **Microsoft Edge**: [Install from Microsoft Edge Add-ons](https://microsoftedge.microsoft.com/addons/detail/supercheck-recorder/0rdckc265vb9)
+- **Microsoft Edge**: [Install from Microsoft Edge Add-ons](https://microsoftedge.microsoft.com/addons/detail/supercheck-recorder/ngmlkgfgmdnfpddohcbfdgihennolnem)
 
 ### Install from source (developer build)
 
-Requires Node.js 18 or later.
+Requires Node.js 20 or later.
 
 ```bash
 git clone https://github.com/supercheck-io/supercheck.git
@@ -180,6 +180,9 @@ npm run lint
 # Build library, examples, and extension bundle
 npm run build
 
+# Check recorder and imported vendor source types after bundle preparation
+npm run typecheck
+
 # Install test browser dependencies
 npm run test:install
 
@@ -191,6 +194,16 @@ npm run test:browser
 ```
 
 ### Vendored Playwright source
+
+Use Node.js 24 for CI-equivalent development checks. The `electron` development
+dependency is a pinned alias to `electron-types`: it supplies the official SDK
+declarations without installing or running an Electron binary, and retains Node
+20 installation support.
+`npm run build` prepares the locked vendor bundles before `npm run typecheck`.
+After changing root dependencies, prepare those bundles again before typechecking.
+The compiler checks recorder source and its imported vendor code with the existing
+Node 20.8 declaration baseline, plus Chrome and Vite declarations resolved from
+the recorder root. Strictness and source coverage are unchanged.
 
 The `playwright/` directory contains the exact subset of Microsoft Playwright v1.53.0 source needed to build the extension without external build dependencies or private repositories. When updating Playwright, replace vendored packages from the corresponding upstream source, update `playwright/VERSION`, and verify the build and browser test suites.
 
@@ -214,6 +227,5 @@ The Supercheck Recorder is distributed under the [Apache-2.0 License](LICENSE). 
 
 ## Community
 
-[![Discord](https://img.shields.io/badge/Discord-Join%20Community-5865F2?logo=discord&logoColor=white)](https://discord.gg/UVe327CSbm)
 [![GitHub Issues](https://img.shields.io/badge/GitHub-Issues-181717?logo=github&logoColor=white)](https://github.com/supercheck-io/supercheck/issues)
 [![GitHub Discussions](https://img.shields.io/badge/GitHub-Discussions-181717?logo=github&logoColor=white)](https://github.com/supercheck-io/supercheck/discussions)

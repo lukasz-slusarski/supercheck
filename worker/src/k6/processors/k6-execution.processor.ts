@@ -1,8 +1,19 @@
+import { ExecutionCapacityError } from '../../execution/services/execution-admission.service';
+import { deferForCapacity } from '../../common/capacity-deferral';
+import {
+  withRunCallback,
+  RunCallbackBusyError,
+  canPersistK6Result,
+} from '../../execution/services/run-callback';
 import { Processor, WorkerHost, OnWorkerEvent } from '@nestjs/bullmq';
-import { Logger } from '@nestjs/common';
+import {
+  Logger,
+  OnApplicationBootstrap,
+  OnModuleDestroy,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Job } from 'bullmq';
-import { sql, eq, and, type SQL } from 'drizzle-orm';
+import { Job, UnrecoverableError, DelayedError } from 'bullmq';
+import { sql, eq, and, type SQL, inArray } from 'drizzle-orm';
 import {
   K6ExecutionService,
   K6ExecutionTask,
@@ -10,10 +21,20 @@ import {
 import { DbService } from '../../execution/services/db.service';
 import { UsageTrackerService } from '../../execution/services/usage-tracker.service';
 import { HardStopNotificationService } from '../../execution/services/hard-stop-notification.service';
-import { CancellationService } from '../../common/services/cancellation.service';
+import {
+  CancellationService,
+  RUN_CANCELLATION_MARKER,
+} from '../../common/services/cancellation.service';
+import {
+  getBillableMs,
+  getBillableVirtualUsers,
+} from '../../common/billable-ms';
 import * as schema from '../../db/schema';
 import { JobNotificationService } from '../../execution/services/job-notification.service';
 import { K6_QUEUE } from '../k6.constants';
+import { consumesWorkerQueue } from '../../common/worker-queues';
+import { locationSupportsWorkload } from '../../common/location/location-capability';
+import { GlobalQueueCapabilityGuard } from '../../common/location/global-queue-guard';
 
 type K6Task = K6ExecutionTask;
 
@@ -68,10 +89,57 @@ abstract class BaseK6ExecutionProcessor extends WorkerHost {
     );
   }
 
+  /**
+   * Whether a live execution exists for the run. If Kubernetes stays
+   * unreachable past the bounded wait, fail the run terminally (no retry, no
+   * usage) so it cannot sit queued forever with no sweeper looking at it.
+   */
+  private async hasActiveExecutionOrFail(runId: string): Promise<boolean> {
+    try {
+      return await this.k6ExecutionService.hasActiveExecution(runId, {
+        boundUncertainty: true,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const recorded = await this.dbService
+        .failRunUnlessCancelled(runId, message)
+        .then(
+          () => true,
+          (err: Error) => {
+            this.logger.error(
+              `[${runId}] Failed to mark run failed after unverifiable execution state: ${err.message}`,
+            );
+            return false;
+          },
+        );
+      // Nothing claimed the run yet, so retry rather than give up with the failure unrecorded.
+      throw recorded ? new UnrecoverableError(message) : new Error(message);
+    }
+  }
+
   async handleProcess(
     job: Job<K6Task>,
   ): Promise<{ success: boolean; timedOut?: boolean; error?: string }> {
+    try {
+      return await withRunCallback(this.dbService.db, job.data.runId, () =>
+        this.handleProcessOwned(job),
+      );
+    } catch (error) {
+      if (error instanceof RunCallbackBusyError) {
+        await job.moveToDelayed(Date.now() + 10_000, job.token);
+        throw new DelayedError();
+      }
+      throw error;
+    }
+  }
+
+  private async handleProcessOwned(
+    job: Job<K6Task>,
+  ): Promise<{ success: boolean; timedOut?: boolean; error?: string }> {
     const processStartTime = Date.now();
+    let observedBillableMs = 0;
+    let observedVirtualUsers: number | undefined;
+    let usagePersisted = false;
     const requestedLocation = job.data.location || this.workerLocation;
     const normalizedJobLocation = requestedLocation.toLowerCase();
     const jobLocationIsWildcard = this.isWildcardLocation(
@@ -88,6 +156,23 @@ abstract class BaseK6ExecutionProcessor extends WorkerHost {
     };
 
     const runId = taskData.runId;
+    const terminal = await this.dbService.getTerminalRun(runId);
+    if (terminal)
+      return {
+        success: terminal.status === 'passed',
+        error: terminal.errorDetails ?? undefined,
+      };
+    if (await this.hasActiveExecutionOrFail(runId)) {
+      await job.moveToDelayed(Date.now() + 10_000, job.token);
+      throw new DelayedError();
+    }
+    if (!(await this.dbService.claimRunExecution(runId))) {
+      // Refused because cancellation was requested, or because the run already finished (a replay of a
+      // terminal run). Either way nothing is running, so end the run here (finalizing is a no-op if it is
+      // already terminal) instead of leaving it queued until a recovery sweep (which is off by default).
+      await this.dbService.finalizeCancelledRun(runId);
+      return { success: false, error: RUN_CANCELLATION_MARKER };
+    }
     const isJobRun = Boolean(taskData.jobId);
     const testId = taskData.tests?.[0]?.id || taskData.testId || null;
 
@@ -113,14 +198,19 @@ abstract class BaseK6ExecutionProcessor extends WorkerHost {
         .set({
           status: 'error',
           completedAt: new Date(),
-          errorDetails: 'Execution cancelled by user',
+          errorDetails: RUN_CANCELLATION_MARKER,
         })
-        .where(eq(schema.runs.id, runId));
+        .where(
+          and(
+            eq(schema.runs.id, runId),
+            inArray(schema.runs.status, ['queued', 'running']),
+          ),
+        );
 
       return {
         success: false,
         timedOut: false,
-        error: 'Cancellation requested by user',
+        error: RUN_CANCELLATION_MARKER,
       };
     }
 
@@ -141,7 +231,12 @@ abstract class BaseK6ExecutionProcessor extends WorkerHost {
           completedAt: new Date(),
           errorDetails: blockCheck.reason,
         })
-        .where(eq(schema.runs.id, runId));
+        .where(
+          and(
+            eq(schema.runs.id, runId),
+            inArray(schema.runs.status, ['queued', 'running']),
+          ),
+        );
 
       // Update job status if this is a job run
       if (taskData.jobId) {
@@ -169,19 +264,46 @@ abstract class BaseK6ExecutionProcessor extends WorkerHost {
     }
 
     try {
+      // Backstop for stale or misrouted jobs: never execute in a location that
+      // lost k6 capability. Checked inside the try so the run is marked failed
+      // (with job status and notifications) instead of staying queued. A DB
+      // error throws and retries; unknown capability is never treated as allowed.
+      const jobLocation = effectiveJobLocation.toLowerCase();
+      if (jobLocation !== 'global' && !jobLocationIsWildcard) {
+        const allowed = await locationSupportsWorkload(
+          this.dbService,
+          jobLocation,
+          'k6',
+        );
+        if (!allowed) {
+          throw new UnrecoverableError(
+            `Location "${jobLocation}" does not support k6 execution`,
+          );
+        }
+      }
+
       // Mark run as in-progress
       await this.dbService.db
         .update(schema.runs)
         .set({
           status: 'running',
-          startedAt: new Date(),
-          location:
-            effectiveJobLocation as (typeof schema.runs.$inferInsert)['location'],
+          // The app marks runs running at admission; keep that timestamp.
+          startedAt: sql`coalesce(${schema.runs.startedAt}, now())`,
+          location: effectiveJobLocation,
         })
-        .where(eq(schema.runs.id, runId));
+        .where(
+          and(
+            eq(schema.runs.id, runId),
+            inArray(schema.runs.status, ['queued', 'running']),
+          ),
+        );
 
       // Execute k6
       const result = await this.k6ExecutionService.runK6Test(taskData);
+      // Meter only container run time evidenced by Kubernetes.
+      const billableMs = result.billableMs ?? 0;
+      observedBillableMs = billableMs;
+      observedVirtualUsers = result.billingVirtualUsers;
 
       // Log execution result
       this.logger.log(
@@ -191,12 +313,7 @@ abstract class BaseK6ExecutionProcessor extends WorkerHost {
       // Extract metrics from summary
       const metrics = this.extractMetrics(result.summary);
 
-      // Check if this was a cancellation (exit code 137 = SIGKILL)
-      // The container executor kills the container with SIGKILL when cancellation is detected
-      const wasCancelled =
-        !result.success &&
-        (result.error?.includes('code 137') ||
-          result.error?.includes('cancelled'));
+      const wasCancelled = result.cancelled === true;
 
       // Create k6_performance_runs record
       const totalRequests = Math.round(metrics.totalRequests || 0);
@@ -221,17 +338,13 @@ abstract class BaseK6ExecutionProcessor extends WorkerHost {
             ? 'passed'
             : 'failed';
 
-      const actualDurationMs =
-        result.durationMs > 0
-          ? result.durationMs
-          : Math.max(1000, Date.now() - processStartTime);
       await this.usageTrackerService.completeRunWithUsage(
         {
           organizationId: taskData.organizationId,
           runId,
           eventType: 'k6_execution',
-          durationMs: actualDurationMs,
-          virtualUsers: metrics.maxVUs > 0 ? metrics.maxVUs : 1,
+          durationMs: billableMs,
+          virtualUsers: result.billingVirtualUsers,
           metadata: {
             jobId: taskData.jobId,
             testId,
@@ -239,6 +352,15 @@ abstract class BaseK6ExecutionProcessor extends WorkerHost {
           },
         },
         async (transaction) => {
+          if (
+            !(await canPersistK6Result(
+              transaction,
+              taskData.organizationId,
+              taskData.projectId,
+              taskData.jobId,
+            ))
+          )
+            return;
           // A replay can arrive after completion committed but before BullMQ
           // acknowledged it. Reuse the existing performance record for this run.
           const existingPerformanceRun =
@@ -278,7 +400,7 @@ abstract class BaseK6ExecutionProcessor extends WorkerHost {
               summaryS3Url: result.summaryUrl ?? null,
               consoleS3Url: result.consoleUrl ?? null,
               errorDetails: wasCancelled
-                ? 'Cancellation requested by user'
+                ? RUN_CANCELLATION_MARKER
                 : result.error,
               consoleOutput: result.consoleOutput
                 ? result.consoleOutput.slice(0, 10000)
@@ -319,7 +441,7 @@ abstract class BaseK6ExecutionProcessor extends WorkerHost {
           }
 
           if (wasCancelled) {
-            runUpdate.errorDetails = 'Cancellation requested by user';
+            runUpdate.errorDetails = RUN_CANCELLATION_MARKER;
           } else if (result.timedOut) {
             const baseExpression =
               metadataExpression ?? sql`coalesce(metadata, '{}'::jsonb)`;
@@ -334,6 +456,9 @@ abstract class BaseK6ExecutionProcessor extends WorkerHost {
               result.error ?? 'k6 execution timed out before completion.';
           } else if (result.error) {
             runUpdate.errorDetails = result.error;
+          } else if (runStatus === 'passed' || runStatus === 'failed') {
+            // Completion wins a late-cancel race: drop a stale cancellation marker, and only that marker.
+            runUpdate.errorDetails = sql`CASE WHEN ${schema.runs.errorDetails} = ${RUN_CANCELLATION_MARKER} THEN NULL ELSE ${schema.runs.errorDetails} END`;
           }
 
           if (metadataExpression) {
@@ -343,29 +468,37 @@ abstract class BaseK6ExecutionProcessor extends WorkerHost {
           await transaction
             .update(schema.runs)
             .set(runUpdate)
-            .where(eq(schema.runs.id, runId));
+            .where(
+              and(
+                eq(schema.runs.id, runId),
+                inArray(schema.runs.status, ['queued', 'running']),
+              ),
+            );
         },
       );
+      usagePersisted = true;
 
-      // Track K6 usage for billing (even for cancelled runs - they still consumed resources)
-      // Use actual duration for cancelled runs, not 0
-      await this.usageTrackerService
-        .trackK6Execution(
-          taskData.organizationId,
-          metrics.maxVUs > 0 ? metrics.maxVUs : 1, // At least 1 VU for cancelled runs
-          actualDurationMs,
-          {
-            runId,
-            jobId: taskData.jobId,
-            testId,
-            location: taskData.location,
-          },
-        )
-        .catch((err: Error) =>
-          this.logger.warn(
-            `[${runId}] Failed to track K6 usage: ${err.message}`,
-          ),
-        );
+      // Track K6 usage for billing. Cancelled runs that started a container are
+      // charged for the time it ran; runs that never started are not charged.
+      if (billableMs > 0 && result.billingVirtualUsers !== undefined) {
+        await this.usageTrackerService
+          .trackK6Execution(
+            taskData.organizationId,
+            result.billingVirtualUsers,
+            billableMs,
+            {
+              runId,
+              jobId: taskData.jobId,
+              testId,
+              location: taskData.location,
+            },
+          )
+          .catch((err: Error) =>
+            this.logger.warn(
+              `[${runId}] Failed to track K6 usage: ${err.message}`,
+            ),
+          );
+      }
 
       if (taskData.jobId) {
         // Use the same execution error check for final job status
@@ -435,10 +568,22 @@ abstract class BaseK6ExecutionProcessor extends WorkerHost {
         success: result.success,
         timedOut: result.timedOut,
         error: wasCancelled
-          ? 'Cancellation requested by user'
+          ? RUN_CANCELLATION_MARKER
           : (result.error ?? undefined),
       };
     } catch (error) {
+      if (error instanceof ExecutionCapacityError) {
+        return deferForCapacity(job, async (reason) => {
+          // A run the user already cancelled ends as cancelled; the capacity failure must not replace that.
+          await this.dbService
+            .failRunUnlessCancelled(runId, reason)
+            .catch((err: Error) =>
+              this.logger.error(
+                `[${runId}] Failed to mark run failed after waiting for capacity: ${err.message}`,
+              ),
+            );
+        });
+      }
       const message = `[Job ${job.id}] Failed with error: ${
         error instanceof Error ? error.message : String(error)
       }`;
@@ -447,6 +592,39 @@ abstract class BaseK6ExecutionProcessor extends WorkerHost {
         error instanceof Error ? error.stack : undefined,
       );
 
+      if (
+        !message.includes('cancelled') &&
+        !message.includes('cancellation') &&
+        !(error instanceof UnrecoverableError) &&
+        (job.attemptsMade ?? 0) + 1 < (job.opts?.attempts ?? 1)
+      ) {
+        const attemptBillableMs = Math.max(
+          getBillableMs(error),
+          observedBillableMs,
+        );
+        if (attemptBillableMs > 0 && !usagePersisted) {
+          await this.usageTrackerService.completeRunWithUsage(
+            {
+              organizationId: taskData.organizationId,
+              runId: `${runId}:attempt:${job.attemptsMade ?? 0}`,
+              eventType: 'k6_execution',
+              durationMs: attemptBillableMs,
+              virtualUsers:
+                getBillableVirtualUsers(error) ?? observedVirtualUsers,
+              metadata: {
+                executionRunId: runId,
+                retryAttempt: job.attemptsMade ?? 0,
+                requiresAllocationReconciliation:
+                  (getBillableVirtualUsers(error) ?? observedVirtualUsers) ===
+                  undefined,
+              },
+            },
+            async () => {},
+          );
+        }
+        throw error;
+      }
+
       // Update run record to error status before rethrowing to ensure UI and retries work correctly
       try {
         const _durationSeconds = Math.round(
@@ -454,21 +632,55 @@ abstract class BaseK6ExecutionProcessor extends WorkerHost {
         );
         // Check if this is a cancellation error
         const isCancellation =
-          message.includes('cancelled') ||
-          message.includes('cancellation') ||
-          message.includes('code 137');
+          message.includes('cancelled') || message.includes('cancellation');
 
-        await this.dbService.db
-          .update(schema.runs)
-          .set({
-            status: isCancellation ? 'error' : 'failed',
-            completedAt: new Date(),
-            durationMs: Date.now() - processStartTime,
-            errorDetails: isCancellation
-              ? 'Cancellation requested by user'
-              : message,
-          })
-          .where(eq(schema.runs.id, runId));
+        const persistError = async (
+          transaction?: Parameters<
+            Parameters<UsageTrackerService['completeRunWithUsage']>[1]
+          >[0],
+        ) => {
+          await (transaction ?? this.dbService.db)
+            .update(schema.runs)
+            .set({
+              status: isCancellation ? 'error' : 'failed',
+              completedAt: new Date(),
+              durationMs: Date.now() - processStartTime,
+              errorDetails: isCancellation ? RUN_CANCELLATION_MARKER : message,
+            })
+            .where(
+              and(
+                eq(schema.runs.id, runId),
+                inArray(schema.runs.status, ['queued', 'running']),
+              ),
+            );
+        };
+        const failureBillableMs = Math.max(
+          getBillableMs(error),
+          observedBillableMs,
+        );
+        if (failureBillableMs > 0 && !usagePersisted) {
+          await this.usageTrackerService.completeRunWithUsage(
+            {
+              organizationId: taskData.organizationId,
+              runId,
+              eventType: 'k6_execution',
+              durationMs: failureBillableMs,
+              virtualUsers:
+                getBillableVirtualUsers(error) ?? observedVirtualUsers,
+              metadata: {
+                testId,
+                jobId: taskData.jobId,
+                executionError: true,
+                requiresAllocationReconciliation:
+                  (getBillableVirtualUsers(error) ?? observedVirtualUsers) ===
+                  undefined,
+              },
+            },
+            persistError,
+          );
+        } else {
+          await persistError();
+        }
       } catch (dbError) {
         this.logger.error(
           `[${runId}] Failed to update run to failed status: ${getErrorMessage(dbError)}`,
@@ -534,9 +746,7 @@ abstract class BaseK6ExecutionProcessor extends WorkerHost {
 
       // Check if this is a cancellation error (re-check at outer scope)
       const isCancellationOuter =
-        message.includes('cancelled') ||
-        message.includes('cancellation') ||
-        message.includes('code 137');
+        message.includes('cancelled') || message.includes('cancellation');
 
       // For cancellations, return a result instead of throwing to prevent BullMQ retry
       if (isCancellationOuter) {
@@ -572,8 +782,7 @@ abstract class BaseK6ExecutionProcessor extends WorkerHost {
     }
 
     const metrics = summary.metrics as
-      | Record<string, Record<string, number>>
-      | undefined;
+      Record<string, Record<string, number>> | undefined;
     if (!metrics) {
       return {
         totalRequests: 0,
@@ -641,8 +850,19 @@ abstract class BaseK6ExecutionProcessor extends WorkerHost {
 @Processor(K6_QUEUE, {
   concurrency: 1,
   lockDuration: 70 * 60 * 1000,
+  stalledInterval: 30000,
+  maxStalledCount: 2,
+  metrics: { maxDataPoints: 60 },
+  // Idle unless this worker consumes the global k6 queue (WORKER_QUEUES). The
+  // instance still serves handleProcess() for the regional dynamic workers.
+  autorun: consumesWorkerQueue('global-k6'),
 })
-export class K6ExecutionProcessor extends BaseK6ExecutionProcessor {
+export class K6ExecutionProcessor
+  extends BaseK6ExecutionProcessor
+  implements OnApplicationBootstrap, OnModuleDestroy
+{
+  private capabilityGuard: GlobalQueueCapabilityGuard | null = null;
+
   constructor(
     k6ExecutionService: K6ExecutionService,
     dbService: DbService,
@@ -662,6 +882,23 @@ export class K6ExecutionProcessor extends BaseK6ExecutionProcessor {
       hardStopNotificationService,
       cancellationService,
     );
+  }
+
+  onApplicationBootstrap(): void {
+    // k6-global has no location: the consuming worker's own location decides.
+    if (!consumesWorkerQueue('global-k6')) return;
+    this.capabilityGuard = new GlobalQueueCapabilityGuard(
+      () => this.worker,
+      this.dbService,
+      this.workerLocation,
+      'k6',
+      this.logger,
+    );
+    this.capabilityGuard.start();
+  }
+
+  onModuleDestroy(): void {
+    this.capabilityGuard?.stop();
   }
 
   async process(

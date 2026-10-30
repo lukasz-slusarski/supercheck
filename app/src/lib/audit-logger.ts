@@ -7,6 +7,7 @@
  * Uses Pino for structured logging alongside database persistence.
  */
 
+import { getAuditActor } from "./audit-actor";
 import { db } from "@/utils/db";
 import {
   auditLogs as audit_log,
@@ -44,7 +45,14 @@ const auditLogger = createLogger({ module: 'audit' }) as {
 /**
  * Log an audit event to the database and structured logs
  */
-export async function logAuditEvent(event: AuditEvent): Promise<void> {
+// Either the shared pool or a transaction handle, so callers can commit audit rows atomically.
+type AuditExecutor = Pick<typeof db, "insert">;
+
+export async function logAuditEvent(
+  event: AuditEvent,
+  executor: AuditExecutor = db,
+  options: { strict?: boolean } = {}
+): Promise<void> {
   try {
     // Get request context if available (skip if outside request scope)
     let ipAddress = "unknown";
@@ -64,6 +72,8 @@ export async function logAuditEvent(event: AuditEvent): Promise<void> {
       userAgent = event.userAgent || "system";
     }
 
+    const actor = await getAuditActor(event.userId);
+
     // Prepare audit log entry according to schema
     const auditEntry = {
       userId: event.userId || null,
@@ -80,11 +90,12 @@ export async function logAuditEvent(event: AuditEvent): Promise<void> {
         userAgent: event.userAgent || userAgent,
         ...(event.metadata ?? {}),
         ...(event.metadata ? { metadata: { ...event.metadata } } : {}),
+        ...actor,
       },
     };
 
     // Insert into database
-    await db.insert(audit_log).values(auditEntry);
+    await executor.insert(audit_log).values(auditEntry);
 
     // Log to Pino with structured data
     const logData = {
@@ -111,11 +122,12 @@ export async function logAuditEvent(event: AuditEvent): Promise<void> {
       );
     }
   } catch (error) {
-    // Never fail the request due to audit logging errors
+    // Existing callers remain best-effort; critical transactions can require persistence.
     auditLogger.error(
       { err: error, event },
       'Failed to log audit event'
     );
+    if (options.strict) throw error;
   }
 }
 
@@ -205,7 +217,8 @@ export async function logAdminEvent(
   targetUserId?: string,
   resourceType?: string,
   resourceId?: string,
-  metadata?: Record<string, unknown>
+  metadata?: Record<string, unknown>,
+  executor?: AuditExecutor
 ): Promise<void> {
   await logAuditEvent({
     userId,
@@ -218,7 +231,7 @@ export async function logAdminEvent(
       timestamp: new Date().toISOString(),
     },
     success: true, // Admin actions that reach here are assumed successful
-  });
+  }, executor);
 }
 
 /**

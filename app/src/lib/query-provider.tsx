@@ -9,15 +9,23 @@ import {
 import { persistQueryClient } from "@tanstack/react-query-persist-client";
 import { createSyncStoragePersister } from "@tanstack/query-sync-storage-persister";
 import { ReactNode, useEffect, useState } from "react";
+import { useSession } from "@/utils/auth-client";
 
-const CACHE_KEY = "supercheck-cache-v1";
+// Bump the version when a persisted query changes shape; older stores are removed on load.
+const CACHE_KEY = "supercheck-cache-v3";
+const CACHE_KEY_PREFIX = "supercheck-cache-";
 const MAX_AGE = 24 * 60 * 60 * 1000; // 24 hours
 const STALE_TIME = 30 * 60 * 1000; // 30 minutes - data is fresh for this long
 
 // Share the browser cache across providers and client navigations.
 let browserClient: QueryClient | undefined;
+let browserIdentity: string | null | undefined;
 let unsubscribePersistence: (() => void) | undefined;
 let restorationPromise: Promise<void> | undefined;
+// Set when another tab removed this identity's saved cache (it signed out): until this tab's identity
+// changes, nothing may write that cache back, even if this tab still shows the old data for a moment.
+let cacheClearedByOtherTab = false;
+let stopWatchingCacheKey: (() => void) | undefined;
 
 function createClient() {
   return new QueryClient({
@@ -35,19 +43,49 @@ function createClient() {
   });
 }
 
-function initializePersistence(client: QueryClient): Promise<void> {
+// A cache is only cleared when its own tab sees the session end, so an expired session or a
+// closed browser leaves that account's data in localStorage. Anyone using the browser next could
+// read it, so keep only the identity that is signed in now (and no older cache versions).
+function pruneCaches(storage: Storage, keep: string) {
+  try {
+    const stale: string[] = [];
+    for (let i = 0; i < storage.length; i++) {
+      const key = storage.key(i);
+      if (key && key.startsWith(CACHE_KEY_PREFIX) && key !== keep) stale.push(key);
+    }
+    stale.forEach((key) => storage.removeItem(key));
+  } catch {
+    /* pruning is best effort: it must not stop this account's own cache from working */
+  }
+}
+
+function initializePersistence(
+  client: QueryClient,
+  identity: string,
+): Promise<void> {
   try {
     const storage = window.localStorage;
+    pruneCaches(storage, `${CACHE_KEY}:${identity}`);
+    cacheClearedByOtherTab = false;
+    stopWatchingCacheKey?.();
+    const ownKey = `${CACHE_KEY}:${identity}`;
+    const onStorage = (event: StorageEvent) => {
+      if (event.storageArea === storage && event.key === ownKey && event.newValue === null) {
+        cacheClearedByOtherTab = true;
+      }
+    };
+    window.addEventListener("storage", onStorage);
+    stopWatchingCacheKey = () => window.removeEventListener("storage", onStorage);
     const persister = createSyncStoragePersister({
       storage: {
         getItem: (key) => storage.getItem(key),
         setItem: (key, value) => {
-          // A throttled save must not restore a signed-out user's cache.
-          if (browserClient === client) storage.setItem(key, value);
+          // A throttled save must not restore a signed-out user's cache, here or in another tab.
+          if (browserClient === client && !cacheClearedByOtherTab) storage.setItem(key, value);
         },
         removeItem: (key) => storage.removeItem(key),
       },
-      key: CACHE_KEY,
+      key: `${CACHE_KEY}:${identity}`,
       throttleTime: 500,
     });
 
@@ -73,7 +111,7 @@ function initializePersistence(client: QueryClient): Promise<void> {
     console.error("Failed to initialize query persistence:", error);
     // Clear potentially corrupted cache
     try {
-      window.localStorage.removeItem(CACHE_KEY);
+      window.localStorage.removeItem(`${CACHE_KEY}:${identity}`);
     } catch {
       /* ignore */
     }
@@ -82,8 +120,13 @@ function initializePersistence(client: QueryClient): Promise<void> {
   return Promise.resolve();
 }
 
-function getClient() {
+function getClient(identity: string | null) {
   if (isServer) return createClient();
+
+  if (browserIdentity !== identity) {
+    clearQueryCache();
+    browserIdentity = identity;
+  }
 
   if (!browserClient) {
     browserClient = createClient();
@@ -100,10 +143,14 @@ export function clearQueryCache() {
     unsubscribePersistence = undefined;
   }
 
+  stopWatchingCacheKey?.();
+  stopWatchingCacheKey = undefined;
   browserClient?.clear();
 
   try {
-    window.localStorage.removeItem(CACHE_KEY);
+    // Older versions and other accounts are pruned when the next identity restores its cache.
+    if (browserIdentity)
+      window.localStorage.removeItem(`${CACHE_KEY}:${browserIdentity}`);
   } catch {
     /* ignore */
   }
@@ -114,18 +161,45 @@ export function clearQueryCache() {
 }
 
 export function QueryProvider({ children }: { children: ReactNode }) {
-  const client = getClient();
+  const session = useSession();
+  const identity = session.data?.user.id ?? null;
+  return (
+    <IdentityQueryProvider
+      key={identity ?? "anonymous"}
+      identity={identity}
+      pending={session.isPending}
+    >
+      {children}
+    </IdentityQueryProvider>
+  );
+}
+
+function IdentityQueryProvider({
+  children,
+  identity,
+  pending,
+}: {
+  children: ReactNode;
+  identity: string | null;
+  pending: boolean;
+}) {
+  const client = getClient(identity);
   const [isRestoring, setIsRestoring] = useState(true);
 
   useEffect(() => {
     // Server and first client render both use an empty cache. Restore only
     // after mount, with queries paused until the saved cache is ready.
-    restorationPromise ??= initializePersistence(client);
+    if (pending) return;
+    if (!identity) {
+      setIsRestoring(false);
+      return;
+    }
+    restorationPromise ??= initializePersistence(client, identity);
     void restorationPromise.then(
       () => setIsRestoring(false),
       () => setIsRestoring(false),
     );
-  }, [client]);
+  }, [client, identity, pending]);
 
   return (
     <QueryClientProvider client={client}>

@@ -1,3 +1,4 @@
+import { isUuid } from "@/lib/uuid";
 import { NextRequest, NextResponse } from 'next/server';
 import { hasPermissionForUser } from '@/lib/rbac/middleware';
 import { requireUserAuthContext, isAuthError } from '@/lib/auth-context';
@@ -15,10 +16,11 @@ export async function GET(
 ) {
   const resolvedParams = await params;
   try {
-    const { userId } = await requireUserAuthContext();
+    const { userId } = await requireUserAuthContext((await params).id);
     const projectId = resolvedParams.id;
     
     // Get project to determine organization
+    if (!isUuid((await params).id)) return NextResponse.json({ error: "Project not found" }, { status: 404 });
     const projectData = await db
       .select({
         id: projects.id,
@@ -107,10 +109,11 @@ export async function PUT(
 ) {
   const resolvedParams = await params;
   try {
-    const { userId } = await requireUserAuthContext();
+    const { userId } = await requireUserAuthContext((await params).id);
     const projectId = resolvedParams.id;
     
     // Get project to determine organization
+    if (!isUuid((await params).id)) return NextResponse.json({ error: "Project not found" }, { status: 404 });
     const projectData = await db
       .select({ organizationId: projects.organizationId })
       .from(projects)
@@ -198,10 +201,11 @@ export async function DELETE(
 ) {
   const resolvedParams = await params;
   try {
-    const { userId } = await requireUserAuthContext();
+    const { userId } = await requireUserAuthContext((await params).id);
     const projectId = resolvedParams.id;
     
     // Get project to determine organization
+    if (!isUuid((await params).id)) return NextResponse.json({ error: "Project not found" }, { status: 404 });
     const projectData = await db
       .select({ organizationId: projects.organizationId, isDefault: projects.isDefault })
       .from(projects)

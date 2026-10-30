@@ -1,19 +1,11 @@
 // Browser-safe defaults; database pricing remains authoritative.
 
+import catalog from "./plan-catalog.json";
+
 export const DEFAULT_OVERAGE_PRICING_CENTS = {
-  plus: {
-    playwrightMinutes: 3,
-    k6VuMinutes: 0.5,
-    aiCredits: 5,
-    sreInvestigationUnits: 50,
-  },
-  pro: {
-    playwrightMinutes: 2,
-    k6VuMinutes: 0.25,
-    aiCredits: 3,
-    sreInvestigationUnits: 50,
-  },
-} as const;
+  plus: catalog.plus.overageCents,
+  pro: catalog.pro.overageCents,
+};
 
 export const DEFAULT_OVERAGE_PRICING = {
   plus: {
@@ -34,8 +26,8 @@ export const DEFAULT_OVERAGE_PRICING = {
   },
 };
 
-export function formatOveragePrice(price: number, unit: string) {
-  if (price < 0.01) {
+export function formatOveragePrice(price: number, unit: string, perUnit = false) {
+  if (price < 0.01 && !perUnit) {
     return `$${(price * 1000).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 4 })} per 1,000 ${unit}`;
   }
   return `$${price.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 6 })}/${unit}`;

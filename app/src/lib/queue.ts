@@ -1,5 +1,6 @@
+import { getExecutionPolicy, assertExecutionWorkload } from "./execution/execution-policy";
 import crypto from "crypto";
-import { Queue, QueueEvents } from "bullmq";
+import { FlowProducer, Queue, QueueEvents, type JobsOptions } from "bullmq";
 import Redis, { RedisOptions } from "ioredis";
 import type {
   LocationConfig,
@@ -15,6 +16,16 @@ import {
 } from "./location-registry";
 import { omitExecutionSecrets } from "./execution-payload";
 import { ExecutionQueueError } from "./execution-errors";
+import {
+  abortMonitorCycle,
+  MonitorCycleClosedError,
+  missingCycleClosureEnabled,
+  missingCycleDeadlineMs,
+  monitorCycleId,
+  monitorCyclePolicy,
+  persistMonitorCycle,
+  type MonitorCycleRequest,
+} from "./monitor-cycles";
 import {
   partitionMonitorLocationsByAvailability,
   resolveMonitorLocations,
@@ -110,7 +121,7 @@ export interface JobExecutionTask {
 export interface MonitorJobData {
   monitorId: string;
   projectId?: string;
-  type: "http_request" | "website" | "ping_host" | "port_check";
+  type: "http_request" | "website" | "ping_host" | "port_check" | "synthetic_test";
   target: string;
   config?: unknown; // Using unknown for config for now, can be refined with shared MonitorConfig type
   frequencyMinutes?: number;
@@ -173,26 +184,20 @@ async function assertK6QueueAvailable(location: string): Promise<void> {
   let activeQueueNames: Set<string>;
   try {
     activeQueueNames = await getActiveWorkerQueueNamesFromRegistry();
-  } catch {
-    // Redis heartbeat scan failed — allow the job to be enqueued anyway.
-    // BullMQ will hold it until a worker picks it up.
-    queueLogger.warn(
-      { location },
-      "[assertK6QueueAvailable] Heartbeat lookup failed — skipping active-worker check"
+  } catch (error) {
+    throw new ExecutionQueueError(
+      "queue_unavailable",
+      "Unable to verify active k6 workers",
+      error,
     );
-    return;
   }
 
   const queueName = location === "global" ? K6_GLOBAL_QUEUE : k6QueueName(location);
 
   if (!activeQueueNames.has(queueName)) {
-    // Log a warning but do NOT hard-fail. Worker heartbeat queue lists are
-    // refreshed on a 30s interval, so there is a brief window after a worker
-    // starts consuming a new queue before the heartbeat advertises it.
-    // Throwing here would reject valid K6 runs during that window.
-    queueLogger.warn(
-      { queueName, location, activeQueues: Array.from(activeQueueNames) },
-      "[assertK6QueueAvailable] No heartbeat found for queue — job will be enqueued but may wait for a worker"
+    throw new ExecutionQueueError(
+      "queue_unavailable",
+      `No active k6 worker available for location "${location}". Retry after a worker starts heartbeating.`,
     );
   }
 }
@@ -201,10 +206,8 @@ async function assertK6QueueAvailable(location: string): Promise<void> {
 export const RUNNING_CAPACITY_LIMIT_KEY = "supercheck:capacity:running";
 export const QUEUE_CAPACITY_LIMIT_KEY = "supercheck:capacity:queued";
 
-// Redis key TTL values (in seconds) - applies to both job and test execution
+// Terminal job retention; BullMQ owns Redis key lifetimes.
 export const REDIS_JOB_KEY_TTL = 7 * 24 * 60 * 60; // 7 days for job data (completed/failed jobs)
-export const REDIS_EVENT_KEY_TTL = 24 * 60 * 60; // 24 hours for events/stats
-export const REDIS_METRICS_TTL = 48 * 60 * 60; // 48 hours for metrics data
 export const REDIS_CLEANUP_BATCH_SIZE = 100; // Process keys in smaller batches to reduce memory pressure
 
 /** Redis pub/sub channel that wakes every app replica and regional worker. */
@@ -458,23 +461,10 @@ export async function getQueues(): Promise<{
           },
         };
 
-        // Queue settings with Redis TTL and auto-cleanup options
-        // CRITICAL: lockDuration and stallInterval must accommodate max execution times:
-        // - Tests: up to 5 minutes (300s)
-        // - Jobs: up to 1 hour (3600s)
-        // - lockDuration: 70 minutes (4200s) - max execution time + buffer for cleanup
-        // - stallInterval: 30 seconds - check frequently for stalled jobs
+        // Locks, stalled-job recovery, and metrics are configured on Workers.
         const queueSettings = {
           connection,
           defaultJobOptions,
-          // Settings to prevent orphaned Redis keys and handle long-running jobs
-          lockDuration: 70 * 60 * 1000, // 70 minutes - must be >= max execution time (60 min for jobs)
-          stallInterval: 30000, // Check for stalled jobs every 30 seconds
-          maxStalledCount: 2, // Move job back to waiting max 2 times before failing
-          metrics: {
-            maxDataPoints: 60, // Limit metrics storage to 60 data points (1 hour at 1 min interval)
-            collectDurations: true,
-          },
         };
 
         // Playwright - single GLOBAL queue for all tests and jobs
@@ -843,7 +833,7 @@ async function performQueueCleanup(connection: Redis): Promise<void> {
       name: `playwright-${region}`,
       queue,
     })),
-    ...Object.entries(queueState.k6Queues).map(([region, queue]) => ({
+    ...Object.entries(queueState.capacityK6Queues).map(([region, queue]) => ({
       name: k6QueueName(region),
       queue,
     })),
@@ -857,7 +847,7 @@ async function performQueueCleanup(connection: Redis): Promise<void> {
   for (const { name, queue } of queuesToClean) {
     if (queue) {
       // Cleaning up queue
-      await cleanupOrphanedKeys(connection, name); // Cleans up BullMQ internal keys
+      await cleanupOrphanedKeys(connection, name); // Repair legacy TTLs; BullMQ owns job retention
 
       // Clean completed and failed jobs older than REDIS_JOB_KEY_TTL from the queue itself
       await queue.clean(
@@ -880,7 +870,7 @@ async function performQueueCleanup(connection: Redis): Promise<void> {
 }
 
 /**
- * Cleans up orphaned keys for a specific queue in batches to reduce memory pressure
+ * Repairs legacy expiry on durable queue keys; BullMQ owns job retention.
  */
 async function cleanupOrphanedKeys(
   connection: Redis,
@@ -900,39 +890,36 @@ async function cleanupOrphanedKeys(
 
       cursor = nextCursor;
 
-      // Process this batch of keys
+      // Repair durable keys in bounded pipelines; BullMQ leases keep native TTLs.
+      const durable: string[] = [];
+      const candidates: string[] = [];
       for (const key of keys) {
-        // Skip keys that BullMQ manages properly (active jobs, waiting jobs, etc.)
-        if (
-          key.includes(":active") ||
-          key.includes(":wait") ||
-          key.includes(":delayed") ||
-          key.includes(":failed") ||
-          key.includes(":completed") ||
-          key.includes(":schedulers")
-        ) {
-          // Preserve job scheduler keys
-          continue;
+        const suffix = key.slice(`bull:${queueName}:`.length);
+        if (suffix === 'limiter' || suffix === 'stalled-check' ||
+            suffix.startsWith('de:') || suffix.endsWith(':lock')) continue;
+        if (/^(id|wait|active|paused|delayed|prioritized|waiting-children|completed|failed|stalled|repeat|meta|events|pc|marker)$/.test(suffix) ||
+            /:(logs|dependencies|processed|failed|unsuccessful)$/.test(suffix) ||
+            /^metrics:(completed|failed)(:data)?$/.test(suffix)) durable.push(key);
+        else candidates.push(key);
+      }
+      if (candidates.length) {
+        const types = connection.pipeline();
+        candidates.forEach((key) => types.type(key));
+        const results = await types.exec();
+        if (!results) throw new Error('Queue key inspection returned no results');
+        for (let i = 0; i < results.length; i++) {
+          const [error, type] = results[i];
+          if (error) throw error;
+          if (type === 'hash') durable.push(candidates[i]);
         }
-
-        // Check if the key has a TTL set
-        const ttl = await connection.ttl(key);
-        if (ttl === -1) {
-          // -1 means no TTL is set
-          // Set appropriate TTL based on key type
-          let expiryTime = REDIS_JOB_KEY_TTL;
-
-          if (key.includes(":events:")) {
-            expiryTime = REDIS_EVENT_KEY_TTL;
-          } else if (key.includes(":metrics")) {
-            expiryTime = REDIS_METRICS_TTL;
-          } else if (key.includes(":meta") || key.includes(":scheduler:")) {
-            continue; // Skip meta keys and scheduler keys as they should live as long as the app runs
-          }
-
-          await connection.expire(key, expiryTime);
-          // Set TTL for key
-        }
+      }
+      if (durable.length) {
+        const repair = connection.pipeline();
+        // Hashes may be live BullMQ data; unreachable hashes also persist and need a separate audit. Keep classification aligned with worker/src/execution/services/redis.service.ts.
+        durable.forEach((key) => repair.persist(key));
+        const results = await repair.exec();
+        if (!results) throw new Error('Queue key repair returned no results');
+        for (const [error] of results) { if (error) throw error; }
       }
     } while (cursor !== "0");
   } catch (error) {
@@ -990,7 +977,9 @@ export async function addTestToQueue(task: TestExecutionTask): Promise<{
   const jobId = task.runId ?? task.testId;
   const orgId = task.organizationId || "global";
   const queuedAt = Date.now();
-  const safeTask = omitExecutionSecrets(task);
+  const policy = await getExecutionPolicy(orgId);
+  await assertExecutionWorkload(orgId, policy, "playwright", [task.code]);
+  const safeTask = { ...omitExecutionSecrets(task), _executionTier: policy.tier };
 
   try {
     const { getCapacityManager } = await import("./capacity-manager");
@@ -1022,7 +1011,7 @@ export async function addTestToQueue(task: TestExecutionTask): Promise<{
             ...safeTask,
             _capacityStatus: "immediate",
           },
-          { jobId }
+          { jobId, priority: policy.priority }
         );
 
         return { runId: jobId, status: "running" };
@@ -1073,7 +1062,9 @@ export async function addJobToQueue(task: JobExecutionTask): Promise<{
   const runId = task.runId;
   const orgId = task.organizationId || "global";
   const queuedAt = Date.now();
-  const safeTask = omitExecutionSecrets(task);
+  const policy = await getExecutionPolicy(orgId);
+  await assertExecutionWorkload(orgId, policy, "playwright", task.testScripts.map(test => test.script));
+  const safeTask = { ...omitExecutionSecrets(task), _executionTier: policy.tier };
 
   try {
     const { getCapacityManager } = await import("./capacity-manager");
@@ -1102,7 +1093,7 @@ export async function addJobToQueue(task: JobExecutionTask): Promise<{
             ...safeTask,
             _capacityStatus: "immediate",
           },
-          { jobId: runId }
+          { jobId: runId, priority: policy.priority }
         );
 
         return { runId, status: "running" };
@@ -1156,7 +1147,9 @@ export async function addK6TestToQueue(
   const runId = task.runId;
   const orgId = task.organizationId || "global";
   const queuedAt = Date.now();
-  const safeTask = omitExecutionSecrets(task);
+  const policy = await getExecutionPolicy(orgId);
+  await assertExecutionWorkload(orgId, policy, "k6", task.tests?.length ? task.tests.map(test => test.script) : [task.script]);
+  const safeTask = { ...omitExecutionSecrets(task), _executionTier: policy.tier };
 
   // Resolve the queue location: use caller-provided location, or fall back to DB default.
   const k6TestLocation = task.location || await getFirstDefaultLocationCode();
@@ -1191,7 +1184,7 @@ export async function addK6TestToQueue(
             location: k6TestLocation,
             _capacityStatus: "immediate",
           },
-          { jobId: runId }
+          { jobId: runId, priority: policy.priority }
         );
 
         return { runId, status: "running" };
@@ -1252,7 +1245,9 @@ export async function addK6JobToQueue(
   const runId = task.runId;
   const orgId = task.organizationId || "global";
   const queuedAt = Date.now();
-  const safeTask = omitExecutionSecrets(task);
+  const policy = await getExecutionPolicy(orgId);
+  await assertExecutionWorkload(orgId, policy, "k6", task.tests?.length ? task.tests.map(test => test.script) : [task.script]);
+  const safeTask = { ...omitExecutionSecrets(task), _executionTier: policy.tier };
 
   // Respect the caller-provided location (already validated by resolveProjectK6Location);
   // fall back to the instance default only when no location was specified.
@@ -1288,7 +1283,7 @@ export async function addK6JobToQueue(
             location: k6JobLocation,
             _capacityStatus: "immediate",
           },
-          { jobId: runId }
+          { jobId: runId, priority: policy.priority }
         );
 
         return { runId, status: "running" };
@@ -1444,7 +1439,9 @@ async function restoreDisabledCapacityQueues(
     const [next, keys] = await connection.scan(cursor, "MATCH", "bull:k6-*:*", "COUNT", 100);
     cursor = next;
     for (const key of keys) {
-      const code = key.split(":")[1]?.slice(3);
+      const queueName = key.split(":")[1];
+      if (queueName === K6_JOB_SCHEDULER_QUEUE) continue;
+      const code = queueName?.slice(3);
       if (code && !queueState.capacityK6Queues[code]) codes.add(code);
     }
   } while (cursor !== "0");
@@ -1481,6 +1478,8 @@ async function reapDisabledCapacityQueues(): Promise<void> {
       if (Object.values(counts).some((count) => count > 0) || queueState.k6Queues[code]) continue;
       delete queueState.capacityK6Queues[code];
       delete queueState.retiredK6At[code];
+      const { invalidateBullBoard } = await import("./bull-board/state");
+      invalidateBullBoard();
       const events = queueState.executionQueueEvents.filter((event) => event.name === queue.name);
       queueState.executionQueueEvents = queueState.executionQueueEvents.filter((event) => event.name !== queue.name);
       await Promise.all([queue.close(), ...events.map((event) => event.close())]);
@@ -1753,7 +1752,9 @@ export async function addMonitorExecutionJobToQueue(
       (task.config as MonitorConfig | undefined) ?? undefined;
     const locationConfig =
       (monitorConfig?.locationConfig as LocationConfig | null) ?? null;
-    const effectiveLocations = await resolveMonitorLocations(locationConfig, task.projectId);
+    const effectiveLocations = await resolveMonitorLocations(locationConfig, task.projectId, {
+      monitorType: task.type,
+    });
 
     // Determine which locations have active queues — degrade gracefully
     // when a subset of workers is offline rather than aborting entirely.
@@ -1783,54 +1784,94 @@ export async function addMonitorExecutionJobToQueue(
       );
     }
 
-    const executionGroupId = `${task.monitorId}-${Date.now()}-${Buffer.from(
-      crypto.randomBytes(6)
-    ).toString("hex")}`;
-
-    await Promise.all(
-      enqueuedLocations.map(async (location) => {
-        const monitorQueue = monitorExecutionQueue[location];
-
-        if (!monitorQueue) {
-          queueLogger.warn(
-            { location, monitorId: task.monitorId },
-            `No monitor queue for location "${location}", skipping`
-          );
-          return;
-        }
-
-        return monitorQueue.add(
-          "executeMonitorJob",
-          {
-            ...task,
-            executionLocation: location,
-            executionGroupId,
-            expectedLocations: enqueuedLocations,
-          },
-          {
-            jobId: `${task.monitorId}:${executionGroupId}:${location}`,
-            priority: 1,
-            // Retry configuration for transient failures (network blips, container startup)
-            attempts: 3,
-            backoff: { type: "exponential", delay: 5000 },
-            // Cleanup completed/failed jobs to prevent Redis memory bloat
-            removeOnComplete: { age: 3600 }, // 1 hour
-            removeOnFail: { age: 86400 }, // 24 hours
-          }
-        );
-      })
-    );
-
-    return executionGroupId;
+    return await enqueueMonitorLocationJobs(monitorExecutionQueue, task, enqueuedLocations, {
+      // lifo keeps immediate runs ahead of queued scheduled checks while leaving the
+      // job in the `:wait` list that the KEDA triggers measure (priority would move
+      // it to `:prioritized`, which they cannot see).
+      lifo: true,
+      attempts: 3,
+      backoff: { type: "exponential", delay: 5000 },
+      removeOnComplete: { age: 3600 },
+      removeOnFail: { age: 86400 },
+    }, {
+      // Manual runs have no scheduler retry: a failed publication aborts its cycle immediately.
+      configuredLocations: effectiveLocations,
+      policy: monitorCyclePolicy(locationConfig),
+      abortOnFailure: true,
+    });
   } catch (error) {
     queueLogger.error(
       { err: error, monitorId: task.monitorId },
       `Error adding monitor execution job for monitor ${task.monitorId}`
     );
+    const { recordSchedulingFailure } = await import("./monitor-scheduling-failure");
+    await recordSchedulingFailure(task.monitorId, error instanceof Error ? error.message : String(error));
     throw new Error(
       `Failed to add monitor execution job: ${
         error instanceof Error ? error.message : String(error)
       }`
     );
+  }
+}
+
+/** Submit a cycle in one Redis transaction so workers see all regional jobs together. */
+export async function enqueueMonitorLocationJobs(
+  queues: Record<string, Queue>,
+  task: MonitorJobData,
+  locations: MonitoringLocation[],
+  opts: JobsOptions,
+  cycle?: MonitorCycleRequest,
+): Promise<string> {
+  if (locations.length === 0) throw new Error(`Monitor ${task.monitorId}: no jobs enqueued`);
+  // Flag off (default): byte-for-byte the previous behavior. Flag on: the cycle row is
+  // persisted first, its stable id is the group id, and it (not a Redis marker) owns abort state.
+  const closureCycle = cycle && missingCycleClosureEnabled() ? cycle : undefined;
+  const executionGroupId = closureCycle
+    ? monitorCycleId(task.monitorId, closureCycle.key ?? crypto.randomUUID())
+    : `${task.monitorId}-${crypto.randomUUID()}`;
+  const redis = await getRedisConnection();
+  const flow = new FlowProducer({ connection: redis });
+  flow.on("error", (error) => queueLogger.error({ err: error }, "Monitor flow Redis error"));
+  try {
+    if (closureCycle) {
+      // Persisted inside the guarded block so any later failure reaches the abort below.
+      await persistMonitorCycle({
+        id: executionGroupId,
+        monitorId: task.monitorId,
+        configuredLocations: closureCycle.configuredLocations,
+        policy: closureCycle.policy,
+        deadlineMs: missingCycleDeadlineMs(process.env, task.config as { timeoutSeconds?: number } | undefined),
+      });
+    }
+    const nodes = await flow.addBulk(locations.map((location) => {
+      const queue = queues[location];
+      if (!queue) throw new Error(`No monitor queue for location "${location}"`);
+      return {
+        name: "executeMonitorJob",
+        queueName: queue.name,
+        data: { ...task, executionLocation: location, executionGroupId, expectedLocations: locations, ...(closureCycle ? { monitorCycle: true } : {}) },
+        opts: { ...opts, jobId: `${executionGroupId}-${location}` },
+      };
+    }));
+    // BullMQ addBulk does not surface individual Redis script errors.
+    if (!nodes || nodes.length !== locations.length || (await Promise.all(nodes.map(({ job }) => job.getState()))).includes("unknown")) {
+      throw new Error(`Monitor ${task.monitorId}: incomplete cycle enqueue`);
+    }
+    return executionGroupId;
+  } catch (error) {
+    if (closureCycle) {
+      // A scheduler retry reuses this id, so no sticky Redis marker; abort only when no retry remains.
+      // A cycle that already closed is left as it is (the closure owns its outcome).
+      if (closureCycle.abortOnFailure && !(error instanceof MonitorCycleClosedError)) {
+        await abortMonitorCycle(executionGroupId)
+          .catch((abortError) => queueLogger.warn({ err: abortError, executionGroupId }, "Unable to abort failed monitor cycle"));
+      }
+    } else {
+      await redis.set(`monitor:aggr:aborted:${executionGroupId}`, '1', 'EX', 7 * 24 * 60 * 60)
+        .catch((markerError) => queueLogger.warn({ err: markerError, executionGroupId }, "Unable to mark failed monitor publication aborted"));
+    }
+    throw error;
+  } finally {
+    await flow.close().catch((error) => queueLogger.warn({ err: error }, "Monitor flow close failed"));
   }
 }

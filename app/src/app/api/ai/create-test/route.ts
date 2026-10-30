@@ -1,3 +1,4 @@
+import { getClientIP } from "@/lib/session-security";
 import { NextRequest, NextResponse } from "next/server";
 import { AIStreamingService } from "@/lib/ai/ai-streaming-service";
 import { AISecurityService, AuthService } from "@/lib/ai/ai-security";
@@ -73,10 +74,7 @@ export async function POST(request: NextRequest) {
 
     // Step 2: Rate limiting check (with user/org context)
     const headersList = await headers();
-    const clientIp =
-      headersList.get("x-forwarded-for")?.split(",")[0]?.trim() ||
-      headersList.get("x-real-ip") ||
-      "unknown";
+    const clientIp = getClientIP(headersList);
 
     // Security: Authentication is MANDATORY for AI Create
     // This prevents unauthenticated users from consuming AI resources
@@ -157,6 +155,8 @@ export async function POST(request: NextRequest) {
 
     // Step 4: Generate streaming AI response
     const aiResponse = await AIStreamingService.generateStreamingResponse({
+      signal: request.signal,
+      userId, orgId, tier,
       prompt,
       maxTokens: 4000,
       temperature: 0.2, // Slightly higher temperature for creative code generation

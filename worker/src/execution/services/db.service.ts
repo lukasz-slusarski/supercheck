@@ -1,3 +1,4 @@
+import { canPersistRunCallback } from './run-callback';
 import { Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PostgresJsDatabase } from 'drizzle-orm/postgres-js';
@@ -13,12 +14,23 @@ import {
   AlertType,
   AlertStatus,
 } from '../../db/schema'; // Specifically import reports table
-import { eq, and, sql, desc, inArray, type SQL } from 'drizzle-orm';
+import {
+  eq,
+  and,
+  or,
+  ne,
+  isNull,
+  sql,
+  desc,
+  inArray,
+  type SQL,
+} from 'drizzle-orm';
 import { ReportMetadata } from '../interfaces'; // Import our interface
 import { NotificationProvider } from '../../notification/notification.service';
 import { decryptNotificationProviderConfig } from '../../common/notification-provider-crypto';
 import { DB_PROVIDER_TOKEN } from '../../db/db.constants';
 import type { ExecutionUsageTransaction } from './execution-usage-receipts';
+import { RUN_CANCELLATION_MARKER } from '../../common/services/cancellation.service';
 
 // Re-export from canonical location for backward compatibility.
 // All new code should import directly from '../../db/db.constants'.
@@ -63,56 +75,29 @@ export class DbService implements OnModuleInit {
     );
 
     try {
-      const existing = await this.db
-        .select()
-        .from(reports)
-        .where(
-          and(
-            eq(reports.entityId, entityId),
-            eq(reports.entityType, entityType),
-          ),
-        )
-        .limit(1);
+      await this.db.transaction(async (tx) => {
+        if (!(await canPersistRunCallback(tx))) return;
 
-      if (existing.length > 0) {
-        this.logger.debug(
-          `Updating existing report metadata for ${entityType}/${entityId}`,
-        );
-        await this.db
-          .update(reports)
-          .set({
-            reportPath, // This is likely the S3 key now
-            status,
-            s3Url,
-            updatedAt: new Date(),
-          })
-          .where(
-            and(
-              eq(reports.entityId, entityId),
-              eq(reports.entityType, entityType),
-            ),
-          )
-          .execute();
-      } else {
-        this.logger.debug(
-          `Inserting new report metadata for ${entityType}/${entityId}`,
-        );
-        await this.db
-          .insert(reports)
-          .values({
-            entityId,
-            entityType,
-            reportPath, // S3 key
-            status,
-            s3Url,
-            createdAt: new Date(),
-            updatedAt: new Date(),
-          })
-          .execute();
-      }
-      this.logger.log(
-        `Successfully stored report metadata for ${entityType}/${entityId}`,
-      );
+        for (const id of new Set(
+          [entityId, metadata.aliasEntityId].filter((id): id is string => !!id),
+        )) {
+          await tx
+            .insert(reports)
+            .values({
+              entityId: id,
+              entityType,
+              reportPath,
+              status,
+              s3Url,
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            })
+            .onConflictDoUpdate({
+              target: [reports.entityType, reports.entityId],
+              set: { reportPath, status, s3Url, updatedAt: new Date() },
+            });
+        }
+      });
     } catch (error) {
       this.logger.error(
         `Error storing report metadata for ${entityType}/${entityId}: ${(error as Error).message}`,
@@ -207,7 +192,7 @@ export class DbService implements OnModuleInit {
         durationMs?: number;
         completedAt?: Date;
         startedAt?: Date;
-        errorDetails?: string;
+        errorDetails?: string | null | SQL;
         artifactPaths?: any;
       } = {
         status,
@@ -263,10 +248,19 @@ export class DbService implements OnModuleInit {
       // Add error details if provided
       if (errorDetails) {
         updateData.errorDetails = errorDetails;
+      } else if (status === 'passed' || status === 'failed') {
+        // Completion wins a late-cancel race: drop a stale cancellation marker from a finished run, and
+        // only that marker (any other recorded detail stays).
+        updateData.errorDetails = sql`CASE WHEN ${runs.errorDetails} = ${RUN_CANCELLATION_MARKER} THEN NULL ELSE ${runs.errorDetails} END`;
       }
 
       // Update the database
-      await database.update(runs).set(updateData).where(eq(runs.id, runId));
+      await database
+        .update(runs)
+        .set(updateData)
+        .where(
+          and(eq(runs.id, runId), inArray(runs.status, ['queued', 'running'])),
+        );
 
       this.logger.log(
         `Successfully updated run ${runId} with status ${status}`,
@@ -484,8 +478,19 @@ export class DbService implements OnModuleInit {
           createdAt: schema.runs.createdAt,
         })
         .from(schema.runs)
-        .where(eq(schema.runs.jobId, jobId))
-        .orderBy(desc(schema.runs.id)) // UUIDv7 is time-ordered (PostgreSQL 18+)
+        .where(
+          and(
+            eq(schema.runs.jobId, jobId),
+            inArray(sql<string>`${schema.runs.status}`, [
+              'passed',
+              'failed',
+              'error',
+              'blocked',
+              'skipped',
+            ]),
+          ),
+        )
+        .orderBy(desc(schema.runs.createdAt), desc(schema.runs.id))
         .limit(limit);
 
       return runs;
@@ -495,6 +500,90 @@ export class DbService implements OnModuleInit {
       );
       return [];
     }
+  }
+
+  async claimRunExecution(runId: string): Promise<boolean> {
+    const [claimed] = await this.db
+      .update(runs)
+      .set({
+        status: 'running',
+        startedAt: sql`coalesce(${runs.startedAt}, now())`,
+      })
+      .where(
+        and(
+          eq(runs.id, runId),
+          inArray(runs.status, ['queued', 'running']),
+          or(
+            isNull(runs.errorDetails),
+            ne(runs.errorDetails, RUN_CANCELLATION_MARKER),
+          ),
+        ),
+      )
+      .returning({ id: runs.id });
+    return !!claimed;
+  }
+
+  /**
+   * Finalize a run whose cancellation was requested before any execution started. The caller has
+   * already ruled out a live execution; the marker comparison keeps this from touching a run that
+   * finished normally.
+   */
+  async finalizeCancelledRun(runId: string): Promise<boolean> {
+    const [finalized] = await this.db
+      .update(runs)
+      .set({ status: 'error', completedAt: new Date() })
+      .where(
+        and(
+          eq(runs.id, runId),
+          inArray(runs.status, ['queued', 'running']),
+          eq(runs.errorDetails, RUN_CANCELLATION_MARKER),
+        ),
+      )
+      .returning({ id: runs.id, jobId: runs.jobId });
+    if (!finalized) return false;
+    if (finalized.jobId) {
+      const statuses = await this.getRunStatusesForJob(finalized.jobId);
+      await this.updateJobStatus(finalized.jobId, statuses);
+    }
+    return true;
+  }
+
+  /**
+   * Fail a run that never started, unless the user cancelled it. The marker guard sits in the same
+   * write, so a cancel landing between a separate check and the write cannot be overwritten.
+   */
+  async failRunUnlessCancelled(runId: string, reason: string): Promise<void> {
+    const [failed] = await this.db
+      .update(runs)
+      .set({
+        status: 'failed',
+        durationMs: 0,
+        completedAt: new Date(),
+        errorDetails: reason,
+      })
+      .where(
+        and(
+          eq(runs.id, runId),
+          inArray(runs.status, ['queued', 'running']),
+          or(
+            isNull(runs.errorDetails),
+            ne(runs.errorDetails, RUN_CANCELLATION_MARKER),
+          ),
+        ),
+      )
+      .returning({ id: runs.id });
+    if (!failed) await this.finalizeCancelledRun(runId);
+  }
+
+  /** A committed terminal result makes a redelivered queue task a replay. */
+  async getTerminalRun(runId: string) {
+    return this.db.query.runs.findFirst({
+      where: and(
+        eq(runs.id, runId),
+        inArray(runs.status, ['passed', 'failed', 'error', 'blocked']),
+      ),
+      columns: { id: true, status: true, errorDetails: true },
+    });
   }
 
   async getRunStatusesForJob(
@@ -516,15 +605,7 @@ export class DbService implements OnModuleInit {
         .from(runs)
         .where(eq(runs.jobId, jobId));
 
-      return result.map((r) => r.status).filter((s) => s !== null) as (
-        | 'pending'
-        | 'running'
-        | 'passed'
-        | 'failed'
-        | 'error'
-        | 'queued'
-        | 'blocked'
-      )[];
+      return result.map((r) => r.status).filter((s) => s !== null);
     } catch (error) {
       this.logger.error(`Failed to get run statuses for job ${jobId}:`, error);
       return [];

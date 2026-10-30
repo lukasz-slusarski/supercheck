@@ -1,3 +1,9 @@
+import { deleteMonitorWithContext } from "@/lib/resource-deletion/monitor";
+import { isInvalidUuidError, isUuid } from "@/lib/uuid";
+import { isDeepStrictEqual } from "node:util";
+import { executionConfig, updateMonitorHandler } from "@/lib/monitor-service";
+import { monitorResumeBlockedResponse, trialIntervalErrorResponse } from "@/lib/execution/trial-interval-response";
+import { monitorConfigForRead, monitorTargetForRead, monitorResultDetailsForRead } from "@/lib/monitor-read-config";
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/utils/db";
 import {
@@ -23,6 +29,12 @@ import {
 } from "@/lib/s3-cleanup";
 import { createLogger } from "@/lib/logger/index";
 import { validateMonitorConfiguration } from "@/lib/monitor-validation";
+import {
+  findLocationsOutsideProject,
+  findUnsupportedMonitorLocations,
+  unsupportedMonitorLocationsMessage,
+} from "@/lib/monitor-location-routing";
+import type { LocationConfig } from "@/db/schema";
 
 const logger = createLogger({ module: "monitor-detail-api" }) as {
   debug: (data: unknown, msg?: string) => void;
@@ -61,6 +73,7 @@ export async function GET(
     }
 
     // Find the monitor scoped to current organization and project (defense-in-depth)
+    if (!isUuid((await routeContext.params).id)) return NextResponse.json({ error: "Monitor not found" }, { status: 404 });
     const monitor = await db.query.monitors.findFirst({
       where: and(
         eq(monitors.id, id),
@@ -80,10 +93,13 @@ export async function GET(
       .orderBy(desc(monitorResults.checkedAt))
       .limit(RECENT_RESULTS_LIMIT);
 
+    const canUpdateMonitor = checkPermissionWithContext("monitor", "update", context);
     // Ensure alertConfig has proper defaults if it's null or undefined
     const responseMonitor = {
       ...monitor,
-      recentResults,
+      config: monitorConfigForRead(monitor.config, canUpdateMonitor),
+      target: monitorTargetForRead(monitor.target, canUpdateMonitor),
+      recentResults: recentResults.map((result) => ({ ...result, details: monitorResultDetailsForRead(result.details) })),
       alertConfig: monitor.alertConfig || {
         enabled: false,
         notificationProviders: [],
@@ -98,6 +114,9 @@ export async function GET(
 
     return NextResponse.json(responseMonitor);
   } catch (error) {
+    if (isInvalidUuidError(error)) {
+      return NextResponse.json({ error: "Monitor not found" }, { status: 404 });
+    }
     if (isAuthError(error)) {
       return NextResponse.json(
         {
@@ -132,6 +151,15 @@ export async function PUT(
     const authCtx = await requireAuthContext();
     const userId = authCtx.userId;
 
+    // Permission first: an unauthorised caller must not get validation detail or learn whether the monitor exists.
+    const canUpdate = checkPermissionWithContext("monitor", "update", authCtx);
+    if (!canUpdate) {
+      return NextResponse.json(
+        { error: "Insufficient permissions" },
+        { status: 403 },
+      );
+    }
+
     const rawData = await request.json();
     const validationResult = monitorsUpdateSchema.safeParse(rawData);
 
@@ -144,14 +172,7 @@ export async function PUT(
 
     const updateData = validationResult.data;
 
-    // Check permission via context
-    const canUpdate = checkPermissionWithContext("monitor", "update", authCtx);
-    if (!canUpdate) {
-      return NextResponse.json(
-        { error: "Insufficient permissions" },
-        { status: 403 },
-      );
-    }
+    if (!isUuid(id)) return NextResponse.json({ error: "Monitor not found" }, { status: 404 });
 
     // Find the monitor scoped to current organization and project (defense-in-depth)
     const currentMonitor = await db.query.monitors.findFirst({
@@ -166,6 +187,14 @@ export async function PUT(
       return NextResponse.json({ error: "Monitor not found" }, { status: 404 });
     }
 
+    if (rawData.frequencyMinutes !== undefined) {
+      const trialIntervalError = await trialIntervalErrorResponse(currentMonitor.organizationId, rawData.frequencyMinutes);
+      if (trialIntervalError) return trialIntervalError;
+    }
+
+    const resumeBlocked = await monitorResumeBlockedResponse(currentMonitor.organizationId, currentMonitor.status, rawData);
+    if (resumeBlocked) return resumeBlocked;
+
     const configurationValidation = validateMonitorConfiguration({
       type: updateData.type ?? currentMonitor.type,
       target: updateData.target ?? currentMonitor.target,
@@ -173,6 +202,37 @@ export async function PUT(
     });
     if (!configurationValidation.success) {
       return NextResponse.json(configurationValidation, { status: 400 });
+    }
+
+    if (updateData.config?.locationConfig) {
+      const outside = await findLocationsOutsideProject(
+        updateData.config.locationConfig as LocationConfig,
+        authCtx.project.id,
+      );
+      if (outside.length > 0) {
+        return NextResponse.json(
+          { error: `Invalid location codes: ${outside.join(", ")}` },
+          { status: 400 },
+        );
+      }
+    }
+
+    if (updateData.config || updateData.type) {
+      const effectiveType = updateData.type ?? currentMonitor.type;
+      const effectiveConfig = (updateData.config ?? currentMonitor.config) as
+        | { locationConfig?: LocationConfig | null }
+        | null
+        | undefined;
+      const unsupported = await findUnsupportedMonitorLocations(
+        effectiveConfig?.locationConfig,
+        effectiveType,
+      );
+      if (unsupported.length > 0) {
+        return NextResponse.json(
+          { error: unsupportedMonitorLocationsMessage(unsupported, effectiveType) },
+          { status: 400 },
+        );
+      }
     }
 
     // Validate frequency bounds (1 minute minimum, 1440 minutes = 24 hours maximum)
@@ -464,7 +524,7 @@ export async function PUT(
           );
       } else if (
         oldStatus === "paused" &&
-        (newStatus === "up" || newStatus === "down")
+        (newStatus === "up" || newStatus === "down" || newStatus === "pending")
       ) {
         // Resume monitor - add to scheduler if it has valid frequency
         if (newFrequency && newFrequency > 0) {
@@ -495,9 +555,11 @@ export async function PUT(
     }
 
     // Handle frequency changes for non-paused monitors OR config changes
-    const configChanged =
-      JSON.stringify(currentMonitor.config) !==
-      JSON.stringify(updatedMonitor.config);
+    // Same comparison PATCH uses: editing alert channels or regions must not restart the cadence.
+    const configChanged = !isDeepStrictEqual(
+      executionConfig(currentMonitor.config),
+      executionConfig(updatedMonitor.config),
+    );
     const targetChanged = currentMonitor.target !== updatedMonitor.target;
     const typeChanged = currentMonitor.type !== updatedMonitor.type;
 
@@ -698,9 +760,7 @@ export async function PATCH(
     const authCtx = await requireAuthContext();
     const userId = authCtx.userId;
 
-    const rawData = await request.json();
-
-    // Check permission via context
+    // Permission first: an unauthorised caller must not get validation detail or learn whether the monitor exists.
     const canUpdate = checkPermissionWithContext("monitor", "update", authCtx);
     if (!canUpdate) {
       return NextResponse.json(
@@ -708,6 +768,10 @@ export async function PATCH(
         { status: 403 },
       );
     }
+
+    const rawData = await request.json();
+
+    if (!isUuid(id)) return NextResponse.json({ error: "Monitor not found" }, { status: 404 });
 
     // Find the monitor scoped to current organization and project (defense-in-depth)
     const currentMonitor = await db.query.monitors.findFirst({
@@ -722,28 +786,76 @@ export async function PATCH(
       return NextResponse.json({ error: "Monitor not found" }, { status: 404 });
     }
 
-    const updatePayload: Partial<{
-      config: typeof currentMonitor.config;
-      alertConfig: typeof currentMonitor.alertConfig;
-      status: typeof currentMonitor.status;
-      updatedAt: Date;
-    }> = {
-      updatedAt: new Date(),
-    };
-
-    // Handle partial update for 'config'
-    if (rawData.config) {
-      const newConfig = deepMerge(currentMonitor.config ?? {}, rawData.config);
-      updatePayload.config = newConfig;
+    if (rawData.frequencyMinutes !== undefined) {
+      const trialIntervalError = await trialIntervalErrorResponse(currentMonitor.organizationId, rawData.frequencyMinutes);
+      if (trialIntervalError) return trialIntervalError;
     }
 
+    const resumeBlocked = await monitorResumeBlockedResponse(currentMonitor.organizationId, currentMonitor.status, rawData);
+    if (resumeBlocked) return resumeBlocked;
+
+    const updatePayload: Parameters<typeof updateMonitorHandler>[1] = {};
+    for (const key of ["name", "description", "type", "target", "frequencyMinutes", "enabled"] as const) {
+      if (rawData[key] !== undefined) Object.assign(updatePayload, { [key]: rawData[key] });
+    }
+    if (rawData.enabled !== undefined && typeof rawData.enabled !== "boolean") {
+      return NextResponse.json({ error: "enabled must be boolean" }, { status: 400 });
+    }
+    if (rawData.frequencyMinutes !== undefined &&
+      (typeof rawData.frequencyMinutes !== "number" || !Number.isFinite(rawData.frequencyMinutes) ||
+       rawData.frequencyMinutes < 1 || rawData.frequencyMinutes > 1440)) {
+      return NextResponse.json({ error: "frequencyMinutes must be between 1 and 1440" }, { status: 400 });
+    }
+    if (rawData.status !== undefined) {
+      if (!["paused", "up", "down", "pending"].includes(rawData.status)) {
+        return NextResponse.json({ error: "Invalid monitor status" }, { status: 400 });
+      }
+      if (rawData.enabled !== undefined && rawData.enabled !== (rawData.status !== "paused")) {
+        return NextResponse.json({ error: "status and enabled disagree" }, { status: 400 });
+      }
+      updatePayload.enabled = rawData.status !== "paused";
+      updatePayload.status = rawData.status;
+    }
+    if (rawData.config) updatePayload.config = deepMerge(currentMonitor.config ?? {}, rawData.config);
+
     const configurationValidation = validateMonitorConfiguration({
-      type: currentMonitor.type,
-      target: currentMonitor.target,
+      type: updatePayload.type ?? currentMonitor.type,
+      target: updatePayload.target ?? currentMonitor.target,
       config: updatePayload.config ?? currentMonitor.config,
     });
     if (!configurationValidation.success) {
       return NextResponse.json(configurationValidation, { status: 400 });
+    }
+
+    if (rawData.config?.locationConfig) {
+      const outside = await findLocationsOutsideProject(
+        (updatePayload.config as { locationConfig?: LocationConfig } | undefined)
+          ?.locationConfig,
+        authCtx.project.id,
+      );
+      if (outside.length > 0) {
+        return NextResponse.json(
+          { error: `Invalid location codes: ${outside.join(", ")}` },
+          { status: 400 },
+        );
+      }
+    }
+
+    if (rawData.config || rawData.type) {
+      const effectiveConfig = (updatePayload.config ?? currentMonitor.config) as
+        | { locationConfig?: LocationConfig | null }
+        | null
+        | undefined;
+      const unsupported = await findUnsupportedMonitorLocations(
+        effectiveConfig?.locationConfig,
+        updatePayload.type ?? currentMonitor.type,
+      );
+      if (unsupported.length > 0) {
+        return NextResponse.json(
+          { error: unsupportedMonitorLocationsMessage(unsupported, currentMonitor.type) },
+          { status: 400 },
+        );
+      }
     }
 
     // Handle partial update for 'alertConfig'
@@ -755,117 +867,7 @@ export async function PATCH(
       updatePayload.alertConfig = newAlertConfig;
     }
 
-    if (rawData.status) {
-      updatePayload.status = rawData.status;
-    }
-
-    const [updatedMonitor] = await db
-      .update(monitors)
-      .set(updatePayload)
-      .where(
-        and(
-          eq(monitors.id, id),
-          eq(monitors.projectId, authCtx.project.id),
-          eq(monitors.organizationId, authCtx.organizationId),
-        ),
-      )
-      .returning();
-
-    if (!updatedMonitor) {
-      return NextResponse.json(
-        { error: "Failed to update monitor" },
-        { status: 404 },
-      );
-    }
-
-    // Handle pause/resume logic when status changes
-    if (rawData.status && rawData.status !== currentMonitor.status) {
-      logger.debug(
-        {
-          monitorId: id,
-          oldStatus: currentMonitor.status,
-          newStatus: rawData.status,
-        },
-        "Monitor status changed (PATCH)",
-      );
-
-      if (rawData.status === "paused") {
-        // Pause monitor - remove from scheduler and clear scheduledJobId
-        logger.debug(
-          { monitorId: id },
-          "Pausing monitor (PATCH) - removing from scheduler",
-        );
-
-        // Try both the stored scheduledJobId and the monitor ID
-        let deleteSuccess = false;
-        if (currentMonitor.scheduledJobId) {
-          deleteSuccess = await deleteScheduledMonitor(
-            currentMonitor.scheduledJobId,
-          );
-        }
-
-        if (!deleteSuccess) {
-          deleteSuccess = await deleteScheduledMonitor(id);
-        }
-
-        // Clear the scheduled job ID from database
-        await db
-          .update(monitors)
-          .set({ scheduledJobId: null })
-          .where(
-            and(
-              eq(monitors.id, id),
-              eq(monitors.projectId, authCtx.project.id),
-              eq(monitors.organizationId, authCtx.organizationId),
-            ),
-          );
-      } else if (
-        currentMonitor.status === "paused" &&
-        (rawData.status === "up" || rawData.status === "down")
-      ) {
-        // Resume monitor - add to scheduler if it has valid frequency
-        if (
-          updatedMonitor.frequencyMinutes &&
-          updatedMonitor.frequencyMinutes > 0
-        ) {
-          logger.debug(
-            {
-              monitorId: id,
-              frequencyMinutes: updatedMonitor.frequencyMinutes,
-            },
-            "Resuming monitor (PATCH) - adding to scheduler",
-          );
-
-          const jobData: MonitorJobData = {
-            monitorId: updatedMonitor.id,
-            projectId: authCtx.project.id,
-            type: updatedMonitor.type as MonitorJobData["type"],
-            target: updatedMonitor.target,
-            config: updatedMonitor.config as Record<string, unknown>,
-            frequencyMinutes: updatedMonitor.frequencyMinutes,
-          };
-
-          const schedulerId = await scheduleMonitor({
-            monitorId: id,
-            frequencyMinutes: updatedMonitor.frequencyMinutes,
-            jobData,
-            retryLimit: 3,
-          });
-
-          // Update monitor with new scheduler ID
-          await db
-            .update(monitors)
-            .set({ scheduledJobId: schedulerId })
-            .where(
-              and(
-                eq(monitors.id, id),
-                eq(monitors.projectId, authCtx.project.id),
-                eq(monitors.organizationId, authCtx.organizationId),
-              ),
-            );
-        }
-      }
-    }
+    const updatedMonitor = await updateMonitorHandler(id, updatePayload);
 
     // Log the audit event for monitor partial update
     await logAuditEvent({
@@ -916,131 +918,24 @@ export async function PATCH(
  * Mirrors the logic from the deleteMonitor server action.
  */
 export async function DELETE(
-  _request: NextRequest,
+  _request: Request,
   routeContext: { params: Promise<{ id: string }> },
 ) {
   try {
     const { id } = await routeContext.params;
     const context = await requireAuthContext();
-    const { userId, project, organizationId } = context;
-
-    const canDelete = checkPermissionWithContext("monitor", "delete", context);
-    if (!canDelete) {
-      return NextResponse.json(
-        { error: "Insufficient permissions to delete monitors" },
-        { status: 403 },
-      );
+    if (!checkPermissionWithContext("monitor", "delete", context)) {
+      return NextResponse.json({ error: "Insufficient permissions" }, { status: 403 });
     }
-
-    // Transaction: verify ownership, collect S3 report URLs, delete DB records
-    const transactionResult = await db.transaction(async (tx) => {
-      const [existingMonitor] = await tx
-        .select({
-          id: monitors.id,
-          name: monitors.name,
-          type: monitors.type,
-          target: monitors.target,
-        })
-        .from(monitors)
-        .where(
-          and(
-            eq(monitors.id, id),
-            eq(monitors.projectId, project.id),
-            eq(monitors.organizationId, organizationId),
-          ),
-        )
-        .limit(1);
-
-      if (!existingMonitor) {
-        return { success: false as const, error: "Monitor not found" };
-      }
-
-      // Collect S3 report URLs for cleanup
-      const resultsWithReports = await tx
-        .select({ testReportS3Url: monitorResults.testReportS3Url })
-        .from(monitorResults)
-        .where(eq(monitorResults.monitorId, id));
-
-      const reportInputs: ReportDeletionInput[] = resultsWithReports
-        .filter((r) => !!r.testReportS3Url)
-        .map((r) => ({
-          s3Url: r.testReportS3Url || undefined,
-          entityId: id,
-          entityType: "monitor" as const,
-        }));
-
-      // Delete monitor results and the monitor itself
-      await tx.delete(monitorResults).where(eq(monitorResults.monitorId, id));
-      await tx.delete(monitors).where(eq(monitors.id, id));
-
-      return {
-        success: true as const,
-        monitor: existingMonitor,
-        reportInputs,
-      };
-    });
-
-    if (!transactionResult.success) {
-      return NextResponse.json(
-        { error: transactionResult.error },
-        { status: 404 },
-      );
-    }
-
-    // Post-transaction cleanup (non-blocking)
-
-    // Unschedule from Redis
-    try {
-      await deleteScheduledMonitor(id);
-    } catch (err) {
-      logger.warn({ err, monitorId: id }, "Failed to unschedule monitor");
-    }
-
-    // S3 cleanup (fire-and-forget)
-    if (transactionResult.reportInputs.length > 0) {
-      void (async () => {
-        try {
-          const s3 = createS3CleanupService();
-          await s3.deleteReports(transactionResult.reportInputs);
-        } catch (err) {
-          logger.warn({ err, monitorId: id }, "S3 cleanup failed for monitor");
-        }
-      })();
-    }
-
-    await logAuditEvent({
-      userId,
-      organizationId,
-      action: "monitor_deleted",
-      resource: "monitor",
-      resourceId: id,
-      metadata: {
-        monitorName: transactionResult.monitor.name,
-        monitorType: transactionResult.monitor.type,
-        monitorTarget: transactionResult.monitor.target,
-        projectId: project.id,
-      },
-      success: true,
-    });
-
-    return NextResponse.json({
-      success: true,
-      message: "Monitor deleted successfully",
-    });
+    if (!isUuid(id)) return NextResponse.json({ error: "Monitor not found" }, { status: 404 });
+    const result = await deleteMonitorWithContext(id, context);
+    const status = result.success ? 200 : result.error?.includes("not found") ? 404 : result.error?.includes("active") ? 409 : 500;
+    return NextResponse.json(result, { status });
   } catch (error) {
     if (isAuthError(error)) {
-      return NextResponse.json(
-        {
-          error:
-            error instanceof Error ? error.message : "Authentication required",
-        },
-        { status: 401 },
-      );
+      return NextResponse.json({ error: "Authentication required" }, { status: 401 });
     }
-    logger.error({ err: error }, "Error deleting monitor");
-    return NextResponse.json(
-      { error: "Internal server error" },
-      { status: 500 },
-    );
+    console.error("Error deleting monitor:", error);
+    return NextResponse.json({ success: false, error: "Failed to delete monitor" }, { status: 500 });
   }
 }

@@ -14,6 +14,8 @@ export interface LocationData {
   coordinates: { lat: number; lon: number } | null;
   isEnabled: boolean;
   isDefault: boolean;
+  supportsBrowser: boolean;
+  supportsK6: boolean;
   sortOrder: number;
   createdAt: string;
   updatedAt: string;
@@ -75,6 +77,27 @@ export async function fetchAvailableLocations(
     throw new Error(data.error || "Failed to fetch available locations");
   }
   return data.data;
+}
+
+export type LocationDisplayData = Pick<LocationData,
+  "code" | "name" | "region" | "flag" | "coordinates" | "isEnabled"
+>;
+
+/** Display metadata only; execution pickers must continue using enabled locations. */
+export function useLocationMetadata() {
+  const query = useQuery<LocationDisplayData[]>({
+    queryKey: [...LOCATIONS_QUERY_KEY, "metadata"],
+    queryFn: async () => {
+      const response = await fetch("/api/locations/metadata");
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      if (!data.success) throw new Error(data.error || "Failed to fetch location metadata");
+      return data.data;
+    },
+    staleTime: 5 * 60 * 1000,
+    refetchOnMount: "always",
+  });
+  return { locations: query.data ?? [], isLoading: query.isPending && query.isFetching, error: query.error };
 }
 
 // ── Hooks ──────────────────────────────────────────────────────
@@ -165,7 +188,10 @@ export function useCreateLocation() {
       region?: string;
       flag?: string;
       coordinates?: { lat: number; lon: number };
+      isEnabled?: boolean;
       isDefault?: boolean;
+      supportsBrowser?: boolean;
+      supportsK6?: boolean;
       sortOrder?: number;
     }) => {
       const response = await fetch("/api/admin/locations", {
@@ -198,6 +224,8 @@ export function useUpdateLocation() {
       coordinates?: { lat: number; lon: number } | null;
       isEnabled?: boolean;
       isDefault?: boolean;
+      supportsBrowser?: boolean;
+      supportsK6?: boolean;
       sortOrder?: number;
     }) => {
       const response = await fetch(`/api/admin/locations/${id}`, {

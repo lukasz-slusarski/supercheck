@@ -12,6 +12,9 @@ export async function register() {
   if (process.env.NEXT_RUNTIME === 'nodejs') {
     console.log('[Instrumentation] Starting - Loading background services...');
 
+    const { initializeMcpOAuthCleanup } = await import('@/lib/mcp/cleanup');
+    initializeMcpOAuthCleanup();
+
     // Validate Polar configuration early in cloud mode
     try {
       console.log('[Instrumentation] Validating Polar configuration...');
@@ -87,6 +90,13 @@ export async function register() {
       }
     } catch (error) {
       console.error('[Instrumentation] ❌ Failed to initialize monitor schedulers:', error);
+    }
+
+    try {
+      const { initializeStatusPageScheduler } = await import('@/lib/status-page-scheduler');
+      await initializeStatusPageScheduler();
+    } catch (error) {
+      console.error('[Instrumentation] Failed to initialize status page scheduler:', error);
     }
 
     // Initialize email template processor

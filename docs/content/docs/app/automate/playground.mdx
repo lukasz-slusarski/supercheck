@@ -22,7 +22,7 @@ Use the editor to write and check your script:
 
 Use the Playground to check a script before adding it to an automated job or monitor.
 
-1. Click **Run** and select an execution location if prompted.
+1. Click **Run**.
 2. Watch the run status and live logs in the results panel.
 3. Open the report when the run finishes. Review errors and available screenshots or traces.
 4. Update the script and run it again until it checks the expected behavior.
@@ -110,6 +110,14 @@ Check the target URL, selectors, credentials, waits, and assertions. Run the scr
 
 After a failed run, use AI Fix to review suggested changes. Apply only changes you understand, then run the test again.
 
+<Accordions>
+<Accordion title="Access checks and AI credits" id="ai-fix-access">
+
+Keep the run's organization selected and make sure you can view its project. AI Fix checks access to the report before using an AI credit. Cloud AI Create and Fix also share an hourly organization token guard; if it is reached, wait before retrying. Closing or cancelling a generated response stops the active provider request.
+
+</Accordion>
+</Accordions>
+
 ![AI Fix Button](/screenshots/ai-fix-button.png)
 
 ### Use AI Fix
@@ -133,7 +141,8 @@ AI Fix is effective for code-level issues that can be resolved by modifying your
 | **Assertion Failures** | Expected value mismatch | Corrects assertion or expected value |
 | **Navigation Errors** | Page not loading, wrong URL | Fixes URL or adds navigation waits |
 
-### When AI Fix Shows Guidance Instead
+<Accordions>
+<Accordion title="When AI Fix shows guidance instead" id="ai-fix-guidance">
 
 Some failures require manual investigation rather than code changes. In these cases, AI Fix displays a guidance modal with troubleshooting steps:
 
@@ -141,6 +150,9 @@ Some failures require manual investigation rather than code changes. In these ca
 - **Authentication Failures** — Invalid credentials, expired tokens, 401/403 errors
 - **Infrastructure Problems** — Database down, service unavailable
 - **Permission Errors** — Access denied, insufficient privileges
+
+</Accordion>
+</Accordions>
 
 <Callout type="info">
 Review the suggested diff before applying it, then run the test again to verify the change.
@@ -161,15 +173,20 @@ Start with pre-built templates for common testing scenarios. Templates provide w
 |----------|-----------|
 | **Browser Fundamentals** | UI Smoke (navigation), Browser selection with tags, Comprehensive Browser Test |
 | **Auth Flows** | Auth flow (login + logout) |
-| **Responsive & Devices** | Mobile/responsive layout, Device emulation (geo, locale, timezone) |
+| **Responsive & Devices** | Mobile / responsive layout, Device emulation (geo, locale, timezone) |
+| **Data-Driven** | Data-Driven Test (File Variable) |
+| **Diagnostics** | Failure Diagnostics |
+| **Authentication** | Passkey Registration and Sign-In |
+| **AI Applications** | WebMCP Tools (Experimental, Chromium) |
+| **Reliability** | Shared Resource Lock |
 
 </Tab>
 <Tab value="API">
 
 | Category | Templates |
 |----------|-----------|
-| **API Health** | Health/JSON contract |
-| **API CRUD** | Create + read + cleanup |
+| **API Health** | Health / JSON contract |
+| **API CRUD** | Simulated API CRUD |
 | **Authentication** | Authenticated request |
 | **API Coverage** | Comprehensive API Test |
 
@@ -178,15 +195,15 @@ Start with pre-built templates for common testing scenarios. Templates provide w
 
 | Category | Templates |
 |----------|-----------|
-| **Database Checks** | SELECT health check, Safe UPDATE with RETURNING, Database Discovery & Query |
-| **Transactions** | Insert with rollback |
+| **Database Checks** | SELECT health check, Query plan analysis, Database Discovery & Query |
+| **Transactions** | Read-only transaction |
 
 </Tab>
 <Tab value="Custom">
 
 | Category | Templates |
 |----------|-----------|
-| **Cross-layer** | Custom test fixtures, Form with API stubbing, Device emulation showcase, API + UI end-to-end, GitHub API + Browser Integration |
+| **Cross-layer** | Custom test fixtures, Form with API stubbing, Device emulation showcase, API response + UI input, GitHub API + Browser Integration |
 
 </Tab>
 <Tab value="Performance">
@@ -196,7 +213,9 @@ Start with pre-built templates for common testing scenarios. Templates provide w
 | **Smoke & Health** | Smoke Check (API), Basic Performance Test |
 | **Load Profiles** | Ramping Load, Advanced Thresholds |
 | **Resilience** | Spike + Recovery, Stress Test, Breakpoint Test |
-| **Reliability** | Soak/Endurance |
+| **Reliability** | Soak / Endurance |
+| **Protocols** | WebSocket + API Load Test, gRPC + API Load Test |
+| **Data-Driven** | Data-Driven Performance Test (File Variable) |
 | **API Coverage** | API Checklist (GET + POST + auth), Checks & Assertions |
 
 </Tab>

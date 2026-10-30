@@ -1,10 +1,10 @@
 ---
 title: Monitors
-description: 24/7 uptime monitoring from multiple regions
+description: 24/7 uptime monitoring for your services
 icon: Globe
 ---
 
-Monitors continuously check your services and alert you when issues occur. Run checks from multiple geographic regions to detect localized outages and ensure global availability.
+Monitors continuously check your services and alert you when issues occur. Track availability and response times, then investigate failed checks.
 
 ![Monitors List](/screenshots/monitors-list.png)
 
@@ -19,7 +19,7 @@ Monitors continuously check your services and alert you when issues occur. Run c
 %%{init: {"flowchart":{"nodeSpacing":20,"rankSpacing":24,"padding":12,"wrappingWidth":140}}}%%
 flowchart LR
     Create[Create a monitor] --> Target[Set endpoint or select a saved test]
-    Target --> Schedule[Choose interval and available regions]
+    Target --> Schedule[Choose check interval]
     Schedule --> Alerts[Select channel and alert thresholds]
     Alerts --> Save[Save and review the first result]
     Save --> Review[Compare results and investigate failures]
@@ -162,6 +162,14 @@ Run full Playwright browser tests on a schedule to validate complete user flows.
 4. Set the check interval (minimum 5 minutes)
 5. Monitor runs your test and reports pass/fail status
 
+<Accordions>
+<Accordion title="Multi-location synthetic checks" id="multi-location-synthetic">
+
+When a legacy single queue job runs a synthetic monitor from several locations, it checks those locations one at a time. This lets each browser execution use an organization's single available execution slot. Lightweight HTTP, website, ping, and port checks can still run in parallel; distributed per-location jobs keep their existing behavior.
+
+</Accordion>
+</Accordions>
+
 ![Create Synthetic Monitor](/screenshots/create-synthetic-monitor.png)
 
 <Callout type="info">
@@ -170,95 +178,35 @@ Set synthetic monitor intervals longer than your test execution time to prevent 
 
 📚 [Playwright Documentation](https://playwright.dev/docs/intro) — Learn more about writing browser tests
 
-## Multi-Location Monitoring
-
-Run checks from multiple geographic locations to detect regional outages and measure latency from different parts of the world.
-
-<Callout type="info">
-**Dynamic Locations**: Available locations are managed by your administrator through the Super Admin panel. Add new locations to enable multi-region monitoring from any geographic area.
-</Callout>
-
-### Default Locations
-
-| Region | Location | Notes |
-|--------|----------|-------|
-| **Local** | Your server location | Default for self-hosted deployments |
-
-Cloud deployments may include additional regions such as US East (Ashburn), EU Central (Nuremberg), and Asia Pacific (Singapore). Use the monitor's location picker to see which regions your project can use.
-
-### Choose Monitoring Locations
-
-Select the regions you want to monitor, then use the location filter on the monitor detail page to compare results.
-
-![Multi-Location Selector](/screenshots/create-monitor-multilocation-selector.png)
-
-<Callout type="info">
-**Single Location**: When only one location is available, the multi-location configuration UI is automatically hidden. Location settings appear dynamically when additional locations are added via the Super Admin panel. If some configured locations are temporarily offline, Supercheck runs the check from the live subset and aggregates only the locations that actually executed.
-</Callout>
-
-The overall status reflects the majority of locations that completed the check. Review per-location results to find a regional outage even when the overall status is **Up**.
-
-<Callout type="info">
-**Self-Hosted Deployments**: By default, self-hosted instances have a single `local` location. All checks execute from your worker. For true geographic distribution, deploy additional workers in different regions and add the corresponding locations via the Super Admin panel.
-</Callout>
-
 ## Alert Configuration
 
 Configure when and how you receive notifications about monitor status changes.
 
 ![Alert Settings](/screenshots/create-monitor-alerts-setting.png)
 
-### Alert Settings
-
-| Setting | Description | Recommended |
+| Setting | What it does | Recommended |
 |---------|-------------|-------------|
-| **Enable Alerts** | Turn notifications on/off for this monitor | On for production services |
-| **Alert on Failure** | Notify when monitor exceeds failure threshold | Always enable |
-| **Alert on Recovery** | Notify when monitor returns to healthy state | Enable for critical services |
-| **Failure Threshold** | Consecutive failures before alerting (1-5) | 2-3 to avoid false positives |
-| **Recovery Threshold** | Consecutive successes before recovery alert (1-5) | 2 to confirm stability |
-| **Notification Channels** | Which providers receive alerts | Multiple channels for critical services |
+| **Enable Alerts** | Turns notifications on or off for this monitor | On for production |
+| **Alert on Failure** | Alerts once the failure threshold is reached, then up to 3 times per outage at the reminder interval | On |
+| **Alert on Recovery** | One alert per outage once the recovery threshold is reached | On for critical services |
+| **Failure Threshold** | Consecutive failures before the first alert (1–5) | 2–3 |
+| **Recovery Threshold** | Consecutive healthy checks before the recovery alert (1–5) | 2 |
+| **SSL Expiration Alerts** | Website monitors only. Warns when a certificate is within **SSL Expiration Warning Days**, at most once per 24 hours | On |
+| **Notification Channels** | Where alerts are sent | More than one for critical services |
 
-### Threshold Logic
+<Accordions>
+<Accordion title="Example: failure threshold 3, recovery threshold 2" id="threshold-example">
 
-Thresholds prevent alert fatigue from transient issues:
+| Check | Result | Alert |
+|-------|--------|-------|
+| 1–2 | ❌ Fail | — |
+| 3 | ❌ Fail | **Failure alert** |
+| 4 | ❌ Fail | — |
+| 5 | ✅ Pass | — |
+| 6 | ✅ Pass | **Recovery alert** |
 
-<Tabs items={['Threshold Settings', 'Example']}>
-<Tab value="Threshold Settings">
-
-**Failure Threshold**
-
-The number of consecutive failures required before sending the first failure alert. This prevents alerts from single network blips.
-
-**Recovery Threshold**
-
-The number of consecutive successes required before sending a recovery alert. This ensures the service is truly stable before confirming recovery.
-
-**Alert Limiting**
-
-- Maximum **3 alerts** per failure or recovery sequence
-- Counter resets when status changes
-
-</Tab>
-<Tab value="Example">
-
-**Configuration:** Failure Threshold = 3, Recovery Threshold = 2
-
-| Check | Result | Consecutive Count | Alert Sent |
-|-------|--------|-------------------|------------|
-| 1 | ❌ Fail | 1 failure | — |
-| 2 | ❌ Fail | 2 failures | — |
-| 3 | ❌ Fail | 3 failures ✓ | **Failure Alert** |
-| 4 | ❌ Fail | 4 failures | — |
-| 5 | ✅ Pass | 1 success | — |
-| 6 | ✅ Pass | 2 successes ✓ | **Recovery Alert** |
-
-</Tab>
-</Tabs>
-
-<Callout type="info">
-A threshold of 2-3 works well for most services. Use 1 only for extremely critical services where any failure requires immediate attention.
-</Callout>
+</Accordion>
+</Accordions>
 
 ## Monitor Details Page
 
@@ -268,11 +216,11 @@ The monitor details page provides comprehensive visibility into your monitor's h
 
 ### Header Section
 
-The header displays essential monitor information at a glance:
-
-- **Monitor Name** — The name you assigned to the monitor
-- **Test ID** — For synthetic monitors, shows the linked Playwright test ID (click to copy)
-- **Action Buttons** — Quick access to Pause, Edit, Delete, and **AI Analyze** operations
+| Element | Details |
+|---------|---------|
+| **Monitor Name** | The name you assigned to the monitor |
+| **Test ID** | For synthetic monitors, the linked Playwright test ID (click to copy) |
+| **Action Buttons** | Quick access to Pause, Edit, Delete, and **AI Analyze** |
 
 ### AI Analyze
 
@@ -284,9 +232,7 @@ Click **AI Analyze** in the header to generate an AI-powered analysis report for
 - **Issue Diagnosis** — Suggested causes with available error messages and timestamps
 - **Recommendations** — Actionable next steps based on observed issues (only when problems exist)
 
-<Callout type="info">
-For self-hosted deployments, an administrator must [configure an AI provider](/docs/app/deployment/self-hosted#optional-configuration) to enable AI Analyze.
-</Callout>
+Self-hosted: an administrator must [configure an AI provider](/docs/app/deployment/self-hosted#optional-configuration) first.
 
 ### Key Metrics Bar
 
@@ -308,26 +254,20 @@ Nine key metrics are displayed prominently below the header:
 **P95 Response Time** represents the response time that 95% of your checks complete within. This metric helps identify tail latency issues that averages might hide.
 </Callout>
 
-### Availability Overview
+<Accordions>
+<Accordion title="How statistics are computed" id="statistics-rollups">
 
-A visual bar chart showing the status of the last 100 individual checks:
+All-locations history uses one combined rollup for each hour or day. For older periods that only have per-location rollups, those location rows are summed instead. Combined and location rows for the same period are never counted together. Each statistics window falls back to retained raw checks only when that window has no rollups; deleted raw history cannot be reconstructed.
 
-- **Green bars** — Successful checks (monitor was up)
-- **Red bars** — Failed checks (monitor was down)
-- **Location Filter** — Filter by specific region or view all locations combined
+</Accordion>
+</Accordions>
 
-This visualization helps you quickly identify patterns like intermittent failures or sustained outages.
+### Availability and Response Time
 
-### Response Time Chart
-
-An interactive line chart displaying response times over time:
-
-- **100 Data Points** — Shows the most recent 100 check results
-- **Multi-Location Data** — Region is shown in the hover details
-- **Hover Details** — View exact response time and timestamp on hover
-- **Visual Patterns** — Identify latency spikes, trends, and anomalies
-
-The chart helps you spot performance degradation before it impacts users.
+| Chart | What it shows |
+|-------|---------------|
+| **Availability Overview** | Bar chart of the last 100 individual checks: green bars are successful checks (monitor was up), red bars are failed checks (monitor was down). Helps you spot intermittent failures or sustained outages |
+| **Response Time Chart** | Interactive line chart of the most recent 100 check results. Hover for the exact response time and timestamp; use it to identify latency spikes, trends, and anomalies, and to spot performance degradation before it impacts users |
 
 ### Recent Check Results Table
 
@@ -337,14 +277,12 @@ A paginated table showing detailed results for each check:
 |--------|-------------|
 | **Result** | Pass (✓) or Fail (✗) indicator |
 | **Checked At** | When the check was performed (relative time) |
-| **Location** | Which region performed the check (with flag icon) |
 | **Response Time** | How long the check took |
 | **Error** | For failed checks, shows the error message or links to report |
 
 **Features:**
 - **Pagination** — Navigate through historical results (10 per page)
 - **Date Filter** — Filter results by specific date
-- **Location Filter** — View results from a specific region only
 
 ## Monitor Reports
 
@@ -388,3 +326,25 @@ Use **Copy Prompt** to copy error details for AI-assisted debugging.
 <Callout type="info">
 **Synthetic Monitors**: Minimum interval is 5 minutes to prevent overlapping Playwright executions. Set intervals longer than your test execution time—for a 2-minute test, use 5+ minute intervals.
 </Callout>
+
+## Configuration and cleanup
+
+<Accordions>
+<Accordion title="Configuration access" id="configuration-access">
+
+Monitor viewers can read check settings and results, but request credentials, request headers, and request bodies are omitted from the configuration returned to them. Users with monitor update permission retain the full configuration needed to edit a monitor. Notification detail links check access to the monitor's own organization and project.
+
+</Accordion>
+<Accordion title="Editing a monitor and the legacy retryStrategy field" id="legacy-retry-strategy">
+
+Updating a monitor's target, type, or configuration refreshes its scheduled checks. Paused monitors remain paused when their configuration changes.
+
+The legacy `config.retryStrategy` field is unsupported for monitors. It is accepted for compatibility but ignored; omit it from new configurations. It does not control execution retries. This deprecation does not change monitor execution or job retry behavior, and existing saved configurations require no migration.
+
+</Accordion>
+<Accordion title="Deleting stored artifacts" id="deleting-stored-artifacts">
+
+Deleting a resource with stored artifacts waits for storage cleanup to finish. If cleanup fails, Supercheck keeps the resource available for another deletion attempt. Restore storage access and retry; a partial cleanup may already have removed some artifacts.
+
+</Accordion>
+</Accordions>

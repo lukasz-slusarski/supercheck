@@ -23,6 +23,8 @@ import { RecorderAutoConnect } from "@/components/recorder/RecorderAutoConnect";
 import { getCurrentUser, getActiveOrganization, getSelectableProjects } from "@/lib/session";
 import { getCurrentProjectContext } from "@/lib/project-context";
 import { isSelfHosted } from "@/lib/feature-flags";
+import { getTrialSummary } from "@/lib/execution/trial-limits";
+import { TrialBanner } from "@/components/trial-banner";
 import { checkPermissionWithContext } from "@/lib/rbac/middleware";
 
 function deriveInitialSubscriptionStatus(
@@ -88,6 +90,12 @@ export default async function MainLayout({
       org,
       initialIsSelfHosted
     );
+    // A free trial is separate from a paid subscription; without it an
+    // unsubscribed organization would be sent to the subscribe page.
+    if (!initialIsSelfHosted && !initialSubscriptionStatus.isActive) {
+      const trial = await getTrialSummary(org.id).catch(() => undefined);
+      initialSubscriptionStatus = { ...initialSubscriptionStatus, trial: trial ?? null };
+    }
     try {
       const [projectsResult, currentProjectResult] = await Promise.all([
         getSelectableProjects(user.id),
@@ -166,19 +174,19 @@ export default async function MainLayout({
             <JobProvider>
               <SetupChecker />
               <AppSidebar />
-              <SidebarInset>
+              <SidebarInset className="lg:has-[[data-fit-viewport]]:h-svh lg:has-[[data-fit-viewport]]:min-h-0">
                 <header className="sticky top-0 z-10 flex h-14 min-w-0 shrink-0 items-center justify-between gap-2 border-b border-t bg-background transition-[width,height] ease-linear group-has-[[data-collapsible=icon]]/sidebar-wrapper:h-12">
                   <div className="flex min-w-0 flex-1 items-center gap-2 px-2 sm:px-4">
-                    <SidebarTrigger className="-ml-1" />
+                    <SidebarTrigger className="-ml-1 shrink-0" />
                     <Separator
                       orientation="vertical"
-                      className="mr-2 data-[orientation=vertical]:h-4"
+                      className="mr-2 hidden shrink-0 sm:block data-[orientation=vertical]:h-4"
                     />
-                    <div className="min-w-0 overflow-hidden">
+                    <div className="min-w-0 flex-1 overflow-hidden">
                       <BreadcrumbDisplay />
                     </div>
                   </div>
-                  <div className="flex shrink-0 items-center gap-2 px-2 sm:gap-4 sm:px-4">
+                  <div className="flex shrink-0 items-center gap-1 px-2 sm:gap-4 sm:px-4">
                     <div className="hidden xl:block">
                       <DemoBadge />
                     </div>
@@ -192,7 +200,8 @@ export default async function MainLayout({
                     <NavUser />
                   </div>
                 </header>
-                <main className="flex-1 flex-col gap-4 overflow-y-auto">
+                <main className="flex min-h-0 flex-1 flex-col overflow-y-auto">
+                  <TrialBanner initialTrial={initialSubscriptionStatus?.trial ?? null} />
                   <SubscriptionGuard
                     initialSubscriptionStatus={initialSubscriptionStatus}
                     initialIsSelfHosted={initialIsSelfHosted}

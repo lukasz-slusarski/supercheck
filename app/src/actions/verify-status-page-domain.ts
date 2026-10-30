@@ -5,8 +5,9 @@ import { statusPages } from "@/db/schema";
 import { eq, and } from "drizzle-orm";
 import { requireProjectContext } from "@/lib/project-context";
 import { requirePermissions } from "@/lib/rbac/middleware";
+import { checkFeatureAvailability } from "@/lib/middleware/plan-enforcement";
 import { revalidatePath } from "next/cache";
-import { resolve4, resolve6, resolveCname } from "node:dns/promises";
+import { resolve4, resolve6, resolveCname, resolveTxt } from "node:dns/promises";
 import { z } from "zod";
 import { logAuditEvent } from "@/lib/audit-logger";
 import {
@@ -16,7 +17,7 @@ import {
   getStatusPageDomainVerificationTargets,
   isReservedStatusPageHostname,
 } from "@/lib/status-page-domain";
-import { getStatusPageCustomDomainTargetResolutionError } from "@/lib/status-page-domain-guidance";
+import { getStatusPageCustomDomainTargetResolutionError, getStatusPageDomainOwnershipRecord } from "@/lib/status-page-domain-guidance";
 
 // UUID validation schema
 const uuidSchema = z.string().uuid("Invalid status page ID");
@@ -37,6 +38,11 @@ export async function verifyStatusPageDomain(statusPageId: string) {
       { status_page: ["update"] },
       { organizationId, projectId: project.id }
     );
+
+    const availability = await checkFeatureAvailability(organizationId, "customDomains");
+    if (!availability.available) {
+      return { success: false, message: availability.error ?? "Custom domains are not available on your plan." };
+    }
 
     // SECURITY: Get status page with ownership verification
     const statusPage = await db.query.statusPages.findFirst({
@@ -128,20 +134,30 @@ export async function verifyStatusPageDomain(statusPageId: string) {
           };
         }
 
-        // Update status page with ownership check
-        await db
+        const ownership = getStatusPageDomainOwnershipRecord(statusPage.customDomain, statusPageId);
+        let txtRecords: string[][] = [];
+        try { txtRecords = await resolveTxt(ownership.name); } catch { /* missing proof is rejected below */ }
+        if (!txtRecords.some((record) => record.join("") === ownership.value)) {
+          return { success: false, message: `Add a TXT record at ${ownership.name} with value ${ownership.value}, then verify again.` };
+        }
+
+        // DNS ownership proof belongs to this page and this exact hostname.
+        const verified = await db
           .update(statusPages)
           .set({
             customDomainVerified: true,
+            customDomainLastCheckedAt: new Date(),
             updatedAt: new Date(),
           })
           .where(
             and(
               eq(statusPages.id, statusPageId),
               eq(statusPages.organizationId, organizationId),
-              eq(statusPages.projectId, project.id)
+              eq(statusPages.projectId, project.id),
+              eq(statusPages.customDomain, statusPage.customDomain)
             )
-          );
+          ).returning({ id: statusPages.id });
+        if (!verified.length) return { success: false, message: "Domain configuration changed. Verify again." };
 
         // Log audit event
         await logAuditEvent({

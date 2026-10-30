@@ -1,12 +1,16 @@
 "use client";
 
+import { buildOAuthResumePath, isOAuthResumePath, sanitizeNextPath } from "@/lib/auth/safe-next-path";
+import { hardNavigate } from "@/lib/auth/hard-navigate";
 import { clearProjectsCache } from "@/hooks/use-project-context";
 import { announceProjectChange, reloadProjectContext } from "@/lib/project-navigation";
 import { signIn } from "@/utils/auth-client";
 import { useRouter, useSearchParams } from "next/navigation";
-import { useState, useEffect, useCallback, useMemo, Suspense } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef, Suspense } from "react";
 import { LoginForm } from "@/components/auth/login-form";
+import type { TurnstileCaptchaRef } from "@/components/auth/turnstile-captcha";
 import { Loader2 } from "lucide-react";
+import { parseInviteToken } from "@/lib/validations/auth";
 
 interface InviteData {
   organizationName: string;
@@ -36,10 +40,17 @@ function SignInPageContent() {
   const [inviteData, setInviteData] = useState<InviteData | null>(null);
   const [isFromNotification, setIsFromNotification] = useState(false);
   const [emailVerified, setEmailVerified] = useState(false);
-  const [captchaToken, setCaptchaToken] = useState<string | null>(null);
+  const captchaRef = useRef<TurnstileCaptchaRef>(null);
 
   // Derive invite token from URL params (not state)
-  const inviteToken = useMemo(() => searchParams.get("invite"), [searchParams]);
+  const inviteToken = useMemo(() => parseInviteToken(searchParams.get("invite")), [searchParams]);
+  // Allowlisted continuation (e.g. CLI device approval); never an arbitrary redirect.
+  const nextPath = useMemo(
+    // An MCP client's authorization request resumes after sign-in; otherwise only
+    // the allowlisted `next` continuations apply.
+    () => buildOAuthResumePath(searchParams) ?? sanitizeNextPath(searchParams.get("next")),
+    [searchParams],
+  );
 
   const getInviteSignInGuidance = useCallback((message?: string) => {
     const normalized = String(message ?? "").toLowerCase();
@@ -124,30 +135,33 @@ function SignInPageContent() {
       // Step 2: Attempt sign-in via Better Auth
       // Include CAPTCHA token in request headers if available
       // Better Auth captcha plugin validates via x-captcha-response header
+      // Turnstile tokens are single-use: request a fresh one for every attempt
+      // (a retry after a wrong password would otherwise resend a spent token).
+      // No stale-token fallback: a spent token only fails verification server-side.
+      const freshToken = await captchaRef.current?.execute();
       const { error } = await signIn.email({
         email,
         password,
         fetchOptions: {
-          headers: captchaToken ? { "x-captcha-response": captchaToken } : {},
+          headers: freshToken ? { "x-captcha-response": freshToken } : {},
         },
       });
 
       if (error) {
-        if (inviteToken && error.message?.toLowerCase().includes("verif")) {
+        // Classify CAPTCHA first: "Captcha verification failed" also contains
+        // "verif" and must not be mistaken for the email-verification gate below.
+        // A CAPTCHA rejection says nothing about the credentials: don't count it
+        // toward lockout, and don't blame the invitee's account.
+        const errorMessage = error.message?.toLowerCase() ?? "";
+        if (errorMessage.includes("captcha")) {
+          setError("Verification failed. Please try again.");
+          return;
+        }
+        if (inviteToken && errorMessage.includes("verif")) {
           router.push(`/verify-email?email=${encodeURIComponent(email)}&invite=${encodeURIComponent(inviteToken)}`);
           return;
         }
-        // Step 3a: Record failed attempt
-        const failedResult = await fetch("/api/auth/sign-in/check", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "failed", email }),
-        });
-        const failedData = await failedResult.json();
-
-        // Invite flow UX: show clear guidance for first-time invitees.
-        // Keep recording failed attempts for security/rate limiting, but avoid
-        // lockout-style messaging that implies repeated password failures.
+        // Invitees receive guidance while server hooks enforce lockout.
         if (inviteToken) {
           setError(getInviteSignInGuidance(error.message));
           return;
@@ -155,19 +169,8 @@ function SignInPageContent() {
 
         // Keep pre-lockout errors generic. Exposing attempts remaining only for
         // known accounts enables account enumeration.
-        if (failedData.isLocked) {
-          setError(failedData.message || "Too many failed attempts. Account temporarily locked.");
-        } else {
-          setError(error.message || "An error occurred");
-        }
+        setError(error.message || "An error occurred");
       } else {
-        // Step 3b: Clear lockout on successful sign-in
-        await fetch("/api/auth/sign-in/check", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "success", email }),
-        }).catch(() => { /* ignore errors on cleanup */ });
-
         // If user signed in with an invite token, auto-accept the invitation
         if (inviteToken) {
           try {
@@ -186,8 +189,11 @@ function SignInPageContent() {
           }
           // Fallback: redirect to invite page for manual acceptance
           router.push(`/invite/${inviteToken}`);
+        } else if (isOAuthResumePath(nextPath)) {
+          // The authorize endpoint answers with a redirect, so leave the SPA router.
+          hardNavigate(nextPath as string);
         } else {
-          router.push("/");
+          router.push(nextPath ?? "/");
         }
       }
     } catch (err) {
@@ -201,6 +207,7 @@ function SignInPageContent() {
   return (
     <LoginForm
       className="w-full max-w-sm px-4"
+      nextPath={nextPath}
       onSubmit={handleSubmit}
       isLoading={isLoading}
       error={error}
@@ -208,7 +215,7 @@ function SignInPageContent() {
       inviteToken={inviteToken}
       isFromNotification={isFromNotification}
       emailVerified={emailVerified}
-      onCaptchaToken={setCaptchaToken}
+      captchaRef={captchaRef}
     />
   );
 }

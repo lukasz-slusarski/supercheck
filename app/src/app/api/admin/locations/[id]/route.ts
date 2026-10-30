@@ -1,3 +1,4 @@
+import { isUuid } from "@/lib/uuid";
 import { NextRequest, NextResponse } from "next/server";
 import { requireAdmin } from "@/lib/admin";
 import { db } from "@/utils/db";
@@ -76,6 +77,7 @@ export async function PATCH(request: NextRequest, { params }: RouteParams) {
     }
 
     // Check location exists
+    if (!isUuid((await params).id)) return NextResponse.json({ error: "Location not found" }, { status: 404 });
     const [existing] = await db
       .select()
       .from(locations)
@@ -101,8 +103,33 @@ export async function PATCH(request: NextRequest, { params }: RouteParams) {
       );
     }
 
+    if (
+      !(parsed.data.isEnabled ?? existing.isEnabled) &&
+      (parsed.data.isDefault ?? existing.isDefault)
+    ) {
+      return NextResponse.json(
+        { success: false, error: "A disabled location cannot be the default location" },
+        { status: 400 }
+      );
+    }
+
     // Use a transaction to prevent TOCTOU races on default enforcement and disable guard
     const updated = await db.transaction(async (tx) => {
+      const [current] = await tx
+        .select()
+        .from(locations)
+        .where(eq(locations.id, id))
+        .limit(1)
+        .for("update");
+      if (!current) {
+        throw new Error("CONFLICT:Location changed. Refresh and try again.");
+      }
+      if (
+        !(parsed.data.isEnabled ?? current.isEnabled) &&
+        (parsed.data.isDefault ?? current.isDefault)
+      ) {
+        throw new Error("CONFLICT:A disabled location cannot be the default location. Refresh and try again.");
+      }
       // Enforce single default: clear others before setting new default
       if (parsed.data.isDefault) {
         await tx
@@ -114,7 +141,7 @@ export async function PATCH(request: NextRequest, { params }: RouteParams) {
       // Block disabling the last enabled location.
       // In cloud mode, exclude the hidden "local" row from the count so it doesn't
       // inflate the number of usable locations ("local" is invisible to all consumers).
-      if (parsed.data.isEnabled === false && existing.isEnabled) {
+      if (parsed.data.isEnabled === false && current.isEnabled) {
         const enabledRows = await tx
           .select({ code: locations.code })
           .from(locations)
@@ -190,6 +217,7 @@ export async function DELETE(_request: NextRequest, { params }: RouteParams) {
     const { id } = await params;
 
     // Check location exists
+    if (!isUuid((await params).id)) return NextResponse.json({ error: "Location not found" }, { status: 404 });
     const [existing] = await db
       .select()
       .from(locations)

@@ -13,7 +13,6 @@ import {
   RadioTower,
   Shield,
   Siren,
-  SquareLibrary,
   Tally4,
   UserPlus,
   Variable,
@@ -56,7 +55,7 @@ export type QuickCreateCapabilities = {
 const CHROME_WEB_STORE_URL =
   "https://chromewebstore.google.com/detail/supercheck-recorder/gfmbcelfhhfmifdkccnbgdadibdfhioe";
 const EDGE_ADDONS_URL =
-  "https://microsoftedge.microsoft.com/addons/detail/supercheck-recorder/0rdckc265vb9";
+  "https://microsoftedge.microsoft.com/addons/detail/supercheck-recorder/ngmlkgfgmdnfpddohcbfdgihennolnem";
 
 // Detect browser type
 function detectBrowser(): "chrome" | "edge" | "unsupported" {
@@ -224,14 +223,6 @@ export function CreatePageContent({
           title: "Integration",
           description: "Connect evidence sources",
           onClick: () => router.push("/org-admin?tab=integrations"),
-        }
-      : null,
-    capabilities.canConfigureSreConnectors
-      ? {
-          icon: <SquareLibrary size={20} className="text-cyan-500" />,
-          title: "Diagnostic Recipe",
-          description: "Add safe query templates",
-          onClick: () => router.push("/org-admin?tab=diagnostic-recipes"),
         }
       : null,
     capabilities.canConfigureSreConnectors

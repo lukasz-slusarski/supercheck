@@ -1,3 +1,4 @@
+import { getExecutionPolicy, ExecutionWorkloadError } from "@/lib/execution/execution-policy";
 /**
  * Job Scheduler Processor
  *
@@ -14,10 +15,13 @@ import { eq, and, inArray } from 'drizzle-orm';
 import { addJobToQueue, addK6JobToQueue, JobExecutionTask, K6ExecutionTask, queueLogger } from '@/lib/queue';
 import { prepareJobTestScripts } from '@/lib/job-execution-utils';
 import { getNextRunDate } from './cron-utils';
-import { resolveProjectK6Location } from '@/lib/location-registry';
+import {
+  assertProjectSupportsBrowser,
+  LocationWorkloadUnavailableError,
+  resolveProjectK6Location,
+} from '@/lib/location-registry';
 import {
   SubscriptionAccessDeniedError,
-  subscriptionService,
 } from '@/lib/services/subscription-service';
 import { polarUsageService } from '@/lib/services/polar-usage.service';
 
@@ -116,9 +120,8 @@ export async function processScheduledJob(
     // controls as user/API-triggered executions. Expected policy denials skip
     // the tick; operational failures are rethrown for BullMQ retry/backoff.
     try {
-      await subscriptionService.blockUntilSubscribed(organizationId);
-      await subscriptionService.requireValidPolarCustomer(organizationId);
-      const spendingBlock = await polarUsageService.shouldBlockUsage(organizationId);
+      const policy = await getExecutionPolicy(organizationId);
+      const spendingBlock = policy.tier === "paid" ? await polarUsageService.shouldBlockUsage(organizationId) : { blocked: false };
       if (spendingBlock.blocked) {
         logger.warn(
           { jobId, organizationId, reason: spendingBlock.reason },
@@ -127,9 +130,9 @@ export async function processScheduledJob(
         return { success: true };
       }
     } catch (error) {
-      if (error instanceof SubscriptionAccessDeniedError) {
+      if (error instanceof SubscriptionAccessDeniedError || error instanceof ExecutionWorkloadError) {
         logger.warn(
-          { jobId, organizationId, reason: error.reason },
+          { jobId, organizationId, reason: error instanceof SubscriptionAccessDeniedError ? error.reason : "execution_entitlement_required" },
           'Scheduled execution blocked by subscription validation',
         );
         return { success: true };
@@ -142,7 +145,41 @@ export async function processScheduledJob(
     }
 
     // Resolve location using project-aware logic (respects project location restrictions)
-    const resolvedLocation = isK6Job ? await resolveProjectK6Location(projectId) : null;
+    // A workload with no eligible location is a configuration error: skip the tick
+    // instead of retrying, and never run in another geography.
+    let resolvedLocation: string | null = null;
+    try {
+      if (isK6Job) {
+        resolvedLocation = await resolveProjectK6Location(projectId);
+      } else {
+        await assertProjectSupportsBrowser(projectId);
+      }
+    } catch (error) {
+      if (error instanceof LocationWorkloadUnavailableError) {
+        logger.warn(
+          { jobId, projectId, workload: error.workload },
+          'Scheduled execution skipped: no eligible location for this workload',
+        );
+        // Leave a visible failed run so the skipped tick is not silent.
+        const now = new Date();
+        await db.insert(runs).values({
+          id: runId,
+          jobId,
+          status: 'failed',
+          startedAt: now,
+          completedAt: now,
+          trigger: 'schedule',
+          projectId,
+          errorDetails: error.message,
+          metadata: {
+            jobType,
+            executionEngine: isK6Job ? 'k6' : 'playwright',
+          },
+        });
+        return { success: true };
+      }
+      throw error;
+    }
 
     // Create run record with 'queued' status - capacity manager will update to 'running'
     await db.insert(runs).values({
@@ -217,7 +254,7 @@ export async function processScheduledJob(
           completedAt: new Date(),
           errorDetails: errorMessage,
         })
-        .where(eq(runs.id, runId));
+        .where(and(eq(runs.id, runId), inArray(runs.status, ['queued', 'running'])));
       return { success: false };
     }
 
@@ -236,7 +273,7 @@ export async function processScheduledJob(
             completedAt: new Date(),
             errorDetails: 'Unable to prepare k6 script for execution',
           })
-          .where(eq(runs.id, runId));
+          .where(and(eq(runs.id, runId), inArray(runs.status, ['queued', 'running'])));
         return { success: false };
       }
 
@@ -249,7 +286,7 @@ export async function processScheduledJob(
             completedAt: new Date(),
             errorDetails: 'k6 jobs require performance tests',
           })
-          .where(eq(runs.id, runId));
+          .where(and(eq(runs.id, runId), inArray(runs.status, ['queued', 'running'])));
         return { success: false };
       }
 
@@ -281,7 +318,7 @@ export async function processScheduledJob(
 
         // Update run status based on capacity result
         if (result.status === 'running') {
-          await db.update(runs).set({ status: 'running' }).where(eq(runs.id, runId));
+          await db.update(runs).set({ status: 'running' }).where(and(eq(runs.id, runId), eq(runs.status, 'queued')));
         }
         // If 'queued', status is already 'queued'
       } catch (error) {
@@ -293,7 +330,7 @@ export async function processScheduledJob(
             completedAt: new Date(),
             errorDetails: error instanceof Error ? error.message : 'Failed to enqueue job',
           })
-          .where(eq(runs.id, runId));
+          .where(and(eq(runs.id, runId), inArray(runs.status, ['queued', 'running'])));
         return { success: false };
       }
     } else {
@@ -320,7 +357,7 @@ export async function processScheduledJob(
 
         // Update run status based on capacity result
         if (result.status === 'running') {
-          await db.update(runs).set({ status: 'running' }).where(eq(runs.id, runId));
+          await db.update(runs).set({ status: 'running' }).where(and(eq(runs.id, runId), eq(runs.status, 'queued')));
         }
       } catch (error) {
         logger.error({ jobId, runId, error }, 'Failed to enqueue Playwright job');
@@ -331,7 +368,7 @@ export async function processScheduledJob(
             completedAt: new Date(),
             errorDetails: error instanceof Error ? error.message : 'Failed to enqueue job',
           })
-          .where(eq(runs.id, runId));
+          .where(and(eq(runs.id, runId), inArray(runs.status, ['queued', 'running'])));
         return { success: false };
       }
     }

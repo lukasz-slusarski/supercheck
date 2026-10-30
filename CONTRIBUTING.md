@@ -6,20 +6,74 @@ By participating, you agree to follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Before you start
 
-- Discuss large features, new providers, database changes, or breaking behavior in [GitHub Discussions](https://github.com/supercheck-io/supercheck/discussions) or [Discord](https://discord.gg/UVe327CSbm) first.
+- Discuss large features, new providers, database changes, or breaking behavior in [GitHub Discussions](https://github.com/supercheck-io/supercheck/discussions) first.
 - Report vulnerabilities privately through [SECURITY.md](SECURITY.md). Do not open a public issue.
 - Search existing issues and pull requests before starting work.
 - For anything larger than a small fix, open or comment on an issue so maintainers can confirm the approach before you invest time.
+
+## Server route tests
+
+App tests use jsdom by default. Server route suites should select Node with
+`/** @jest-environment node */` so they use native server APIs, including
+`structuredClone` and Fetch. Keep authorization assertions in the suite; changing
+the environment does not replace testing access checks.
+
+When a route imports the auth stack, check the suite with both
+`MCP_SERVER_ENABLED=true` and `MCP_SERVER_ENABLED=false`.
 
 ## Development setup
 
 Requirements:
 
-- **Node.js 20 or later.** Individual packages state their supported version in `engines` and CI; use the version required by the package you touch.
+- **Node.js 24 for app, worker, and docs development.** Individual packages state their supported version in `engines` and CI; the CLI retains its own minimum Node.js version.
 - **Docker Compose v2** for self-hosted deployment work.
 - **Linux** (Ubuntu 22.04+, Debian 12+) for anything that exercises the K3s and gVisor execution sandbox. macOS and Windows can develop the app, worker, CLI, recorder, and docs, but cannot run the sandboxed execution stack.
 
 Run `npm` commands from the package directory, not the repository root. Each package has its own `package-lock.json`; use `npm ci` for a clean, reproducible install.
+
+### Run the app and worker from source against Compose infrastructure
+
+For fast iteration, run the app and worker with `npm run dev` while PostgreSQL, Redis, and RustFS run in Docker Compose. The local Compose file publishes these services on loopback with public local development credentials. Use these credentials only for trusted local development.
+
+Start the infrastructure from the repository root:
+
+```bash
+cd /path/to/supercheck
+docker compose -f deploy/docker/docker-compose-local.yml up -d postgres redis rustfs
+docker compose -f deploy/docker/docker-compose-local.yml stop app worker
+```
+
+Before starting either package, copy its `.env.example` to `.env` only if `.env` does not already exist, then configure it for the local Compose services. Set matching `DATABASE_URL` and S3 settings in both packages. The database URL must use the Compose PostgreSQL credentials, and the S3 endpoint, bucket, region, access key, and secret key must match RustFS. Preserve existing `.env` files and edit them as needed. The local RustFS development keys are `localdevaccesskey` / `localdevsecretkey0123456789abcdef`.
+
+The app and worker both read `REDIS_HOST`, `REDIS_PORT`, and `REDIS_PASSWORD`. Match these settings to the Compose Redis service. If a local service already uses a default port, set `DB_HOST_PORT`, `REDIS_HOST_PORT`, or `RUSTFS_HOST_PORT` in `deploy/docker/.env` and update the corresponding package settings (`DATABASE_URL`, Redis settings, or `S3_ENDPOINT`).
+
+In a separate terminal for the app, run from the repository root:
+
+```bash
+cd /path/to/supercheck/app
+test -f .env || cp .env.example .env
+npm ci
+npm run db:migrate
+npm run dev
+```
+
+The app is available at `http://localhost:3000`. In another terminal for the worker, run from the repository root:
+
+```bash
+cd /path/to/supercheck/worker
+test -f .env || cp .env.example .env
+npm ci
+npm run dev
+```
+
+The worker health endpoint is `http://localhost:8000/health/ready`. To switch back, stop both dev servers with Ctrl+C, then start the containerized app and worker from `deploy/docker`:
+
+```bash
+cd /path/to/supercheck/deploy/docker
+docker compose -f docker-compose-local.yml up -d app worker
+```
+
+Worker test runs still execute as Kubernetes Jobs. For a local cluster, use a namespace-scoped worker kubeconfig through `KUBECONFIG`. OrbStack has no gVisor `RuntimeClass`; set `EXECUTION_RUNTIME_CLASS_NAME=none` to run without the sandbox, and use only local, trusted targets.
 
 ## Workflow
 
@@ -147,4 +201,4 @@ Use disposable fixtures for browser and provider tests and remove them afterward
 
 The app, worker (including Private Agent mode), deployment assets, and documentation are `AGPL-3.0-only`. The CLI and recorder are Apache-2.0; retain third-party licenses, notices, and upstream headers.
 
-Read the [contributor license agreement](CLA.md); maintainers will ask you to sign it, or to give equivalent written acceptance, before your contribution is merged. You keep ownership and grant the maintainer rights to distribute your contribution under open-source or commercial terms, with a patent grant. The agreement does not replace the license of the files you change. Every human contributor must be covered, including co-authors and anyone contributing through an employer. Maintainers follow the [CLA setup and verification runbook](.github/CLA_SETUP.md). All contributors must follow [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+All contributors must follow [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).

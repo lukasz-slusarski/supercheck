@@ -1,5 +1,7 @@
+import { ensureGitignoreEntries } from '../utils/gitignore.js'
+import { outputMutation } from '../output/formatter.js'
 import { Command } from 'commander'
-import { existsSync, mkdirSync, writeFileSync, readFileSync, appendFileSync } from 'node:fs'
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { logger } from '../utils/logger.js'
 import { CLIError, ExitCode } from '../utils/errors.js'
@@ -7,17 +9,47 @@ import { detectPackageManager, ensurePackageJson, installDependencies } from '..
 import { installPlaywrightBrowsers, isK6Installed, getK6InstallHint } from '../utils/deps.js'
 import { uuidv7 } from '../utils/uuid.js'
 import { slugify } from '../utils/slug.js'
+import { getStoredBaseUrl, getStoredOrganization, getStoredProject, getToken } from '../auth/store.js'
+import { getApiClient } from '../api/client.js'
 
-const CONFIG_TEMPLATE = `import { defineConfig } from '@supercheck/cli'
+const DEFAULT_BASE_URL = 'https://app.supercheck.io'
+
+/**
+ * Normalize the API URL that gets written to a committed config. Rejects
+ * non-HTTP(S) URLs and embedded credentials (same rule as `login`), and drops
+ * query/fragment so no secret can land in version control.
+ */
+function sanitizeBaseUrl(raw: string | null): string | null {
+  const value = raw?.trim()
+  if (raw === null) return DEFAULT_BASE_URL
+  if (!value) return null // explicit empty override: never authenticate against a guessed host
+  try {
+    const url = new URL(value)
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new Error('unsafe')
+    return (url.origin + url.pathname).replace(/\/+$/, '')
+  } catch {
+    logger.warn('Ignoring invalid SUPERCHECK_URL/stored API URL; using the default Supercheck Cloud URL.')
+    return null
+  }
+}
+
+/** The token may only be sent over HTTPS, or HTTP to a loopback host. */
+function isTokenSafeUrl(baseUrl: string): boolean {
+  const { protocol, hostname } = new URL(baseUrl)
+  return protocol === 'https:' || ['localhost', '127.0.0.1', '[::1]'].includes(hostname)
+}
+
+function configTemplate(organization: string, project: string, baseUrl: string): string {
+  return `import { defineConfig } from '@supercheck/cli'
 
 export default defineConfig({
   schemaVersion: '1.0',
   project: {
-    organization: 'my-org',
-    project: 'my-project',
+    organization: ${JSON.stringify(organization)},
+    project: ${JSON.stringify(project)},
   },
   api: {
-    baseUrl: process.env.SUPERCHECK_URL ?? 'https://app.supercheck.io',
+    baseUrl: process.env.SUPERCHECK_URL ?? ${JSON.stringify(baseUrl)},
   },
   tests: {
     playwright: {
@@ -30,6 +62,7 @@ export default defineConfig({
   },
 })
 `
+}
 
 const EXAMPLE_PW_TEST = `// @title Homepage Check
 
@@ -82,13 +115,6 @@ const SUPERCHECK_TSCONFIG = `{
 }
 `
 
-const GITIGNORE_ADDITIONS = `
-# Supercheck CLI
-supercheck.config.local.ts
-supercheck.config.local.js
-supercheck.config.local.mjs
-`
-
 export const initCommand = new Command('init')
   .description('Initialize a new Supercheck project with config and example tests')
   .option('--force', 'Overwrite existing config file')
@@ -97,6 +123,7 @@ export const initCommand = new Command('init')
   .option('--pm <manager>', 'Package manager to use (npm, yarn, pnpm, bun)')
   .action(async (options: { force?: boolean; skipInstall?: boolean; skipExamples?: boolean; pm?: string }) => {
     const cwd = process.cwd()
+    const filesWritten: string[] = []
     const requestedPm = options.pm?.trim().toLowerCase()
     if (requestedPm && !['npm', 'yarn', 'pnpm', 'bun'].includes(requestedPm)) {
       throw new CLIError(
@@ -117,14 +144,41 @@ export const initCommand = new Command('init')
     logger.header('Initializing Supercheck project...')
     logger.newline()
 
+    const baseUrl = sanitizeBaseUrl(getStoredBaseUrl())
+    let organization = getStoredOrganization()?.trim() || 'my-org'
+    let project = getStoredProject()?.trim() || 'my-project'
+    const token = getToken()
+    if (token && baseUrl && !isTokenSafeUrl(baseUrl)) {
+      logger.warn('Skipping authenticated context lookup: the API URL must use HTTPS (HTTP is allowed only for localhost).')
+    } else if (token && baseUrl) {
+      try {
+        logger.info('Fetching authenticated project context...')
+        const { data } = await getApiClient({ token, baseUrl }).request<{
+          organization: { id: unknown }; project: { id: unknown }
+        }>('GET', '/api/context', { retries: 0, timeout: 5_000 })
+        const orgId = data.organization?.id
+        const projectId = data.project?.id
+        if (typeof orgId !== 'string' || !orgId || typeof projectId !== 'string' || !projectId) {
+          throw new Error('Missing project context')
+        }
+        organization = process.env.SUPERCHECK_ORG?.trim() || orgId
+        project = process.env.SUPERCHECK_PROJECT?.trim() || projectId
+      } catch (err) {
+        logger.debug(`Context lookup failed: ${err instanceof Error ? err.message : String(err)}`)
+        logger.warn('Could not load authenticated context. Check the organization and project in supercheck.config.ts before deploying.')
+      }
+    }
+
     // 1. Write supercheck.config.ts
-    writeFileSync(configPath, CONFIG_TEMPLATE, 'utf-8')
+    writeFileSync(configPath, configTemplate(organization, project, baseUrl ?? DEFAULT_BASE_URL), 'utf-8')
+      filesWritten.push(configPath)
     logger.success('Created supercheck.config.ts')
 
     // 2. Write tsconfig.supercheck.json for IDE IntelliSense
     const tsconfigPath = resolve(cwd, 'tsconfig.supercheck.json')
     if (!existsSync(tsconfigPath) || options.force) {
       writeFileSync(tsconfigPath, SUPERCHECK_TSCONFIG, 'utf-8')
+      filesWritten.push(tsconfigPath)
       logger.success('Created tsconfig.supercheck.json (IDE IntelliSense)')
     }
 
@@ -150,6 +204,7 @@ export const initCommand = new Command('init')
       const pwTestPath = resolve(cwd, `_supercheck_/playwright/${pwFilename}`)
       if (!existsSync(pwTestPath)) {
         writeFileSync(pwTestPath, EXAMPLE_PW_TEST, 'utf-8')
+      filesWritten.push(pwTestPath)
         logger.success(`Created _supercheck_/playwright/${pwFilename} (Playwright example)`)
       }
 
@@ -160,19 +215,13 @@ export const initCommand = new Command('init')
       const k6TestPath = resolve(cwd, `_supercheck_/k6/${k6Filename}`)
       if (!existsSync(k6TestPath)) {
         writeFileSync(k6TestPath, EXAMPLE_K6_TEST, 'utf-8')
+      filesWritten.push(k6TestPath)
         logger.success(`Created _supercheck_/k6/${k6Filename} (k6 example)`)
       }
     }
 
     // 5. Update .gitignore
-    const gitignorePath = resolve(cwd, '.gitignore')
-    if (existsSync(gitignorePath)) {
-      const content = readFileSync(gitignorePath, 'utf-8')
-      if (!content.includes('supercheck.config.local')) {
-        appendFileSync(gitignorePath, GITIGNORE_ADDITIONS, 'utf-8')
-        logger.success('Updated .gitignore with Supercheck entries')
-      }
-    }
+    if (ensureGitignoreEntries(cwd).length > 0) logger.success('Updated .gitignore with Supercheck entries')
 
     // 6. Detect package manager
     const pm = (requestedPm as 'npm' | 'yarn' | 'pnpm' | 'bun' | undefined) ?? detectPackageManager(cwd)
@@ -217,7 +266,7 @@ export const initCommand = new Command('init')
     }
 
     logger.info('Next steps:')
-    logger.info('  1. Edit supercheck.config.ts with your org/project details')
+    logger.info('  1. Check the organization and project in supercheck.config.ts')
     logger.info('  2. Run `supercheck login --token <your-token>` to authenticate')
     logger.info('  3. Write tests in _supercheck_/playwright and _supercheck_/k6')
     logger.info('  4. Run `supercheck diff` to preview changes against the cloud')
@@ -230,4 +279,5 @@ export const initCommand = new Command('init')
     logger.info('  supercheck deploy      Push local config to Supercheck')
     logger.info('  supercheck whoami      Check authentication status')
     logger.newline()
+    outputMutation({ initialized: true, filesWritten, installed: !options.skipInstall })
   })

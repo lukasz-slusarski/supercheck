@@ -13,7 +13,10 @@ on:
 
 permissions:
   contents: read
-  id-token: write # Required for npm provenance
+
+concurrency:
+  group: cli-publish-${{ github.ref }}
+  cancel-in-progress: false
 
 defaults:
   run:
@@ -27,14 +30,78 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      # Release tags must be annotated and signed by a key listed in
+      # main's .github/release-allowed-signers. The signers file is read
+      # from main, not from the tagged commit, so a tag cannot add its own key.
+      - name: Checkout release signers from main
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: main
+          path: release-signers
+          sparse-checkout: .github/release-allowed-signers
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Require signed annotated release tag
+        shell: bash
+        env:
+          RELEASE_REF: ${{ github.ref }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          GITHUB_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          set -Eeuo pipefail
+          if [[ "$RELEASE_REF" != refs/tags/* ]]; then
+            if [[ "$DRY_RUN" == "true" ]]; then
+              echo "Dry run on $RELEASE_REF; tag check skipped."
+              exit 0
+            fi
+            echo "::error::Publishing requires a signed release tag; got $RELEASE_REF."
+            exit 1
+          fi
+          # actions/checkout fetches the tag as a bare commit
+          # (+<sha>:refs/tags/<tag>), overwriting the annotated tag object.
+          # Re-fetch the real tag object before verifying it.
+          auth="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
+          git -c "http.${GITHUB_SERVER_URL}/.extraheader=AUTHORIZATION: basic ${auth}" \
+            fetch --no-tags --force origin "+refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          if [[ "$(git cat-file -t "refs/tags/$RELEASE_TAG")" != "tag" ]]; then
+            echo "::error::Tag $RELEASE_TAG is lightweight or missing. Release tags must be annotated and signed."
+            exit 1
+          fi
+          git -c gpg.format=ssh \
+            -c gpg.ssh.allowedSignersFile="$GITHUB_WORKSPACE/release-signers/.github/release-allowed-signers" \
+            verify-tag "refs/tags/$RELEASE_TAG"
+          # The verified tag must still point at the commit this run builds.
+          if [[ "$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")" != "$GITHUB_SHA" ]]; then
+            echo "::error::Tag $RELEASE_TAG no longer points at $GITHUB_SHA."
+            exit 1
+          fi
 
       - name: Setup Node.js
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
-          node-version: "20"
+          node-version: "24"
           cache: "npm"
           cache-dependency-path: cli/package-lock.json
+
+      - name: Verify CLI release version
+        env:
+          RELEASE_REF: ${{ github.ref }}
+        run: |
+          set -Eeuo pipefail
+          if [[ "$RELEASE_REF" == refs/tags/* ]]; then
+            PKG_VERSION=$(node -p "require('./package.json').version")
+            if [[ "$RELEASE_REF" != "refs/tags/cli-v$PKG_VERSION" ]]; then
+              echo "::error::Release tag must be cli-v$PKG_VERSION; got $RELEASE_REF."
+              exit 1
+            fi
+          fi
 
       - name: Install dependencies
         run: npm ci --prefer-offline --no-audit
@@ -46,7 +113,7 @@ jobs:
         run: npm run lint
 
       - name: Run tests
-        run: npm test
+        run: npm run test:cov -- --maxWorkers=2
 
       - name: Build
         run: npm run build
@@ -62,23 +129,27 @@ jobs:
     needs: validate
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      NODE_AUTH_TOKEN: ${{ secrets['NPM_TOKEN'] }}
+    permissions:
+      contents: read
+      id-token: write # npm trusted publishing (OIDC) and provenance
 
     steps:
       - name: Checkout
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
-          node-version: "20"
+          node-version: "24"
           registry-url: "https://registry.npmjs.org"
           cache: "npm"
           cache-dependency-path: cli/package-lock.json
 
-      - name: Enable npm trusted publishing
-        run: npm install --global npm@11
+      - name: Install npm with trusted publishing support
+        run: npm install --global npm@11.21.1
 
       - name: Install dependencies
         run: npm ci --prefer-offline --no-audit
@@ -86,23 +157,11 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Verify tag matches package version
-        run: |
-          PKG_VERSION=$(node -p "require('./package.json').version")
-          if [ "${{ github.event_name }}" = "push" ]; then
-            TAG_VERSION="${GITHUB_REF#refs/tags/cli-v}"
-            if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
-              echo "::error::Tag version ($TAG_VERSION) doesn't match package.json version ($PKG_VERSION)"
-              exit 1
-            fi
-          fi
-          echo "Publishing version: $PKG_VERSION"
-
       - name: Determine npm tag
         id: npm-tag
         run: |
           PKG_VERSION=$(node -p "require('./package.json').version")
-          if echo "$PKG_VERSION" | grep -qE '(alpha|beta|rc|canary|next|dev)'; then
+          if [[ "$PKG_VERSION" == *-* ]]; then
             echo "tag=next" >> "$GITHUB_OUTPUT"
           else
             echo "tag=latest" >> "$GITHUB_OUTPUT"
@@ -118,11 +177,38 @@ jobs:
         run: npm publish --provenance --access public --tag ${{ steps.npm-tag.outputs.tag }}
 
       - name: Summary
+        env:
+          DRY_RUN: ${{ inputs.dry-run }}
         run: |
           PKG_VERSION=$(node -p "require('./package.json').version")
           {
-            echo "### 📦 Published @supercheck/cli@$PKG_VERSION"
+            if [[ "$DRY_RUN" == "true" ]]; then
+              echo "### Dry run passed for @supercheck/cli@$PKG_VERSION (not published)"
+            else
+              echo "### Published @supercheck/cli@$PKG_VERSION"
+            fi
             echo ""
             echo "- **npm tag:** \`${{ steps.npm-tag.outputs.tag }}\`"
             echo "- **Registry:** https://www.npmjs.com/package/@supercheck/cli"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: Create GitHub release
+    needs: publish
+    if: startsWith(github.ref, 'refs/tags/') && inputs.dry-run != true
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      # The repo's "Latest" release is the app (vX.Y.Z); CLI releases must not displace it.
+      - name: Publish GitHub release
+        run: |
+          set -Eeuo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Supercheck CLI ${GITHUB_REF_NAME#cli-v}" \
+            --notes "Published to npm: https://www.npmjs.com/package/@supercheck/cli/v/${GITHUB_REF_NAME#cli-v}" \
+            --generate-notes --verify-tag --latest=false
+        env:
+          GH_TOKEN: ${{ github.token }}

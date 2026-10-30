@@ -176,16 +176,17 @@ test.describe("Security - CSRF Protection @auth @security", () => {
     };
 
     if (status === 429) {
-      // Better Auth rate limits before origin validation once the shared
-      // production IP budget is exhausted. This is still a fail-closed
-      // rejection, but assert its exact contract so another response cannot
-      // accidentally mask the CSRF check.
-      expect(body).toEqual({
-        message: "Too many requests. Please try again later.",
-      });
-      const retryAfter = Number(response.headers()["x-retry-after"]);
-      expect(Number.isInteger(retryAfter)).toBe(true);
-      expect(retryAfter).toBeGreaterThanOrEqual(0);
+      // Fail-closed rejections before origin validation: Better Auth's per-IP
+      // rate limit, or the login-lockout hook, which answers with its own 429
+      // once the shared demo identity/IP bucket is locked. Assert the known
+      // contract so another response cannot accidentally mask the CSRF check.
+      expect(body.message).toMatch(/too many requests|account temporarily locked/i);
+
+      if (/too many requests/i.test(body.message ?? "")) {
+        const retryAfter = Number(response.headers()["x-retry-after"]);
+        expect(Number.isInteger(retryAfter)).toBe(true);
+        expect(retryAfter).toBeGreaterThanOrEqual(0);
+      }
       return;
     }
 
@@ -299,7 +300,12 @@ test.describe("Security - Information Disclosure @auth @security", () => {
         // still satisfies the no-enumeration contract.
         expect(error).toMatch(/locked|too many/i);
       } else if (response.status() === 429) {
-        expect(error).toBe("Too many requests. Please try again later.");
+        // Better Auth rate-limits the sign-in endpoint, while the page can then
+        // surface the fail-closed lockout message from the check endpoint. Both
+        // outcomes reveal nothing about the account, so accept either.
+        expect(error).toMatch(
+          /too many requests|too many failed attempts|account locked/i,
+        );
         const retryAfter = Number(response.headers()["x-retry-after"]);
         expect(Number.isInteger(retryAfter)).toBe(true);
         expect(retryAfter).toBeGreaterThanOrEqual(0);

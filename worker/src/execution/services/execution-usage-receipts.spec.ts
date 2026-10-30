@@ -18,6 +18,26 @@ import {
   ExecutionUsageTransaction,
 } from './execution-usage-receipts';
 
+/** The 0039 statements that touch execution_entitlements (the specs create only that table). */
+function entitlementStatementsOf0039(path: string): string {
+  return readFileSync(path, 'utf8')
+    .split('--> statement-breakpoint')
+    .filter((statement) => {
+      // Skip leading comment lines, then look at how the statement starts (no regex: no backtracking).
+      const body = statement
+        .split('\n')
+        .filter((line) => !line.trimStart().startsWith('--'))
+        .join('\n')
+        .trimStart();
+      return [
+        'ALTER TABLE "execution_entitlements"',
+        'UPDATE "execution_entitlements"',
+        'CREATE INDEX "execution_entitlements_',
+      ].some((prefix) => body.startsWith(prefix));
+    })
+    .join('\n');
+}
+
 jest.setTimeout(60_000);
 
 const postgresUrl = process.env.EXECUTION_USAGE_TEST_DATABASE_URL;
@@ -101,13 +121,40 @@ describe.each(engines)('durable execution usage (%s)', (engine) => {
         'utf8',
       ),
     );
+    // PGlite predates uuidv7(); the default is irrelevant to usage receipts.
+    await pg.exec(
+      readFileSync(
+        resolve(
+          __dirname,
+          '../../../../app/src/db/migrations/0037_execution_entitlements.sql',
+        ),
+        'utf8',
+      ).replaceAll('uuidv7()', 'gen_random_uuid()'),
+    );
+    await pg.exec(
+      readFileSync(
+        resolve(
+          __dirname,
+          '../../../../app/src/db/migrations/0038_trial_load_test_budget.sql',
+        ),
+        'utf8',
+      ),
+    );
+    await pg.exec(
+      entitlementStatementsOf0039(
+        resolve(
+          __dirname,
+          '../../../../app/src/db/migrations/0039_trial_review_hardening.sql',
+        ),
+      ),
+    );
   });
 
   beforeEach(async () => {
     process.env.SELF_HOSTED = 'false';
     process.env.POLAR_ACCESS_TOKEN = 'test-token';
     await pg.exec(
-      'DROP TRIGGER IF EXISTS reject_usage ON usage_events; TRUNCATE execution_usage_receipts, usage_events, runs, organization CASCADE',
+      'DROP TRIGGER IF EXISTS reject_usage ON usage_events; TRUNCATE execution_usage_receipts, execution_entitlements, usage_events, runs, organization CASCADE',
     );
     await database.insert(schema.organization).values({
       id: orgId,
@@ -122,6 +169,45 @@ describe.each(engines)('durable execution usage (%s)', (engine) => {
       runId,
       'running',
     ]);
+  });
+
+  it('keeps retry attempts and final completion separately idempotent', async () => {
+    const retry = {
+      ...completion,
+      runId: `${runId}:attempt:0`,
+      metadata: { executionRunId: runId, retryAttempt: 0 },
+    };
+    await persistExecutionReceipt(database, retry, async () => {});
+    await persistExecutionReceipt(database, retry, async () => {});
+    await persistExecutionReceipt(database, completion, persistResult);
+    const receipts = await database
+      .select()
+      .from(schema.executionUsageReceipts);
+    expect(receipts).toHaveLength(2);
+    expect(receipts.map((receipt) => receipt.runId)).toEqual(
+      expect.arrayContaining([runId, `${runId}:attempt:0`]),
+    );
+    expect(
+      receipts.reduce((sum, receipt) => sum + Number(receipt.units), 0),
+    ).toBeCloseTo((2 * 61) / 60, 3);
+  });
+
+  it('parks positive k6 runtime without native allocation instead of silently charging one VU', async () => {
+    await persistExecutionReceipt(
+      database,
+      { ...completion, eventType: 'k6_execution', durationMs: 61_000 },
+      persistResult,
+    );
+    const [receipt] = await database
+      .select()
+      .from(schema.executionUsageReceipts);
+    expect(Number(receipt.units)).toBe(0);
+    expect(receipt.nextAttemptAt).toBeNull();
+    expect(receipt.lastError).toContain('allocation evidence missing');
+    expect(receipt.metadata).toMatchObject({
+      durationMs: 61_000,
+      requiresAllocationReconciliation: true,
+    });
   });
 
   afterAll(async () => {

@@ -1,12 +1,16 @@
+import { canRevealSecrets } from "../utils/redact.js"
+import { waitForRun } from '../utils/wait.js'
 import { Command } from 'commander'
+import { CronExpressionParser } from 'cron-parser'
+import { isUuid } from '../utils/paths.js'
 import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { isAbsolute, relative, resolve, sep } from 'node:path'
 import { createAuthenticatedClient } from '../api/authenticated-client.js'
 import { ApiClient } from '../api/client.js'
 import { loadConfig } from '../config/loader.js'
 import { discoverFiles } from '../utils/discovery.js'
 import { logger } from '../utils/logger.js'
-import { output, outputDetail, outputPagination } from '../output/formatter.js'
+import { getOutputFormat, output, outputDetail, outputMutation, outputPagination } from '../output/formatter.js'
 import { CLIError, ExitCode } from '../utils/errors.js'
 import { parseIntStrict } from '../utils/number.js'
 import type { PaginatedResponse } from '../api/client.js'
@@ -20,6 +24,21 @@ import { ensureDependenciesForTestType, DependencyError } from '../utils/deps.js
 import { getResolvedConfigBaseUrl } from '../api/authenticated-client.js'
 
 const VALID_JOB_TYPES = ['playwright', 'k6'] as const
+
+function jobTestIds(values: string[]): string[] {
+  const ids = values.flatMap((value) => value.split(',')).map((value) => value.trim()).filter(Boolean)
+  if (ids.length === 0 || ids.some((id) => !isUuid(id.toLowerCase()))) {
+    throw new CLIError('--tests requires valid test UUIDs.', ExitCode.ConfigError)
+  }
+  return ids
+}
+
+function validateSchedule(schedule: string): void {
+  if (!schedule.trim()) return // An empty schedule disables scheduling on update.
+  try { CronExpressionParser.parse(schedule) } catch {
+    throw new CLIError('--schedule must be a valid cron expression.', ExitCode.ConfigError)
+  }
+}
 
 export const jobCommand = new Command('job')
   .description('Manage jobs')
@@ -36,7 +55,8 @@ function inferLocalTestType(filePath: string): 'playwright' | 'k6' {
 }
 
 function toDisplayName(cwd: string, filePath: string): string {
-  const normalized = filePath.replace(cwd, '').replace(/^\//, '')
+  const local = relative(cwd, filePath)
+  const normalized = local === '..' || local.startsWith(`..${sep}`) || isAbsolute(local) ? filePath : local
   return normalized.startsWith('_supercheck_/') ? normalized.replace(/^_supercheck_\//, '') : normalized
 }
 
@@ -67,14 +87,15 @@ function resolveJobLocalTests(
       throw new CLIError(`Cannot resolve local test for job entry: ${ref}`, ExitCode.ConfigError)
     }
 
-    const script = readFileSync(resolved, 'utf-8')
+    let script: string
+    try { script = readFileSync(resolved, 'utf-8') } catch { throw new CLIError(`Cannot read local test: ${resolved}`, ExitCode.ConfigError) }
     const type = inferLocalTestType(resolved)
     return { path: resolved, type, name: toDisplayName(cwd, resolved), script }
   })
 }
 
 async function validateJobTests(
-  client: ReturnType<typeof createAuthenticatedClient>,
+  client: ReturnType<typeof createAuthenticatedClient> | null,
   tests: LocalJobTest[],
 ): Promise<void> {
   // Fast client-side script-type mismatch detection
@@ -86,6 +107,7 @@ async function validateJobTests(
     }
   }
 
+  if (!client) return
   const inputs = tests.map((test) => ({
     name: test.name,
     script: test.script,
@@ -103,7 +125,8 @@ async function validateJobTests(
 async function runLocalJobTests(
   tests: LocalJobTest[],
   cwd: string,
-  testMatch?: string,
+  browser?: string,
+  configPath?: string,
 ): Promise<void> {
   const playwrightTests = tests.filter((t) => t.type === 'playwright').map((t) => t.path)
   const k6Tests = tests.filter((t) => t.type === 'k6').map((t) => t.path)
@@ -111,7 +134,7 @@ async function runLocalJobTests(
   // Pre-flight dependency checks
   try {
     if (playwrightTests.length > 0) {
-      ensureDependenciesForTestType(cwd, 'playwright')
+      ensureDependenciesForTestType(cwd, 'playwright', configPath ? null : browser)
     }
     if (k6Tests.length > 0) {
       ensureDependenciesForTestType(cwd, 'k6')
@@ -125,9 +148,9 @@ async function runLocalJobTests(
 
   if (playwrightTests.length > 0) {
     logger.header('Running Playwright tests')
-    const tempConfig = createTempPlaywrightConfig(cwd, testMatch)
+    const tempConfig = createTempPlaywrightConfig(cwd, playwrightTests.map((path) => path.replace(/\\/g, '/')), browser, configPath)
     try {
-      const code = await runCommand('npx', ['playwright', 'test', '--config', tempConfig.path, ...playwrightTests], cwd)
+      const code = await runCommand('npx', ['playwright', 'test', '--config', tempConfig.path, ...(getOutputFormat() === 'json' ? ['--reporter=json'] : []), ...playwrightTests], cwd)
       if (code !== 0) {
         throw new CLIError(`Playwright tests failed with exit code ${code}`, ExitCode.GeneralError)
       }
@@ -208,6 +231,9 @@ keysCommand
   .requiredOption('--name <name>', 'Key name')
   .option('--expires-in <seconds>', 'Expiry in seconds (min 60)')
   .action(async (jobId: string, options: { name: string; expiresIn?: string }) => {
+    if (!canRevealSecrets()) {
+      throw new CLIError('Use --show-secrets when creating a trigger key so you can save its one-time value.', ExitCode.ConfigError)
+    }
     const client = createAuthenticatedClient()
 
     const body: Record<string, unknown> = { name: options.name }
@@ -266,10 +292,7 @@ jobCommand
   .action(async (options: { name: string; tests: string[]; description: string; type?: string; schedule?: string; dryRun?: boolean }) => {
     const client = createAuthenticatedClient()
 
-    const tests = (options.tests ?? [])
-      .flatMap((value) => value.split(','))
-      .map((value) => value.trim())
-      .filter(Boolean)
+    const tests = jobTestIds(options.tests ?? [])
 
     if (tests.length === 0) {
       throw new CLIError('At least one test ID is required to create a job.', ExitCode.ConfigError)
@@ -290,11 +313,14 @@ jobCommand
       }
       body.jobType = type
     }
-    if (options.schedule) body.cronSchedule = options.schedule
+    if (options.schedule !== undefined) {
+      validateSchedule(options.schedule)
+      body.cronSchedule = options.schedule
+    }
 
     if (options.dryRun) {
       logger.header('Dry run \u2014 job create payload:')
-      logger.info(JSON.stringify(body, null, 2))
+      outputDetail({ dryRun: true, payload: body })
       return
     }
 
@@ -312,29 +338,34 @@ jobCommand
   .command('update <id>')
   .description('Update job configuration')
   .option('--name <name>', 'Job name')
+  .option('--tests <ids...>', 'Replace tests with these test IDs')
   .option('--description <description>', 'Job description')
   .option('--schedule <cron>', 'Cron schedule expression')
   .option('--status <status>', '[deprecated] Job status is runtime state and cannot be updated via the CLI')
   .option('--dry-run', 'Show what would be sent without updating')
-  .action(async (id: string, options: { name?: string; description?: string; schedule?: string; status?: string; dryRun?: boolean }) => {
+  .action(async (id: string, options: { tests?: string[]; name?: string; description?: string; schedule?: string; status?: string; dryRun?: boolean }) => {
     const client = createAuthenticatedClient()
 
     const body: Record<string, unknown> = {}
+    if (options.tests !== undefined) body.tests = jobTestIds(options.tests).map((id) => ({ id }))
     if (options.name !== undefined) body.name = options.name
     if (options.description !== undefined) body.description = options.description
-    if (options.schedule !== undefined) body.cronSchedule = options.schedule
+    if (options.schedule !== undefined) {
+      validateSchedule(options.schedule)
+      body.cronSchedule = options.schedule
+    }
     if (options.status !== undefined) {
       logger.warn('Ignoring --status: job status is runtime state and is not editable via the current API.')
     }
 
     if (Object.keys(body).length === 0) {
-      logger.warn('No fields to update. Use --name, --description, or --schedule.')
+      logger.warn('No fields to update. Use --name, --description, --schedule, or --tests.')
       return
     }
 
     if (options.dryRun) {
       logger.header('Dry run \u2014 job update payload:')
-      logger.info(JSON.stringify(body, null, 2))
+      outputDetail({ dryRun: true, payload: body })
       return
     }
 
@@ -353,11 +384,7 @@ jobCommand
   .action(async (id: string, options: { force?: boolean }) => {
     if (!options.force) {
       const { confirmPrompt } = await import('../utils/prompt.js')
-      const confirmed = await confirmPrompt(`Delete job ${id}?`, { default: false })
-      if (!confirmed) {
-        logger.info('Aborted')
-        return
-      }
+      await confirmPrompt(`Delete job ${id}?`, { default: false })
     }
 
     const client = createAuthenticatedClient()
@@ -366,25 +393,32 @@ jobCommand
       () => client.delete(`/api/jobs/${id}`),
     )
     logger.success(`Job ${id} deleted`)
+    outputMutation({ id, deleted: true })
   })
 
 jobCommand
   .command('run')
   .description('Run a job immediately')
   .requiredOption('--id <id>', 'Job ID to run')
+  .option('--offline', 'Run locally without credentials or server validation (requires --local)')
+  .option('--playwright-config <path>', 'Use an existing Playwright config')
   .option('--local', 'Run locally')
   .option('--cloud', 'Run on cloud')
-  .action(async (options: { id: string; local?: boolean; cloud?: boolean }) => {
+  .action(async (options: { id: string; local?: boolean; cloud?: boolean; offline?: boolean; playwrightConfig?: string }) => {
     if (!options.id.trim()) throw new CLIError('Job ID must not be empty.', ExitCode.ConfigError)
     if (options.local && options.cloud) {
       throw new CLIError('--local and --cloud are mutually exclusive.', ExitCode.ConfigError)
     }
 
+    if (options.offline && !options.local) throw new CLIError('--offline requires --local.', ExitCode.ConfigError)
     const useLocal = options.local === true
+    if (!useLocal && !isUuid(options.id.toLowerCase())) {
+      throw new CLIError('--id must be a valid job UUID for cloud execution.', ExitCode.ConfigError)
+    }
 
     if (useLocal) {
       const cwd = process.cwd()
-      const { config } = await loadConfig({ cwd })
+      const { config } = await loadConfig({ cwd, offline: options.offline })
       const job = config.jobs?.find((j) => j.id === options.id || j.name === options.id)
 
       if (!job) {
@@ -403,12 +437,12 @@ jobCommand
 
       const localTests = resolveJobLocalTests(cwd, tests, patterns)
 
-      const client = createAuthenticatedClient()
+      const client = options.offline ? null : createAuthenticatedClient()
       await withSpinner('Validating test scripts...', async () => {
         await validateJobTests(client, localTests)
       }, { successText: 'Test scripts validated' })
 
-      await runLocalJobTests(localTests, cwd, config.tests?.playwright?.testMatch)
+      await runLocalJobTests(localTests, cwd, config.tests?.playwright?.browser, options.playwrightConfig)
       return
     }
 
@@ -452,6 +486,9 @@ jobCommand
   .option('--wait', 'Wait for the run to complete')
   .option('--timeout <seconds>', 'Maximum wait time in seconds', '300')
   .action(async (id: string, options: { wait?: boolean; timeout: string }) => {
+    const timeoutMs = parseIntStrict(options.timeout, '--timeout', { min: 1 }) * 1000
+    const statusClient = options.wait ? createAuthenticatedClient() : null
+    if (statusClient) await statusClient.get(`/api/jobs/${id}`)
     const triggerClient = new ApiClient({
       token: requireTriggerKey(),
       baseUrl: getStoredBaseUrl() ?? getResolvedConfigBaseUrl() ?? undefined,
@@ -472,52 +509,8 @@ jobCommand
 
     logger.success(`Job triggered. Run ID: ${runId}`)
 
-    if (options.wait) {
-      let statusClient: ReturnType<typeof createAuthenticatedClient>
-      try {
-        statusClient = createAuthenticatedClient()
-      } catch {
-        throw new CLIError(
-          'Waiting for completion requires a CLI token. Set SUPERCHECK_TOKEN (sck_live_* or sck_test_).',
-          ExitCode.AuthError,
-        )
-      }
-
-      logger.info('Waiting for run to complete...')
-      const timeoutMs = parseIntStrict(options.timeout, '--timeout', { min: 1 }) * 1000
-      const startTime = Date.now()
-
-      await withSpinner('Waiting for run to complete...', async () => {
-        while (Date.now() - startTime < timeoutMs) {
-          await new Promise((resolve) => setTimeout(resolve, 3000))
-
-          const { data: runData } = await statusClient.get<{ status: string }>(
-            `/api/runs/${runId}`,
-          )
-
-          const status = typeof runData.status === 'string' ? runData.status.toLowerCase() : ''
-
-          if (['passed', 'failed', 'error', 'blocked'].includes(status)) {
-            if (status === 'passed') {
-              logger.success(`Run ${runId} passed`)
-            } else if (status === 'blocked') {
-              logger.error(`Run ${runId} blocked`)
-              throw new CLIError(`Run ${runId} blocked`, ExitCode.GeneralError)
-            } else {
-              logger.error(`Run ${runId} ${status}`)
-              throw new CLIError(`Run ${runId} ${status}`, ExitCode.GeneralError)
-            }
-            outputDetail(runData as Record<string, unknown>)
-            return
-          }
-
-          logger.debug(`Run status: ${status || '(unknown)'}`)
-        }
-
-        throw new CLIError(
-          `Timed out waiting for run to complete after ${options.timeout}s`,
-          ExitCode.Timeout,
-        )
-      }, { successText: 'Run complete' })
-    }
+    if (statusClient) {
+      try { outputDetail(await waitForRun(statusClient, runId, timeoutMs)) }
+      catch (error) { throw new CLIError(error instanceof Error ? error.message : 'Waiting failed', error instanceof CLIError ? error.exitCode : ExitCode.ApiError, { runId }) }
+    } else outputDetail({ runId, status: 'accepted' })
   })

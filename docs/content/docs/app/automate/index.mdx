@@ -42,7 +42,7 @@ SQL queries against PostgreSQL, MySQL, and other databases with result validatio
 </Card>
 
 <Card icon={<ChartSpline className="text-violet-500" />} title="Performance Test" href="/docs/app/automate/performance-test">
-k6 load testing with virtual users, duration, and thresholds at your available locations.
+k6 load testing with virtual users, duration, and thresholds.
 </Card>
 
 <Card icon={<SquareFunction className="text-indigo-500" />} title="Custom Test" href="/docs/app/automate/custom-test">
@@ -84,10 +84,6 @@ Store configuration values, encrypted secrets, and reusable file-based test data
 - **CI/CD triggers** — API endpoints for pipeline integration
 - **Manual execution** — Run on-demand from the UI
 
-### Multi-Location Execution
-
-Run performance tests from any execution locations enabled by your Supercheck administrator. Self-hosted installations seed a `local` location and can add regional workers as needed.
-
 ### Parallel Execution
 
 Run multiple tests and jobs simultaneously to reduce total execution time. The parallel execution panel in the header shows real-time status of all running and queued executions.
@@ -100,7 +96,7 @@ Run multiple tests and jobs simultaneously to reduce total execution time. The p
 - Open a run to review its progress, or cancel it if you no longer need it.
 - Runs wait when execution capacity is full. Multiple runs can execute at once up to your capacity limit.
 
-For self-hosted deployments, administrators configure execution and queue capacity in the [deployment settings](/docs/app/deployment/self-hosted#scaling).
+Self-hosted: administrators configure execution and queue capacity in the [Docker scaling reference](https://github.com/supercheck-io/supercheck/blob/v1.4.0/deploy/docker/README.md#scaling-workers).
 
 <Callout type="info">
 The parallel execution indicator appears in the top navigation bar showing **RUNNING** and **QUEUED** counts. Click it to view details and manage executions.

@@ -1,3 +1,5 @@
+import { waitForRun } from '../utils/wait.js'
+import { parseIntStrict } from '../utils/number.js'
 import { Command } from 'commander'
 import { createAuthenticatedClient } from '../api/authenticated-client.js'
 import { logger } from '../utils/logger.js'
@@ -7,12 +9,21 @@ import type { PaginatedResponse } from '../api/client.js'
 import { withSpinner } from '../utils/spinner.js'
 import { getSse } from '../utils/sse.js'
 
+/**
+ * The API stores the report's storage location (an internal host such as http://rustfs:9000/...).
+ * Show the address that works from outside: the application's own report route.
+ */
+export function publicReportUrl(client: { getBaseUrl(): string }, run: Record<string, unknown>): Record<string, unknown> {
+  if (typeof run.reportUrl !== 'string' || !run.reportUrl || typeof run.id !== 'string') return run
+  return { ...run, reportUrl: `${client.getBaseUrl().replace(/\/$/, '')}/api/test-results/${encodeURIComponent(run.id)}/report/index.html` }
+}
+
 export const runCommand = new Command('run')
   .description('Manage runs')
 
 runCommand
   .command('list')
-  .description('List runs')
+  .description('List job runs (runs of a test executed directly are not listed; use `test execute --wait` or `run get <runId>`)')
   .option('--page <page>', 'Page number', '1')
   .option('--limit <limit>', 'Items per page', '50')
   .option('--job <jobId>', 'Filter by job ID')
@@ -35,7 +46,7 @@ runCommand
       ),
     )
 
-    output(data.data, {
+    output(data.data.map((run) => publicReportUrl(client, run)), {
       columns: [
         { key: 'id', header: 'ID' },
         { key: 'jobName', header: 'Job' },
@@ -57,7 +68,7 @@ runCommand
       'Fetching run details',
       () => client.get<Record<string, unknown>>(`/api/runs/${id}`),
     )
-    outputDetail(data)
+    outputDetail(publicReportUrl(client, data))
   })
 
 runCommand
@@ -103,7 +114,7 @@ runCommand
         if (!json) logger.success(`Run complete: ${String(record.status ?? 'done')}`)
         return false
       }
-    }, Math.max(Number(options.idleTimeout) || 60, 10) * 1000)
+    }, { idleTimeoutMs: Math.max(Number(options.idleTimeout) || 60, 10) * 1000, isTerminal: ({ event }) => event === 'complete' })
   })
 
 runCommand
@@ -116,4 +127,12 @@ runCommand
       () => client.post<Record<string, unknown>>(`/api/runs/${id}/cancel`),
     )
     outputDetail(data)
+  })
+
+runCommand.command('wait <id>')
+  .description('Wait for a run with a bounded deadline; does not trigger a new run')
+  .option('--timeout <seconds>', 'Maximum wait time', '300')
+  .action(async (id: string, options: { timeout: string }) => {
+    const timeout = parseIntStrict(options.timeout, '--timeout', { min: 1 }) * 1000
+    outputDetail(await waitForRun(createAuthenticatedClient(), id, timeout))
   })

@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { db } from "@/utils/db";
 import {
   monitors as monitorTable,
@@ -24,6 +25,7 @@ interface MonitorApiData {
   target: string;
   frequencyMinutes: number;
   enabled?: boolean;
+  status?: DBMonitorStatus;
   config?: MonitorConfig | null;
   alertConfig?: AlertConfig | null; // Alert configuration for notifications
   organizationId: string; // Required for dual scoping
@@ -31,7 +33,17 @@ interface MonitorApiData {
   createdByUserId?: string; // Assuming this comes from authenticated session
 }
 
-export async function createMonitorHandler(data: MonitorApiData) {
+/** Anything that can run an insert: the global `db` or a transaction handle. */
+type InsertExecutor = Pick<typeof db, "insert">;
+
+/**
+ * Validate and insert a monitor row only (no scheduling). Pass a transaction
+ * as `executor` when the insert must commit together with a lock release.
+ */
+export async function insertMonitorRecord(
+  data: MonitorApiData,
+  executor: InsertExecutor = db
+) {
   const validation = monitorsInsertSchema.safeParse(data);
   if (!validation.success) {
     throw {
@@ -61,14 +73,22 @@ export async function createMonitorHandler(data: MonitorApiData) {
     // id, createdAt, updatedAt are typically auto-generated or set by DB/Drizzle
   };
 
-  const [newMonitor] = await db
+  const [newMonitor] = await executor
     .insert(monitorTable)
     .values(newMonitorData) // Use the explicitly mapped data
     .returning();
 
+  return { newMonitor, enabled: validatedData.enabled !== false };
+}
+
+/** Schedule a freshly committed monitor. Must run after the insert commits. */
+export async function scheduleCreatedMonitor(
+  newMonitor: typeof monitorTable.$inferSelect,
+  enabled: boolean
+) {
   if (
     newMonitor &&
-    validatedData.enabled !== false &&
+    enabled &&
     newMonitor.frequencyMinutes > 0
   ) {
     // Use validatedData.enabled here
@@ -112,6 +132,18 @@ export async function createMonitorHandler(data: MonitorApiData) {
   return newMonitor;
 }
 
+export async function createMonitorHandler(data: MonitorApiData) {
+  const { newMonitor, enabled } = await insertMonitorRecord(data);
+  return scheduleCreatedMonitor(newMonitor, enabled);
+}
+
+/** Config that changes what a check does. Alert channels, regions and bookkeeping must not reset the schedule. */
+export function executionConfig(config: MonitorConfig | null | undefined) {
+  return Object.fromEntries(Object.entries(config ?? {}).filter(([key]) =>
+    !["locationConfig", "regions", "alertChannels", "sslLastCheckedAt", "testTitle", "retryStrategy"].includes(key)
+  ));
+}
+
 export async function updateMonitorHandler(
   monitorId: string,
   data: Partial<MonitorApiData>
@@ -134,6 +166,7 @@ export async function updateMonitorHandler(
   if (data.frequencyMinutes !== undefined)
     updateData.frequencyMinutes = data.frequencyMinutes;
   if (data.config !== undefined) updateData.config = data.config;
+  if (data.enabled !== undefined) updateData.enabled = data.enabled;
   if (data.alertConfig !== undefined) updateData.alertConfig = data.alertConfig;
   // Do not include organizationId or createdByUserId in updates usually, unless specifically intended
 
@@ -145,6 +178,8 @@ export async function updateMonitorHandler(
   } else if (data.enabled === true && existingMonitor.status === "paused") {
     updateData.status = "pending" as DBMonitorStatus;
   }
+
+  if (data.status !== undefined) updateData.status = data.status;
 
   const [updatedMonitor] = await db
     .update(monitorTable)
@@ -161,9 +196,13 @@ export async function updateMonitorHandler(
 
   // Handle re-scheduling or unscheduling (like jobs do)
   const shouldReschedule =
+    (data.status !== undefined && (data.status === "paused") !== (existingMonitor.status === "paused")) ||
     (data.frequencyMinutes !== undefined &&
       data.frequencyMinutes !== existingMonitor.frequencyMinutes) ||
-    (data.enabled !== undefined && data.enabled !== existingMonitor.enabled);
+    (data.enabled !== undefined && data.enabled !== existingMonitor.enabled) ||
+    (data.type !== undefined && data.type !== existingMonitor.type) ||
+    (data.target !== undefined && data.target !== existingMonitor.target) ||
+    (data.config !== undefined && !isDeepStrictEqual(executionConfig(data.config), executionConfig(existingMonitor.config)));
 
   if (shouldReschedule) {
     // Remove existing schedule if any
@@ -227,35 +266,6 @@ export async function updateMonitorHandler(
     }
   }
   return updatedMonitor;
-}
-
-export async function deleteMonitorHandler(monitorId: string) {
-  // Remove scheduled job first (like jobs do)
-  const monitor = await db.query.monitors.findFirst({
-    where: eq(monitorTable.id, monitorId),
-  });
-
-  if (monitor?.scheduledJobId) {
-    try {
-      await deleteScheduledMonitor(monitor.scheduledJobId);
-    } catch (scheduleError) {
-      console.warn(
-        `Could not remove schedule for monitor ${monitorId} during deletion:`,
-        scheduleError
-      );
-      // Continue with deletion even if unscheduling fails
-    }
-  }
-
-  const [deletedMonitor] = await db
-    .delete(monitorTable)
-    .where(eq(monitorTable.id, monitorId))
-    .returning();
-
-  if (!deletedMonitor) {
-    throw { statusCode: 404, message: "Monitor not found for deletion" };
-  }
-  return deletedMonitor;
 }
 
 /**

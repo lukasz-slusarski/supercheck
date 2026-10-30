@@ -118,7 +118,7 @@ const formSchema = z
     type: z.enum(
       ["http_request", "website", "ping_host", "port_check", "synthetic_test"],
       {
-        required_error: "Please select a check type",
+        error: "Please select a check type",
       }
     ),
     interval: z.string().default("1800"),
@@ -1063,6 +1063,7 @@ export function MonitorForm({
               value={locationConfig}
               onChange={setLocationConfig}
               disabled={isSubmitting}
+              monitorType={type}
             />
             <div className="flex justify-end gap-4">
               <Button
@@ -1235,7 +1236,7 @@ export function MonitorForm({
 
                     return (
                       <FormItem className="space-y-2">
-                        <div className="flex items-center gap-2 mb-0">
+                        <div className="flex h-3.5 items-center gap-2">
                           <FormLabel>Check Interval</FormLabel>
                           <Popover>
                             <PopoverTrigger asChild>

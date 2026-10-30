@@ -1,10 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, lte, gt, ne } from 'drizzle-orm';
 import { DbService } from '../../db/db.service';
 import * as schema from '../../db/schema';
 import {
-  AlertType,
   NotificationProviderConfig,
   NotificationProviderType,
 } from '../../db/schema';
@@ -47,13 +46,13 @@ export class MonitorAlertService {
     const db = this.dbService.db;
 
     // Get monitor details
-    const monitor = (await db.query.monitors.findFirst({
+    const monitor = await db.query.monitors.findFirst({
       where: eq(schema.monitors.id, monitorId),
-    })) as typeof schema.monitors.$inferSelect | undefined;
+    });
 
     if (!monitor) {
       this.logger.error(`[NOTIFY] Monitor not found: ${monitorId}`);
-      return;
+      return { delivered: false };
     }
 
     // Get project information
@@ -69,7 +68,37 @@ export class MonitorAlertService {
     // Check if alerts are enabled
     if (!monitor.alertConfig?.enabled) {
       this.logger.log(`[NOTIFY] Alerts not enabled for monitor ${monitorId}`);
-      return;
+      return { delivered: false };
+    }
+
+    const maintenance = await db
+      .select({ id: schema.incidents.id })
+      .from(schema.statusPageComponentMonitors)
+      .innerJoin(
+        schema.incidentComponents,
+        eq(
+          schema.incidentComponents.componentId,
+          schema.statusPageComponentMonitors.componentId,
+        ),
+      )
+      .innerJoin(
+        schema.incidents,
+        eq(schema.incidents.id, schema.incidentComponents.incidentId),
+      )
+      .where(
+        and(
+          eq(schema.statusPageComponentMonitors.monitorId, monitorId),
+          ne(schema.incidents.status, 'resolved'),
+          lte(schema.incidents.scheduledFor, new Date()),
+          gt(schema.incidents.scheduledUntil, new Date()),
+        ),
+      )
+      .limit(1);
+    if (maintenance.length) {
+      this.logger.log(
+        `[NOTIFY] Suppressing monitor ${monitorId} alert during scheduled maintenance`,
+      );
+      return { delivered: false, suppressed: true };
     }
 
     // Get notification providers
@@ -114,7 +143,7 @@ export class MonitorAlertService {
       this.logger.log(
         `[NOTIFY] No notification providers configured for monitor ${monitorId}`,
       );
-      return;
+      return { delivered: false };
     }
 
     // Determine notification details
@@ -133,7 +162,7 @@ export class MonitorAlertService {
           this.logger.log(
             `[NOTIFY] Recovery notifications disabled for monitor ${monitorId}`,
           );
-          return;
+          return { delivered: false };
         }
         break;
       case 'failure':
@@ -145,7 +174,7 @@ export class MonitorAlertService {
           this.logger.log(
             `[NOTIFY] Failure notifications disabled for monitor ${monitorId}`,
           );
-          return;
+          return { delivered: false };
         }
         break;
       default: {
@@ -222,7 +251,7 @@ export class MonitorAlertService {
 
     if (deliveryResults.results.length > 0) {
       const historyRecords = deliveryResults.results.map((result) => ({
-        type: notificationType as AlertType,
+        type: notificationType,
         message: notificationPayload.message,
         target: monitor.name,
         targetType: 'monitor',
@@ -245,6 +274,7 @@ export class MonitorAlertService {
         createdRows,
       );
     }
+    return { delivered: successCount > 0 };
   }
 
   async sendSslExpirationNotification(
@@ -259,9 +289,9 @@ export class MonitorAlertService {
     const db = this.dbService.db;
 
     // Get monitor details
-    const monitor = (await db.query.monitors.findFirst({
+    const monitor = await db.query.monitors.findFirst({
       where: eq(schema.monitors.id, monitorId),
-    })) as typeof schema.monitors.$inferSelect | undefined;
+    });
 
     if (!monitor) {
       this.logger.error(`[SSL-NOTIFY] Monitor not found: ${monitorId}`);
@@ -400,8 +430,10 @@ export class MonitorAlertService {
     );
 
     if (deliveryResults.results.length > 0) {
-      const historyRecords = deliveryResults.results.map((result) => ({
-        type: 'ssl_expiring' as AlertType,
+      const historyRecords = deliveryResults.results.map<
+        typeof schema.alertHistory.$inferInsert
+      >((result) => ({
+        type: 'ssl_expiring',
         message: notificationPayload.message,
         target: monitor.name,
         targetType: 'monitor',

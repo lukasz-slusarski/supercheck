@@ -16,7 +16,7 @@ import {
 import { createSseResponse, createSseStream } from "@/sre/lib/sse-stream";
 import { createSreConnectorTools } from "@/sre/tools/connector-tools";
 import { createSreEvidenceTools } from "@/sre/tools/evidence-tools";
-import { requireSreSameOriginRequest } from "../_auth";
+import { requireSreSameOriginRequest, requireSreSubscription } from "../_auth";
 
 const chatRequestSchema = z.object({
   conversationId: z.string().uuid().optional().nullable(),
@@ -348,6 +348,9 @@ export async function POST(request: NextRequest) {
     );
   }
 
+  const subscriptionError = await requireSreSubscription(context.organizationId, { allowTrial: false });
+  if (subscriptionError) return subscriptionError;
+
   const rateLimit = await checkSreChatRateLimit(context.userId);
   if (!rateLimit.allowed) {
     if (rateLimit.unavailable) {
@@ -390,7 +393,7 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  const stream = createSseStream(async (send) => {
+  const stream = createSseStream(async (send, signal) => {
     const conversation = parsed.data.conversationId
       ? await getSreConversation({
           organizationId: context.organizationId,
@@ -445,6 +448,7 @@ export async function POST(request: NextRequest) {
       const liveConnectorToolsEnabled =
         parsed.data.useLiveConnectorTools && canInvestigateConnectors;
       const result = await runSreAgent({
+        abortSignal: signal,
         system: buildSreTriageSystemPrompt(),
         prompt: buildChatPrompt({
           message: parsed.data.message,

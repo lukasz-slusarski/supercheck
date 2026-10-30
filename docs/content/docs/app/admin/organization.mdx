@@ -1,12 +1,12 @@
 ---
-title: Organization Admin
+title: Organization
 description: Manage organization members, projects, and settings
 icon: UserCog
 ---
 
-Manage your organization's projects, members, CLI tokens, AI SRE setup, and audit trails from the Admin panel.
+Manage your organization's projects, members, CLI tokens, AI SRE setup, and audit trails from the Organization page in the sidebar.
 
-![Organization Admin Overview](/screenshots/org-admin-overview.png)
+![Organization overview](/screenshots/org-admin-overview.png)
 
 ## Your default organization
 
@@ -65,12 +65,22 @@ New members accept the invitation to join the organization.
 </Tab>
 <Tab value="Signup">
 
-Sign up or sign in with the invited email address, then accept the invitation to access the assigned projects.
+Sign up or sign in with the invited email address, then accept the invitation to access the assigned projects. On Supercheck Cloud, verify your email from the link we send before joining.
 
 ![Invitation Signup](/screenshots/org-admin-member-invite-signup.png)
 
 </Tab>
 </Tabs>
+
+<Accordions>
+<Accordion title="Leave an organization" id="leave-an-organization">
+
+Select a project in the team you want to leave, open your profile menu, and choose **Leave organization**. Confirm the organization name before leaving. This removes your membership and project assignments in that team and clears its selected context from all your sessions. Other memberships remain available through the project selector. If you have no memberships left, the normal setup flow creates your personal organization and project.
+
+Organization owners cannot leave. Transfer ownership or delete the organization first. Leaving requires an interactive browser session; CLI tokens cannot perform this action. An administrator must invite you again to rejoin.
+
+</Accordion>
+</Accordions>
 
 ## Roles
 
@@ -117,8 +127,7 @@ Administrators configure project-level AI SRE setup from **Admin** so responders
 The setup tabs are:
 
 - **Services** — Open the top-level **Services** page to register production services and ownership metadata used to map alerts, incidents, and connector evidence.
-- **Integrations** — Configure read-only evidence connectors and link alert notification providers to connector context.
-- **Diagnostic Recipes** — Save bounded, allowlisted read-only query recipes for common incident questions.
+- **Integrations** — Configure read-only evidence connectors, link alert notification providers to connector context, and optionally save repeatable read-only queries.
 - **Private Agents** — [Register and deploy an agent](/docs/app/deployment/private-agent) to use private evidence sources in investigations.
 
 See [AI SRE setup](/docs/app/admin/ai-sre-setup) for the full setup flow.
@@ -133,9 +142,11 @@ Track all actions performed within your organization. View who did what and when
 
 The audit log captures events across these categories:
 
-- **Authentication** — Login, logout, password resets
-- **Authorization** — Role changes, permission grants
-- **Resource Management** — Test creation, monitor updates, job deletions
-- **Execution** — Manual test runs, job triggers
-- **Configuration** — Settings changes, integration updates
-- **Security** — Failed logins, unauthorized access attempts
+| Category | Examples |
+|---|---|
+| **Authentication** | Login, logout, password resets |
+| **Authorization** | Role changes, permission grants |
+| **Resource Management** | Test creation, monitor updates, job deletions |
+| **Execution** | Manual test runs, job triggers |
+| **Configuration** | Settings changes, integration updates |
+| **Security** | Failed logins, unauthorized access attempts |

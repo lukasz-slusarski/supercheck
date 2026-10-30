@@ -1,3 +1,4 @@
+import { isUuid } from "@/lib/uuid";
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/utils/db';
 import { projectMembers, projects } from '@/db/schema';
@@ -11,7 +12,7 @@ export async function GET(
 ) {
   const resolvedParams = await params;
   try {
-    const { userId, organizationId: activeOrganizationId } = await requireUserAuthContext();
+    const { userId, organizationId: activeOrganizationId, projectId, isCliAuth } = await requireUserAuthContext();
 
     if (!activeOrganizationId) {
       return NextResponse.json(
@@ -32,6 +33,7 @@ export async function GET(
     }
 
     // Get project assignments for the specific user in the active organization
+    if (!isUuid((await params).userId)) return NextResponse.json({ error: "User not found" }, { status: 404 });
     const userProjectAssignments = await db
       .select({
         projectId: projectMembers.projectId,
@@ -44,7 +46,8 @@ export async function GET(
       .where(
         and(
           eq(projectMembers.userId, resolvedParams.userId),
-          eq(projects.organizationId, activeOrganizationId)
+          eq(projects.organizationId, activeOrganizationId),
+          isCliAuth && projectId ? eq(projects.id, projectId) : undefined
         )
       );
 

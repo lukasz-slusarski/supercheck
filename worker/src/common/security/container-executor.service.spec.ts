@@ -3,6 +3,7 @@ jest.mock('fs/promises');
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import {
+  computeBillableMs,
   ContainerExecutionOptions,
   ContainerExecutorService,
 } from './container-executor.service';
@@ -62,6 +63,88 @@ describe('ContainerExecutorService', () => {
     await service.onModuleDestroy();
   });
 
+  describe('isolation canary admission', () => {
+    beforeEach(() => {
+      (service as any).k8sModule = {
+        Observable: class {
+          constructor(readonly promise: Promise<unknown>) {}
+        },
+      };
+    });
+    it('reads only the selected pool and refuses a fresh explicit failure', async () => {
+      mockConfigGet.mockImplementation((key: string) =>
+        key === 'ISOLATION_CANARY_GATE_ENABLED' ? 'true' : undefined,
+      );
+      (service as any).executionNodeSelector = { region: 'eu-central' };
+      const read = jest.fn().mockResolvedValue({
+        data: {
+          'eu-central': JSON.stringify({
+            status: 'failed',
+            completedAt: new Date().toISOString(),
+          }),
+        },
+      });
+      (service as any).coreApi = { readNamespacedConfigMap: read };
+      await expect(
+        (service as any).checkIsolationCanaryAdmission(),
+      ).rejects.toThrow('isolation canary failed for pool eu-central');
+      expect(read).toHaveBeenCalledWith(
+        {
+          namespace: 'supercheck-execution',
+          name: 'isolation-pool-health',
+        },
+        expect.objectContaining({ middleware: expect.any(Array) }),
+      );
+      read.mockResolvedValue({ data: {} });
+      await expect(
+        (service as any).checkIsolationCanaryAdmission(),
+      ).resolves.toBeUndefined();
+      read.mockRejectedValue(new Error('API unavailable'));
+      await expect(
+        (service as any).checkIsolationCanaryAdmission(),
+      ).resolves.toBeUndefined();
+    });
+
+    it('aborts a stalled health read after two seconds and admits execution', async () => {
+      jest.useFakeTimers();
+      try {
+        mockConfigGet.mockImplementation((key: string) =>
+          key === 'ISOLATION_CANARY_GATE_ENABLED' ? 'true' : undefined,
+        );
+        (service as any).executionNodeSelector = { region: 'eu-central' };
+        let signal: AbortSignal | undefined;
+        (service as any).coreApi = {
+          readNamespacedConfigMap: jest.fn((_params, options) => {
+            options.middleware[0].pre({
+              setSignal: (value: AbortSignal) => {
+                signal = value;
+              },
+            });
+            return new Promise((_resolve, reject) =>
+              signal!.addEventListener('abort', () =>
+                reject(new Error('aborted')),
+              ),
+            );
+          }),
+        };
+        const admission = (service as any).checkIsolationCanaryAdmission();
+        expect(signal?.aborted).toBe(false);
+        await jest.advanceTimersByTimeAsync(2000);
+        await expect(admission).resolves.toBeUndefined();
+        expect(signal?.aborted).toBe(true);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('does not query health when the rollout flag is disabled', async () => {
+      const read = jest.fn();
+      (service as any).coreApi = { readNamespacedConfigMap: read };
+      await (service as any).checkIsolationCanaryAdmission();
+      expect(read).not.toHaveBeenCalled();
+    });
+  });
+
   describe('backend configuration', () => {
     it('initializes kubernetes clients on startup', async () => {
       const ensureClients = jest.spyOn(
@@ -70,6 +153,22 @@ describe('ContainerExecutorService', () => {
       );
       await service.onModuleInit();
       expect(ensureClients).toHaveBeenCalled();
+    });
+
+    it('keeps a reserved execution deadline free of artifact grace', () => {
+      const manifest = service['buildExecutionJob']({
+        jobName: 'sc-quota',
+        workspace: '/tmp/run',
+        workingDir: '/tmp',
+        limits: {
+          valid: true,
+          timeoutMs: 30_000,
+          memoryLimitMb: 512,
+          cpuLimit: 0.5,
+        },
+        options: { ...defaultOptions, hardDeadlineMs: 10_999 },
+      });
+      expect(manifest.spec?.activeDeadlineSeconds).toBe(10);
     });
 
     it('bounds execution pod ephemeral storage and tmp volume size', () => {
@@ -410,7 +509,355 @@ describe('ContainerExecutorService', () => {
     });
   });
 
+  describe('hasActiveExecution', () => {
+    function failingApi() {
+      service['ensureKubernetesClients'] = jest
+        .fn()
+        .mockResolvedValue(undefined);
+      service['batchApi'] = {
+        listNamespacedJob: jest
+          .fn()
+          .mockRejectedValue(new Error('apiserver down')),
+      } as unknown as NonNullable<(typeof service)['batchApi']>;
+    }
+
+    it('assumes a run is active while Kubernetes cannot be queried', async () => {
+      failingApi();
+      await expect(service.hasActiveExecution('run-1')).resolves.toBe(true);
+      await expect(
+        service.hasActiveExecution('run-1', { boundUncertainty: true }),
+      ).resolves.toBe(true);
+    });
+
+    it('fails loudly after a prolonged outage instead of delaying forever', async () => {
+      failingApi();
+      for (let i = 0; i < 30; i++) {
+        await expect(
+          service.hasActiveExecution('run-2', { boundUncertainty: true }),
+        ).resolves.toBe(true);
+      }
+      await expect(
+        service.hasActiveExecution('run-2', { boundUncertainty: true }),
+      ).rejects.toThrow(/Unable to verify Kubernetes execution state/);
+    });
+
+    it('never throws for unbounded callers such as the stalled-run sweep', async () => {
+      failingApi();
+      for (let i = 0; i < 40; i++) {
+        await expect(service.hasActiveExecution('run-3')).resolves.toBe(true);
+      }
+    });
+
+    it('resets the uncertainty count once Kubernetes answers', async () => {
+      failingApi();
+      for (let i = 0; i < 29; i++) {
+        await service.hasActiveExecution('run-4', { boundUncertainty: true });
+      }
+      service['batchApi'] = {
+        listNamespacedJob: jest.fn().mockResolvedValue({ items: [] }),
+      } as unknown as NonNullable<(typeof service)['batchApi']>;
+      await expect(
+        service.hasActiveExecution('run-4', { boundUncertainty: true }),
+      ).resolves.toBe(false);
+      failingApi();
+      await expect(
+        service.hasActiveExecution('run-4', { boundUncertainty: true }),
+      ).resolves.toBe(true);
+    });
+  });
+
   describe('kubernetes execution', () => {
+    it('retains the numeric exit-code fallback for a generic Kubernetes Error', async () => {
+      service['coreApi'] = {
+        readNamespacedPod: jest.fn().mockResolvedValue({
+          status: {
+            containerStatuses: [
+              {
+                name: 'execution',
+                state: { terminated: { exitCode: 1, reason: 'Error' } },
+              },
+            ],
+          },
+        }),
+      } as unknown as NonNullable<(typeof service)['coreApi']>;
+      const outcome = await service['waitForExecutionOutcome'](
+        'pod',
+        '/tmp/run',
+        1000,
+        { startedAtMs: null, finishedAtMs: null },
+        jest.fn(),
+      );
+      expect(outcome).toMatchObject({ exitCode: 1, message: undefined });
+    });
+
+    it('records container start and finish times as billable evidence', async () => {
+      const evidence = { startedAtMs: null, finishedAtMs: null } as {
+        startedAtMs: number | null;
+        finishedAtMs: number | null;
+      };
+      service['coreApi'] = {
+        readNamespacedPod: jest.fn().mockResolvedValue({
+          status: {
+            containerStatuses: [
+              {
+                name: 'execution',
+                state: {
+                  terminated: {
+                    exitCode: 0,
+                    startedAt: '2026-10-18T10:00:00.000Z',
+                    finishedAt: '2026-10-18T10:00:30.000Z',
+                  },
+                },
+              },
+            ],
+          },
+        }),
+      } as unknown as NonNullable<(typeof service)['coreApi']>;
+      await service['waitForExecutionOutcome'](
+        'pod',
+        '/tmp/run',
+        1000,
+        evidence,
+        jest.fn(),
+      );
+      expect(computeBillableMs(evidence)).toBe(30_000);
+    });
+
+    it('bills zero when the container never started', () => {
+      expect(computeBillableMs({ startedAtMs: null, finishedAtMs: null })).toBe(
+        0,
+      );
+      expect(
+        computeBillableMs({ startedAtMs: null, finishedAtMs: Date.now() }),
+      ).toBe(0);
+    });
+
+    it('bills zero for a container whose reported start is the zero time', async () => {
+      const evidence = { startedAtMs: null, finishedAtMs: null } as {
+        startedAtMs: number | null;
+        finishedAtMs: number | null;
+      };
+      service['coreApi'] = {
+        readNamespacedPod: jest.fn().mockResolvedValue({
+          status: {
+            containerStatuses: [
+              {
+                name: 'execution',
+                state: {
+                  terminated: {
+                    exitCode: 128,
+                    reason: 'StartError',
+                    startedAt: '1970-01-01T00:00:00Z',
+                    finishedAt: '1970-01-01T00:00:00Z',
+                  },
+                },
+              },
+            ],
+          },
+        }),
+      } as unknown as NonNullable<(typeof service)['coreApi']>;
+      await service['waitForExecutionOutcome'](
+        'pod',
+        '/tmp/run',
+        1000,
+        evidence,
+        jest.fn(),
+      );
+      expect(evidence.startedAtMs).toBeNull();
+      expect(computeBillableMs(evidence, 1000)).toBe(0);
+    });
+
+    it('never bills past the job deadline or a negative span', () => {
+      const now = Date.now();
+      expect(
+        computeBillableMs(
+          { startedAtMs: now - 10 * 60_000, finishedAtMs: null },
+          60_000,
+        ),
+      ).toBe(60_000 + 150_000);
+      expect(
+        computeBillableMs({ startedAtMs: now, finishedAtMs: now - 5_000 }),
+      ).toBe(0);
+    });
+
+    it('bills a still-running container from its start until now', () => {
+      const started = Date.now() - 5_000;
+      const billable = computeBillableMs({
+        startedAtMs: started,
+        finishedAtMs: null,
+      });
+      expect(billable).toBeGreaterThanOrEqual(5_000);
+      expect(billable).toBeLessThan(10_000);
+    });
+
+    it('reports OOM termination as failure rather than user cancellation', async () => {
+      service['coreApi'] = {
+        readNamespacedPod: jest.fn().mockResolvedValue({
+          status: {
+            containerStatuses: [
+              {
+                name: 'execution',
+                state: { terminated: { exitCode: 137, reason: 'OOMKilled' } },
+              },
+            ],
+          },
+        }),
+      } as unknown as NonNullable<(typeof service)['coreApi']>;
+      const outcome = await service['waitForExecutionOutcome'](
+        'pod',
+        '/tmp/run',
+        1000,
+        { startedAtMs: null, finishedAtMs: null },
+        jest.fn(),
+      );
+      expect(outcome).toMatchObject({
+        exitCode: 137,
+        cancelled: false,
+        message: 'OOMKilled',
+      });
+    });
+
+    it.each([0, 1])(
+      'caps log snapshots with %i overflow bytes',
+      async (overflow) => {
+        const limit = 10 * 1024 * 1024;
+        service['logClient'] = {
+          log: jest.fn(async (_namespace, _pod, _container, sink: Writable) => {
+            sink.write(Buffer.alloc(limit - 2, 'a'));
+            sink.end(Buffer.alloc(2 + overflow, 'b'));
+          }),
+        } as unknown as NonNullable<(typeof service)['logClient']>;
+        const output = await service['fetchPodLogsSnapshot']('pod');
+        const marker = '\n[Supercheck output truncated at 10 MiB]';
+        expect(output).toBe(
+          'a'.repeat(limit - 2) + 'bb' + (overflow ? marker : ''),
+        );
+        expect(service['logClient'].log).toHaveBeenCalledWith(
+          expect.any(String),
+          'pod',
+          'execution',
+          expect.any(Writable),
+          { follow: false, timestamps: false, limitBytes: limit + 64 * 1024 },
+        );
+      },
+    );
+
+    it.each([false, true])(
+      'preserves artifact collection and fails if the pod terminates before collection=%s',
+      async (earlyTermination) => {
+        service['batchApi'] = {
+          createNamespacedJob: jest
+            .fn()
+            .mockResolvedValue({ metadata: { uid: 'job-uid' } }),
+        } as unknown as NonNullable<(typeof service)['batchApi']>;
+        service['createExecutionSecret'] = jest
+          .fn()
+          .mockResolvedValue(undefined);
+        service['waitForExecutionPod'] = jest.fn().mockResolvedValue('pod');
+        service['waitForExecutionOutcome'] = jest
+          .fn()
+          .mockImplementation(
+            async (
+              _pod,
+              _workspace,
+              _timeout,
+              _evidence,
+              collect: () => Promise<void>,
+            ) => {
+              if (!earlyTermination) await collect();
+              return { exitCode: 0, timedOut: false, cancelled: false };
+            },
+          );
+        service['startLogStreamWithReconnect'] = jest
+          .fn()
+          .mockReturnValue(new AbortController());
+        service['signalExecutionExit'] = jest.fn().mockResolvedValue(undefined);
+        service['extractPodArtifacts'] = jest.fn().mockResolvedValue(undefined);
+        service['deleteExecutionJob'] = jest.fn().mockResolvedValue(undefined);
+        service['fetchPodLogsSnapshot'] = jest.fn().mockResolvedValue('');
+        const result = await service.executeInContainer(null, ['node'], {
+          ...defaultOptions,
+          extractFromContainer: '/tmp/report',
+          extractToHost: '/tmp/host-report',
+        });
+        expect(result.success).toBe(!earlyTermination);
+        if (earlyTermination)
+          expect(result.error).toContain('before requested artifacts');
+        else {
+          expect(service['extractPodArtifacts']).toHaveBeenCalledTimes(1);
+          expect(service['signalExecutionExit']).toHaveBeenCalledTimes(1);
+        }
+      },
+    );
+
+    it('does not charge artifact extraction against the execution timeout', async () => {
+      let now = 0;
+      const clock = jest.spyOn(Date, 'now').mockImplementation(() => now);
+      service['coreApi'] = {
+        readNamespacedPod: jest
+          .fn()
+          .mockResolvedValueOnce({
+            status: {
+              containerStatuses: [
+                { name: 'execution', state: { running: {} } },
+              ],
+            },
+          })
+          .mockResolvedValue({
+            status: {
+              containerStatuses: [
+                { name: 'execution', state: { terminated: { exitCode: 0 } } },
+              ],
+            },
+          }),
+      } as unknown as NonNullable<(typeof service)['coreApi']>;
+      service['readExecutionExitCode'] = jest.fn().mockResolvedValue(0);
+      service['sleep'] = jest.fn().mockResolvedValue(undefined);
+      try {
+        const outcome = await service['waitForExecutionOutcome'](
+          'pod',
+          '/tmp/run',
+          1000,
+          { startedAtMs: null, finishedAtMs: null },
+          async () => {
+            now = 2000;
+          },
+        );
+        expect(outcome).toMatchObject({ exitCode: 0, timedOut: false });
+      } finally {
+        clock.mockRestore();
+      }
+    });
+
+    it('uses Kubernetes exit status even when the tenant writes a successful marker', async () => {
+      const statuses = [
+        { name: 'execution', state: { running: {} } },
+        { name: 'execution', state: { terminated: { exitCode: 7 } } },
+      ];
+      const readPod = jest.fn().mockImplementation(() =>
+        Promise.resolve({
+          status: { containerStatuses: [statuses.shift()] },
+        }),
+      );
+      service['coreApi'] = {
+        readNamespacedPod: readPod,
+      } as unknown as NonNullable<(typeof service)['coreApi']>;
+      service['readExecutionExitCode'] = jest.fn().mockResolvedValue(0);
+      service['sleep'] = jest.fn().mockResolvedValue(undefined);
+      const collectArtifacts = jest.fn().mockResolvedValue(undefined);
+
+      const outcome = await service['waitForExecutionOutcome'](
+        'pod',
+        '/tmp/supercheck/run-test',
+        30000,
+        { startedAtMs: null, finishedAtMs: null },
+        collectArtifacts,
+      );
+      expect(outcome.exitCode).toBe(7);
+      expect(collectArtifacts).toHaveBeenCalledTimes(1);
+      expect(readPod).toHaveBeenCalledTimes(2);
+    });
+
     it.each([false, true])(
       'uses the complete snapshot over replayed logs, retaining the buffer on fetch failure=%s',
       async (snapshotFails) => {
@@ -503,7 +950,7 @@ describe('ContainerExecutorService', () => {
           inlineScriptContent: 'console.log("hello world")',
           inlineScriptFileName: 'test.ts',
           _workspace: '/tmp/supercheck/run-123',
-        } as any,
+        },
         ['node', 'test.ts'],
       );
 
@@ -520,7 +967,7 @@ describe('ContainerExecutorService', () => {
           ...defaultOptions,
           ensureDirectories: ['/tmp/reports', '/tmp/output'],
           _workspace: '/tmp/supercheck/run-456',
-        } as any,
+        },
         ['playwright', 'test', '/tmp/test.ts'],
       );
 
@@ -537,7 +984,7 @@ describe('ContainerExecutorService', () => {
         {
           ...defaultOptions,
           _workspace: '/tmp/supercheck/run-456',
-        } as any,
+        },
         [
           'k6',
           'run',
@@ -558,7 +1005,7 @@ describe('ContainerExecutorService', () => {
         {
           ...defaultOptions,
           _workspace: '/tmp/supercheck/run-789',
-        } as any,
+        },
         ['node', 'test.ts'],
       );
 
@@ -662,6 +1109,112 @@ describe('ContainerExecutorService', () => {
       expect(job.spec?.template.spec?.runtimeClassName).toBe('gvisor');
       expect(job.spec?.template.spec?.nodeSelector).toBeUndefined();
       expect(job.spec?.template.spec?.tolerations).toBeUndefined();
+    });
+
+    describe('execution placement config validation', () => {
+      const originalEnv = { ...process.env };
+      afterEach(() => {
+        process.env = { ...originalEnv };
+      });
+
+      const build = (config: Record<string, string>) =>
+        new ContainerExecutorService(
+          {
+            get: jest.fn((key: string, defaultValue?: string) => {
+              const all: Record<string, string> = {
+                WORKER_IMAGE: 'ghcr.io/supercheck-io/worker:test',
+                ...config,
+              };
+              return all[key] ?? defaultValue;
+            }),
+          } as any,
+          {
+            isCancelled: jest.fn().mockResolvedValue(false),
+            clearCancellationSignal: jest.fn().mockResolvedValue(undefined),
+          } as any,
+        );
+
+      it.each(['true', '1'])(
+        'allows runtime opt-out for self-hosted production (%s)',
+        (value) => {
+          process.env.NODE_ENV = 'production';
+          process.env.SELF_HOSTED = value;
+          expect(() =>
+            build({ EXECUTION_RUNTIME_CLASS_NAME: 'none' }),
+          ).not.toThrow();
+        },
+      );
+
+      it('only warns about a malformed selector outside cloud production', () => {
+        process.env.NODE_ENV = 'test';
+        const svc = build({ EXECUTION_NODE_SELECTOR: 'not-a-pair' });
+        expect((svc as any).executionNodeSelector).toBeUndefined();
+      });
+
+      describe.each([
+        ['malformed key=value selector', { EXECUTION_NODE_SELECTOR: 'region' }],
+        ['malformed JSON selector', { EXECUTION_NODE_SELECTOR: '{"region":' }],
+        [
+          'selector with a dropped entry',
+          { EXECUTION_NODE_SELECTOR: '{"region":"eu","bad":1}' },
+        ],
+        [
+          'non-array tolerations',
+          { EXECUTION_TOLERATIONS_JSON: '{"key":"a"}' },
+        ],
+        [
+          'tolerations with a non-object item',
+          { EXECUTION_TOLERATIONS_JSON: '[{"key":"a"}, 5]' },
+        ],
+      ])('fails startup in cloud production for %s', (_name, config) => {
+        it('throws', () => {
+          process.env.NODE_ENV = 'production';
+          delete process.env.SELF_HOSTED;
+          expect(() =>
+            build({ EXECUTION_RUNTIME_CLASS_NAME: 'gvisor', ...config }),
+          ).toThrow(/Invalid EXECUTION_/);
+        });
+      });
+
+      it.each(['1', 'TRUE'])(
+        'only warns about mismatched placement for self-hosted production (SELF_HOSTED=%p)',
+        (value) => {
+          process.env.NODE_ENV = 'production';
+          process.env.SELF_HOSTED = value;
+          const svc = build({
+            EXECUTION_RUNTIME_CLASS_NAME: 'gvisor',
+            WORKER_LOCATION: 'asia-pacific',
+            EXECUTION_NODE_SELECTOR: 'region=us-east',
+          });
+          expect((svc as any).executionNodeSelector).toEqual({
+            region: 'us-east',
+          });
+        },
+      );
+
+      it('rejects a selector region that does not match WORKER_LOCATION in cloud production', () => {
+        process.env.NODE_ENV = 'production';
+        delete process.env.SELF_HOSTED;
+        expect(() =>
+          build({
+            EXECUTION_RUNTIME_CLASS_NAME: 'gvisor',
+            WORKER_LOCATION: 'asia-pacific',
+            EXECUTION_NODE_SELECTOR: 'region=us-east',
+          }),
+        ).toThrow(/does not match WORKER_LOCATION/);
+      });
+
+      it('accepts a valid region selector in cloud production', () => {
+        process.env.NODE_ENV = 'production';
+        delete process.env.SELF_HOSTED;
+        const svc = build({
+          EXECUTION_RUNTIME_CLASS_NAME: 'gvisor',
+          EXECUTION_NODE_SELECTOR: 'region=eu-central',
+        });
+        expect((svc as any).executionNodeSelector).toEqual({
+          region: 'eu-central',
+        });
+      });
     });
 
     it('uses configured runtime class, node selector, and tolerations', () => {
@@ -805,6 +1358,65 @@ describe('ContainerExecutorService', () => {
         { name: 'timeout', value: '2' },
         { name: 'attempts', value: '3' },
       ]);
+    });
+
+    describe('aborting a run whose reservation was lost', () => {
+      const build = (isCancelled = false) => {
+        const cancellation = {
+          isCancelled: jest.fn().mockResolvedValue(isCancelled),
+          clearCancellationSignal: jest.fn(),
+        };
+        const executor = new ContainerExecutorService(
+          {
+            get: jest.fn((_key: string, fallback?: string) => fallback),
+          } as any,
+          cancellation as any,
+        );
+        (executor as any).deleteExecutionJob = jest
+          .fn()
+          .mockResolvedValue(undefined);
+        return { executor, cancellation };
+      };
+
+      afterEach(() => jest.useRealTimers());
+
+      it("stops this process's container without touching the shared cancellation key", async () => {
+        jest.useFakeTimers();
+        const { executor, cancellation } = build();
+        const onCancelled = jest.fn();
+        executor.abortRun('run-1');
+        const timer = (executor as any).startKubernetesCancellationPoller(
+          'run-1',
+          'job-1',
+          onCancelled,
+        );
+        await jest.advanceTimersByTimeAsync(1100);
+        clearInterval(timer);
+        expect(onCancelled).toHaveBeenCalledTimes(1);
+        expect((executor as any).deleteExecutionJob).toHaveBeenCalledWith(
+          'job-1',
+        );
+        // The shared per-run key is not used to carry the abort, so a replacement attempt is not cancelled by it.
+        expect(cancellation.clearCancellationSignal).not.toHaveBeenCalled();
+      });
+
+      it('is consumed once, so a later attempt of the same run is not stopped by it', async () => {
+        jest.useFakeTimers();
+        const { executor } = build();
+        executor.abortRun('run-1');
+        expect((executor as any).consumeAbort('run-1')).toBe(true);
+        expect((executor as any).consumeAbort('run-1')).toBe(false);
+      });
+
+      it('lets a stale abort expire instead of hitting a much later attempt', () => {
+        const now = jest.spyOn(Date, 'now');
+        const { executor } = build();
+        now.mockReturnValue(1_000);
+        executor.abortRun('run-1');
+        now.mockReturnValue(1_000 + 31_000);
+        expect((executor as any).consumeAbort('run-1')).toBe(false);
+        now.mockRestore();
+      });
     });
 
     it('ignores invalid custom DNS nameservers', () => {

@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { randomUUID } from "node:crypto";
 import { db } from "@/utils/db";
 import { invitation, user as userTable, member, projects } from "@/db/schema";
 import { eq, and, inArray, sql, gte } from "drizzle-orm";
@@ -10,6 +11,7 @@ import { inviteMemberSchema } from "@/lib/validations/member";
 import { logAuditEvent } from "@/lib/audit-logger";
 import { renderOrganizationInvitationEmail } from "@/lib/email-renderer";
 import { checkTeamMemberLimit } from "@/lib/middleware/plan-enforcement";
+import { insertWithinPlanLimit } from "@/lib/middleware/plan-limit-lock";
 import { getRedisConnection } from "@/lib/queue";
 
 // Redis-based rate limiting for distributed/serverless environments
@@ -25,74 +27,89 @@ const INVITE_RATE_LIMIT_MAX =
     : 10;
 const INVITE_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
 
+type InviteReservation = { key: string; token: string };
+
 async function checkInviteRateLimit(
   userId: string,
-): Promise<{ allowed: boolean; retryAfter?: number }> {
+): Promise<{
+  allowed: boolean;
+  retryAfter?: number;
+  reservation?: InviteReservation;
+}> {
   try {
     const redis = await getRedisConnection();
     if (!redis) {
-      // If Redis is unavailable, fail open but log a warning
       console.warn("[INVITE_RATE_LIMIT] Redis unavailable, allowing request");
       return { allowed: true };
     }
-
-    const key = `${INVITE_RATE_LIMIT_KEY_PREFIX}:${userId}`;
-    const now = Date.now();
-    const windowStart = now - INVITE_RATE_LIMIT_WINDOW_MS;
-
-    // Clean up old entries and count remaining
-    await redis.zremrangebyscore(key, 0, windowStart);
-    const count = await redis.zcard(key);
-
-    if (count >= INVITE_RATE_LIMIT_MAX) {
-      // Get the oldest entry to calculate retry-after
-      const oldest = await redis.zrange(key, 0, 0, "WITHSCORES");
-      if (oldest.length >= 2) {
-        const oldestScore = Number(oldest[1]);
-        const retryAfter = Math.ceil(
-          (oldestScore + INVITE_RATE_LIMIT_WINDOW_MS - now) / 1000,
-        );
-        return { allowed: false, retryAfter };
-      }
-      return { allowed: false, retryAfter: 3600 };
-    }
-
-    // Add current request
-    await redis.zadd(key, now, `${now}`);
-    await redis.expire(key, Math.ceil(INVITE_RATE_LIMIT_WINDOW_MS / 1000));
-
-    return { allowed: true };
+    const reservation = {
+      key: `${INVITE_RATE_LIMIT_KEY_PREFIX}:${userId}`,
+      token: randomUUID(),
+    };
+    const retryMs = Number(
+      await redis.eval(
+        `
+      local now = tonumber(ARGV[1])
+      local window = tonumber(ARGV[2])
+      redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now - window)
+      if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[3]) then
+        local oldest = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+        return math.max(1, tonumber(oldest[2]) + window - now)
+      end
+      redis.call('ZADD', KEYS[1], now, ARGV[4])
+      redis.call('PEXPIRE', KEYS[1], window)
+      return 0
+    `,
+        1,
+        reservation.key,
+        Date.now(),
+        INVITE_RATE_LIMIT_WINDOW_MS,
+        INVITE_RATE_LIMIT_MAX,
+        reservation.token,
+      ),
+    );
+    return retryMs > 0
+      ? { allowed: false, retryAfter: Math.ceil(retryMs / 1000) }
+      : { allowed: true, reservation };
   } catch (error) {
     console.error("[INVITE_RATE_LIMIT] Error checking rate limit:", error);
-    // Fail open on error but log
+    // Preserve existing fail-open behavior when Redis is unavailable.
     return { allowed: true };
   }
 }
 
-export async function POST(request: NextRequest) {
+async function releaseInviteReservation(reservation: InviteReservation) {
   try {
-    const { userId, organizationId } = await requireUserAuthContext();
+    const redis = await getRedisConnection();
+    await redis?.zrem(reservation.key, reservation.token);
+  } catch (error) {
+    console.error(
+      "[INVITE_RATE_LIMIT] Error releasing rejected invitation quota:",
+      error,
+    );
+  }
+}
+
+export async function POST(request: NextRequest) {
+  let reservation: InviteReservation | undefined;
+  let invitationCreated = false;
+  try {
+    const { userId, organizationId, isCliAuth } =
+      await requireUserAuthContext();
+    if (isCliAuth) {
+      return NextResponse.json(
+        {
+          error:
+            "Organization administration requires an interactive browser session; CLI tokens are project-scoped",
+        },
+        { status: 403 },
+      );
+    }
 
     if (!organizationId) {
       return NextResponse.json(
         { error: "No active organization found" },
         { status: 400 },
-      );
-    }
-
-    // Check rate limit using Redis
-    const rateLimitResult = await checkInviteRateLimit(userId);
-    if (!rateLimitResult.allowed) {
-      return NextResponse.json(
-        {
-          error: `Rate limit exceeded. Maximum ${INVITE_RATE_LIMIT_MAX} invitations per hour.`,
-        },
-        {
-          status: 429,
-          headers: rateLimitResult.retryAfter
-            ? { "Retry-After": String(rateLimitResult.retryAfter) }
-            : undefined,
-        },
       );
     }
 
@@ -143,10 +160,10 @@ export async function POST(request: NextRequest) {
       });
     } catch (error) {
       if (error instanceof Error) {
-        const zodError = error as { errors?: { message: string }[] };
-        if (zodError.errors && zodError.errors.length > 0) {
+        const zodError = error as { issues?: { message: string }[] };
+        if (zodError.issues && zodError.issues.length > 0) {
           return NextResponse.json(
-            { error: zodError.errors[0].message },
+            { error: zodError.issues[0].message },
             { status: 400 },
           );
         }
@@ -162,23 +179,6 @@ export async function POST(request: NextRequest) {
     const selectedProjectsForRole = roleRequiresProjectAssignments
       ? normalizedSelectedProjects
       : [];
-
-    // Check team member limit for the organization
-    const currentMemberCount = await db
-      .select({ count: sql<number>`count(*)` })
-      .from(member)
-      .where(eq(member.organizationId, organizationId));
-
-    const limitCheck = await checkTeamMemberLimit(
-      organizationId,
-      Number(currentMemberCount[0]?.count || 0),
-    );
-    if (!limitCheck.allowed) {
-      console.warn(
-        `Team member limit reached for organization ${organizationId}: ${limitCheck.error}`,
-      );
-      return NextResponse.json({ error: limitCheck.error }, { status: 403 });
-    }
 
     // Check if user already exists and is a member
     const existingUser = await db
@@ -197,7 +197,10 @@ export async function POST(request: NextRequest) {
       // Owning an account organization does not prevent joining another team's
       // projects. The invitation grants only its explicit role in the target team.
       if (user.role === "super_admin") {
-        return NextResponse.json({ error: "System administrators cannot be invited as team members" }, { status: 400 });
+        return NextResponse.json(
+          { error: "System administrators cannot be invited as team members" },
+          { status: 400 },
+        );
       }
 
       // Check if already a member of current organization
@@ -269,22 +272,82 @@ export async function POST(request: NextRequest) {
       }
     }
 
+    // Reserve quota only after authorization, request, duplicate, and project validation.
+    const rateLimitResult = await checkInviteRateLimit(userId);
+    reservation = rateLimitResult.reservation;
+    if (!rateLimitResult.allowed) {
+      return NextResponse.json(
+        {
+          error: `Rate limit exceeded. Maximum ${INVITE_RATE_LIMIT_MAX} invitations per hour.`,
+        },
+        {
+          status: 429,
+          headers: rateLimitResult.retryAfter
+            ? { "Retry-After": String(rateLimitResult.retryAfter) }
+            : undefined,
+        },
+      );
+    }
+
     // Create invitation
     const expiresAt = new Date();
     expiresAt.setDate(expiresAt.getDate() + 7); // 7 days expiry
 
-    const [newInvitation] = await db
-      .insert(invitation)
-      .values({
-        organizationId,
-        email: normalizedEmail,
-        role,
-        status: "pending",
-        expiresAt,
-        inviterId: userId,
-        selectedProjects: selectedProjectsForRole,
-      })
-      .returning();
+    // Pending invitations reserve a seat: accepting one adds a member without
+    // re-checking the limit, so seats are counted at invite time. The lock keeps
+    // concurrent invites from all passing the same count.
+    const invited = await insertWithinPlanLimit({
+      organizationId,
+      resource: "members",
+      check: checkTeamMemberLimit,
+      countRows: async (tx) => {
+        const [memberRow] = await tx
+          .select({ count: sql<number>`count(*)` })
+          .from(member)
+          .where(eq(member.organizationId, organizationId));
+        const [pendingRow] = await tx
+          .select({ count: sql<number>`count(*)` })
+          .from(invitation)
+          .where(
+            and(
+              eq(invitation.organizationId, organizationId),
+              eq(invitation.status, "pending"),
+              gte(invitation.expiresAt, new Date()),
+            ),
+          );
+        return Number(memberRow?.count || 0) + Number(pendingRow?.count || 0);
+      },
+      insert: async (executor) => {
+        const [created] = await executor
+          .insert(invitation)
+          .values({
+            organizationId,
+            email: normalizedEmail,
+            role,
+            status: "pending",
+            expiresAt,
+            inviterId: userId,
+            selectedProjects: selectedProjectsForRole,
+          })
+          .returning();
+        return created;
+      },
+    });
+
+    if (!invited.ok && invited.busy) {
+      return NextResponse.json(
+        { error: "Too many concurrent requests. Please retry shortly." },
+        { status: 503, headers: { "Retry-After": "2" } },
+      );
+    }
+    if (!invited.ok) {
+      console.warn(
+        `Team member limit reached for organization ${organizationId}: ${invited.check.error}`,
+      );
+      return NextResponse.json({ error: invited.check.error }, { status: 403 });
+    }
+    const newInvitation = invited.row;
+    invitationCreated = true;
 
     // Send email invitation
     const emailService = EmailService.getInstance();
@@ -294,16 +357,17 @@ export async function POST(request: NextRequest) {
     if (selectedProjectDetails.length > 0) {
       const projectNames = selectedProjectDetails.map((p) => p.name);
       if (projectNames.length === 1) {
-        projectInfo = `You'll have ${role === 'project_admin' ? 'project admin' : 'editor'} permissions in the <strong>${projectNames[0]}</strong> project.`;
+        projectInfo = `You'll have ${role === "project_admin" ? "project admin" : "editor"} permissions in the <strong>${projectNames[0]}</strong> project.`;
       } else {
-        projectInfo = `You'll have ${role === 'project_admin' ? 'project admin' : 'editor'} permissions in the following projects: <strong>${projectNames.join(
+        projectInfo = `You'll have ${role === "project_admin" ? "project admin" : "editor"} permissions in the following projects: <strong>${projectNames.join(
           ", ",
         )}</strong>.`;
       }
     }
 
     if (roleRequiresProjectAssignments) {
-      projectInfo += " Other active projects in this team remain visible with read-only access.";
+      projectInfo +=
+        " Other active projects in this team remain visible with read-only access.";
     }
 
     // Fetch org name for email
@@ -398,5 +462,8 @@ export async function POST(request: NextRequest) {
       { error: "Failed to send invitation" },
       { status: 500 },
     );
+  } finally {
+    if (reservation && !invitationCreated)
+      await releaseInviteReservation(reservation);
   }
 }

@@ -1,23 +1,23 @@
 ---
-title: Single-Location
-description: Docker Compose deployment on a single server
+title: Self-Hosted
+description: Install Supercheck on one server with a guided command
 icon: Container
 ---
 
-Deploy Supercheck on a single server with Docker Compose.
+Self-host Supercheck on one Linux server. One command installs Docker, the isolated test sandbox, and every Supercheck service, then checks that it is healthy.
 
 ## Architecture
 
 <p className="text-sm md:hidden">Scroll horizontally to view the full diagram.</p>
 
-<div className="overflow-x-auto" role="region" aria-label="Single-Location deployment layout diagram" tabIndex={0}>
+<div className="overflow-x-auto" role="region" aria-label="Self-Hosted deployment layout diagram" tabIndex={0}>
 <div className="min-w-[52rem]">
 
 ```mermaid
 flowchart TB
-    Users[Users / CI/CD] --> T[Traefik Proxy<br/>SSL / Load Balancer]
+    Users[Users / CI/CD] --> T[Traefik Proxy<br/>HTTPS profile]
     T --> App[Next.js App<br/>UI + API]
-    App --> DB[(PostgreSQL<br/>Primary DB)] & Redis[(Redis + BullMQ<br/>Queue + Cache)] & S3[(MinIO<br/>Artifacts)]
+    App --> DB[(PostgreSQL<br/>Primary DB)] & Redis[(Redis + BullMQ<br/>Queue + Cache)] & S3[(RustFS<br/>Artifacts)]
     App --> SRE[AI SRE Engine<br/>Read-only investigations]
     SRE -.-> Private[Private Agents<br/>Outbound-only queries]
 
@@ -51,269 +51,210 @@ flowchart TB
 </div>
 </div>
 
-Use one Compose file for the bundled stack. HTTP is available on the host for evaluation; enable the `https` profile for a public server. The optional `private-agent` profile adds read-only access to private evidence sources.
+## Prerequisites
 
-## Docker Compose
+| Requirement | Details |
+|-------------|---------|
+| OS | Ubuntu 22.04+ or Debian 12+ (x86_64 or arm64) |
+| Resources | 2 vCPU and 4 GB RAM minimum; 10 GB free disk minimum, 15 GB to start, 30–50 GB for regular use |
+| Access | `sudo` and outbound internet access. Docker and Compose are installed for you |
+| Public HTTPS only | A domain pointing at the server (plus a wildcard record for status pages), inbound ports 80 and 443, and an email address for certificate notices |
 
-Use Ubuntu 22.04+ or Debian 12+ with Docker Engine and Compose **v2.24.4 or newer**. The execution sandbox requires Linux; macOS, Windows, and WSL2 are not supported. Allow at least 2 vCPU and 4 GB RAM.
+<Callout type="warn">
+**Linux only.** The test sandbox needs the Linux kernel. macOS, Windows, WSL2, and Docker Desktop are not supported.
+</Callout>
 
-Installing with an agent? Use the [installation runbook](https://raw.githubusercontent.com/supercheck-io/supercheck/main/deploy/docker/INSTALL.md).
+## Install
 
-### 1. Prepare the Host
+<Steps>
+<Step>
 
-```bash
-git clone https://github.com/supercheck-io/supercheck.git
-cd supercheck/deploy/docker
-./init-secrets.sh
-sudo bash setup-k3s.sh
-```
-
-The scripts generate secrets and prepare the isolated execution environment. Preserve an existing `.env` and its secrets when updating or retrying.
-
-### 2. Configure HTTPS
-
-For a public server, point your app hostname at the server and allow inbound TCP ports **80** and **443**. Edit `.env`:
-
-```dotenv
-COMPOSE_PROFILES=https
-APP_DOMAIN=app.example.com
-ACME_EMAIL=admin@example.com
-STATUS_PAGE_DOMAIN=example.com
-```
-
-Traefik obtains the app certificate and redirects HTTP to HTTPS. The app URL and authentication origin are derived from `APP_DOMAIN`. If `NEXT_PUBLIC_APP_URL` is already set, update it to the same HTTPS origin.
-
-For local evaluation, leave `COMPOSE_PROFILES` and `APP_DOMAIN` unset and open `http://localhost:3000` on the host. Port 3000 is bound to loopback; when using a remote server, forward it with SSH or configure HTTPS.
-
-`STATUS_PAGE_DOMAIN` reserves the default status-page namespace. Point its DNS records at your instance and provide a wildcard or per-host certificate before publishing subdomain status pages. Verified custom domains also route to the app, but require your own certificate setup. If using Cloudflare, use **Full (strict)** and keep custom-domain records DNS-only until verification and origin HTTPS work.
-
-### 3. Start and Verify
+### Download the installer
 
 ```bash
-KUBECONFIG_FILE=/etc/rancher/k3s/supercheck-worker.kubeconfig docker compose config -q
-KUBECONFIG_FILE=/etc/rancher/k3s/supercheck-worker.kubeconfig docker compose up -d --wait --wait-timeout 300
-docker compose ps
-curl --fail --silent --show-error https://app.example.com/api/health
+curl -fsSL https://raw.githubusercontent.com/supercheck-io/supercheck/main/deploy/docker/install.sh -o install.sh
 ```
 
-For local evaluation, use `http://localhost:3000/api/health`. The app applies migrations at startup; no separate migration command is needed. Sign up, then run a test to verify the execution sandbox. To grant your account Super Admin access:
+Read it first with `less install.sh` if you like. Add `--dry-run` in the next step to see the plan without changing anything.
 
-```bash
-docker compose exec app node scripts/bootstrap-admin.js your-email@example.com
-```
+</Step>
+<Step>
 
-### Optional Private Agent
+### Run it
 
-Register an agent in **Organization Admin → Private Agents**, then add its ID and registration token to `.env`:
+<Tabs items={['Guided', 'Local, no prompts', 'Public HTTPS, no prompts']}>
+  <Tab value="Guided">
+    ```bash
+    sudo bash install.sh --version 1.4.0
+    ```
 
-```dotenv
-COMPOSE_PROFILES=https,private-agent
-PRIVATE_AGENT_ID=your-agent-id
-PRIVATE_AGENT_TOKEN=your-registration-token
-```
+    The installer asks only what it cannot detect:
 
-```bash
-docker compose up -d private-agent
-```
+    | Prompt | Default | Notes |
+    |--------|---------|-------|
+    | `Choose` | `1` | `1` = try it on this server (HTTP on localhost); `2` = public server (HTTPS) |
+    | `Domain for Supercheck` | none | Public only. A hostname such as `app.example.com`, not an IP address or URL |
+    | `Email for Let's Encrypt notices` | none | Public only |
+    | `Continue?` | Yes | Last confirmation before anything is installed |
+  </Tab>
+  <Tab value="Local, no prompts">
+    ```bash
+    sudo bash install.sh --version 1.4.0 --local --yes
+    ```
+  </Tab>
+  <Tab value="Public HTTPS, no prompts">
+    ```bash
+    sudo bash install.sh --version 1.4.0 --domain app.example.com --email you@example.com --yes
+    ```
+  </Tab>
+</Tabs>
 
-The colocated agent connects to the app over the private Docker network. It receives no database, Redis, or storage credentials. See [Private Agent](/docs/app/deployment/private-agent) for connector setup and agents on another network or connected to Supercheck Cloud.
+Allow about 10 minutes, mostly image downloads. Re-running is safe: it keeps your existing `.env` and secrets and skips finished steps.
 
-To stop it, run `docker compose stop private-agent` and remove `private-agent` from `COMPOSE_PROFILES`. Keep the agent state volume for reconnection.
+</Step>
+<Step>
 
-### Existing Managed Services
+### Open Supercheck
 
-Use `docker-compose-external.yml` when you already have PostgreSQL, Redis, and S3-compatible storage. Configure their connection values and your domain in `.env`, then use `docker compose -f docker-compose-external.yml` for the commands above. For regional execution workers, see [Multi-Location](/docs/app/deployment/multi-location).
+The installer prints the URL: `https://<your-domain>` for a public install, or `http://localhost:3000` for a local one.
 
-## Optional Configuration
+Port 3000 listens on the server only. From your laptop, forward it with `ssh -L 3000:localhost:3000 <user>@<server>`. For HTTPS, the certificate is issued on first visit and can take up to a minute.
+
+Create your account, then add a test and run it.
+
+</Step>
+</Steps>
+
+<Callout type="warn">
+On a public server, sign-up is open to anyone who can reach the URL. Create your account first, then set `SIGNUP_ENABLED=false` in `.env` (or restrict it with `ALLOWED_EMAIL_DOMAINS`) and recreate the app. See [Optional configuration](#optional-configuration).
+</Callout>
 
 <Accordions>
-  <Accordion title="Browser Integrations (CORS)">
-    Browser-based integrations such as Azure DevOps dashboard widgets, Grafana panels, or custom embedded views need CORS enabled on the App service.
+<Accordion title="Installer options and exit codes" id="installer-options">
 
-    Add this to your `.env` when you want browser clients from those domains to call Supercheck APIs directly:
+| Option | Purpose |
+|--------|---------|
+| `--local` | Evaluate on this server (HTTP on localhost, port 3000) |
+| `--domain <host>` / `--email <address>` | Public HTTPS install; both are required together |
+| `--status-domain <host>` | Domain for status pages (default: same as `--domain`) |
+| `--yes`, `-y` | Never prompt; fail with a clear message if a value is missing |
+| `--dry-run` | Run read-only checks and print the plan; change nothing |
+| `--version <x.y.z>` | Release to install (default: the version bundled with the script) |
+| `--dir <path>` | Install location (default: `/opt/supercheck`) |
+| `--no-prewarm` | Skip importing the ~3 GB worker image into the sandbox; the first test run downloads it instead |
+| `--docker-group` | Add the invoking sudo user to the `docker` group (root-equivalent access) |
 
-    ```bash
-    CORS_ALLOWED_ORIGINS=https://dev.azure.com,https://*.visualstudio.com
-    ```
+Exit codes: `0` healthy, `1` failed, `2` bad usage, `3` installed but the health check reports a problem. The log is `/var/log/supercheck/install.log`.
 
-    <Callout type="info">
-    `CORS_ALLOWED_ORIGINS` is optional and empty by default. This preserves the secure default for self-hosted deployments. Only enable it for trusted browser-based integrations.
-    </Callout>
-
-  </Accordion>
-
-  <Accordion title="OAuth (GitHub / Google)">
-    <Tabs items={['GitHub', 'Google']}>
-      <Tab value="GitHub">
-        1. Go to [GitHub Developer Settings](https://github.com/settings/developers) → **OAuth Apps** → **New OAuth App**
-        2. Set Callback URL: `https://app.yourdomain.com/api/auth/callback/github`
-        3. Add to `.env`:
-           ```bash
-           GITHUB_CLIENT_ID=your-client-id
-           GITHUB_CLIENT_SECRET=your-client-secret
-           ```
-      </Tab>
-      <Tab value="Google">
-        1. Go to [Google Cloud Console](https://console.cloud.google.com/) → **APIs & Services** → **Credentials**
-        2. Create **OAuth client ID** with redirect URI: `https://app.yourdomain.com/api/auth/callback/google`
-        3. Add to `.env`:
-           ```bash
-           GOOGLE_CLIENT_ID=your-client-id.apps.googleusercontent.com
-           GOOGLE_CLIENT_SECRET=your-client-secret
-           ```
-      </Tab>
-    </Tabs>
-  </Accordion>
-
-  <Accordion title="Registration Controls">
-    | Variable | Default | Description |
-    |----------|---------|-------------|
-    | `SIGNUP_ENABLED` | `true` | Set `false` to disable open registration (invited users still work) |
-    | `ALLOWED_EMAIL_DOMAINS` | *(empty)* | Comma-separated allowlist (e.g. `acme.com,acme.org`) |
-  </Accordion>
-
-  <Accordion title="Email (SMTP)">
-    ```bash
-    SMTP_HOST=smtp.gmail.com
-    SMTP_PORT=587
-    SMTP_FROM_EMAIL=notifications@yourdomain.com
-    SMTP_USER=your-email@gmail.com        # Optional
-    SMTP_PASSWORD=your-app-password       # Optional
-    ```
-  </Accordion>
-
-  <Accordion title="AI Provider">
-    OpenAI GPT-6 Luna is the default for test creation, repair, requirement extraction, and AI SRE. Provider selection applies to the whole installation. When switching providers, set both `AI_PROVIDER` and the matching `AI_MODEL`.
-
-    <Tabs items={['OpenAI', 'Azure', 'Anthropic', 'Gemini', 'Vertex AI', 'Bedrock', 'OpenRouter', 'DeepSeek']}>
-      <Tab value="OpenAI">
-        ```bash
-        AI_PROVIDER=openai
-        AI_MODEL=gpt-6-luna
-        OPENAI_API_KEY=sk-your-api-key
-        ```
-      </Tab>
-      <Tab value="Azure">
-        ```bash
-        AI_PROVIDER=azure
-        AZURE_RESOURCE_NAME=your-resource-name
-        AZURE_API_KEY=your-api-key
-        AZURE_OPENAI_DEPLOYMENT=your-deployment-name
-        # Optional: only set if your Azure deployment supports temperature.
-        # GPT-5/reasoning deployments commonly reject this parameter.
-        AZURE_INCLUDE_TEMPERATURE=false
-        ```
-      </Tab>
-      <Tab value="Anthropic">
-        ```bash
-        AI_PROVIDER=anthropic
-        AI_MODEL=claude-3-5-haiku-20241022
-        ANTHROPIC_API_KEY=sk-ant-your-key
-        ```
-      </Tab>
-      <Tab value="Gemini">
-        ```bash
-        AI_PROVIDER=gemini
-        AI_MODEL=gemini-2.5-flash
-        GOOGLE_GENERATIVE_AI_API_KEY=your-api-key
-        ```
-      </Tab>
-      <Tab value="Vertex AI">
-        ```bash
-        AI_PROVIDER=google-vertex
-        AI_MODEL=gemini-2.5-flash
-        GOOGLE_VERTEX_PROJECT=your-project-id
-        ```
-
-        <Callout type="info">
-        Vertex AI uses [Google Application Default Credentials (ADC)](https://cloud.google.com/docs/authentication/application-default-credentials). On GCP, prefer an attached service account. For self-hosted Docker outside GCP, mount your service account key into the app container and set `GOOGLE_APPLICATION_CREDENTIALS` in the container environment; adding it to `.env` alone is not enough because the shipped Compose files do not forward that variable or mount the key file automatically.
-        </Callout>
-      </Tab>
-      <Tab value="Bedrock">
-        ```bash
-        AI_PROVIDER=bedrock
-        AI_MODEL=anthropic.claude-3-5-haiku-20241022-v1:0
-        BEDROCK_AWS_REGION=us-east-1
-        BEDROCK_AWS_ACCESS_KEY_ID=your-access-key
-        BEDROCK_AWS_SECRET_ACCESS_KEY=your-secret-key
-        ```
-      </Tab>
-      <Tab value="OpenRouter">
-        ```bash
-        AI_PROVIDER=openrouter
-        AI_MODEL=anthropic/claude-3.5-haiku
-        OPENROUTER_API_KEY=your-api-key
-        ```
-      </Tab>
-      <Tab value="DeepSeek">
-        ```bash
-        AI_PROVIDER=deepseek
-        AI_MODEL=deepseek-flash
-        DEEPSEEK_API_KEY=your-deepseek-api-key
-        ```
-
-        `deepseek-flash` is the official API model ID for [DeepSeek V4.1 Flash](https://api-docs.deepseek.com/news/news260910/).
-
-        <Callout type="warn">
-        DeepSeek is optional. Selecting it sends prompts, code, uploaded requirement text, and evidence supplied to AI features to DeepSeek's hosted API. Review its data handling and China-related residency implications against your organization's requirements before enabling it. DeepSeek errors do not automatically switch to OpenAI.
-        </Callout>
-      </Tab>
-    </Tabs>
-  </Accordion>
-
-  <Accordion title="AI SRE">
-    Configure an AI provider above to use investigations, Copilot, and automatic alert triage. Database migrations run automatically when the app starts.
-
-    No enable flags are needed. For manual investigations only, set `SRE_AUTOMATION_ENABLED=false`. To disable AI SRE entirely, set `SRE_ENABLED=false`.
-
-    Automatic triage can use your AI provider when alerts fire and incur provider charges. Copilot live sources are on by default for authorized users. Full investigation runs have a separate **Include live sources** option. See [AI SRE Setup](/docs/app/admin/ai-sre-setup).
-
-    After changing `.env`, apply it to both services:
-
-    ```bash
-    docker compose up -d --force-recreate app worker
-    ```
-
-  </Accordion>
+</Accordion>
 </Accordions>
 
----
+## Verify
 
-## Operations
-
-### Scaling
-
-Set `WORKER_REPLICAS` and `RUNNING_CAPACITY` to the same number in `.env`, then run `docker compose up -d`. Keep `WORKER_LOCATION=local` for a single-server installation.
-
-### Backups
-
-Back up your database, MinIO data, `.env`, and Traefik certificate volume before upgrades. For a database backup:
+Run from `/opt/supercheck/deploy/docker` (or `<your --dir>/deploy/docker`):
 
 ```bash
-docker compose exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"' > backup.sql
+sudo docker compose ps
+curl --fail --silent --show-error http://localhost:3000/api/health
 ```
 
-### Updates
+All services should be healthy and the health endpoint should return `{"status":"ok"...`. For HTTPS, also open `https://<your-domain>/api/health`.
 
-Set `SUPERCHECK_VERSION` to the release you want in `.env`, then run:
+<Accordions>
+<Accordion title="What gets installed" id="what-gets-installed">
+
+| Service | Purpose | Host port |
+|---------|---------|-----------|
+| `app` | Next.js UI and API | `127.0.0.1:3000` |
+| `worker` | Test execution in the gVisor sandbox | none |
+| `postgres` | Database | `127.0.0.1:5432` |
+| `redis` | Job queues | `127.0.0.1:6379` |
+| `rustfs` | S3-compatible artifact storage | `127.0.0.1:9000` |
+| `traefik` | HTTPS reverse proxy (HTTPS profile only) | `80`, `443` |
+
+Test runs can reach public addresses but not private networks (RFC1918, link-local, CGNAT, tailnet). Use a [Private Agent](/docs/app/deployment/private-agent) for services inside another network.
+
+</Accordion>
+</Accordions>
+
+## Optional configuration
+
+Edit `.env` in `deploy/docker`, then run `sudo docker compose up -d --force-recreate app worker`.
+
+<Accordions>
+<Accordion title="Common settings" id="common-settings">
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `SIGNUP_ENABLED` | `true` | `false` disables open registration (invited users still work) |
+| `ALLOWED_EMAIL_DOMAINS` | empty | Comma-separated signup allowlist, for example `acme.com,acme.org` |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_FROM_EMAIL`, `SMTP_USER`, `SMTP_PASSWORD` | unset | Email for alerts and invitations (disabled without `SMTP_HOST`) |
+| `AI_PROVIDER`, `AI_MODEL`, `OPENAI_API_KEY` | `openai`, `gpt-6-luna`, unset | AI features and AI SRE. Other providers: [Docker environment reference](https://github.com/supercheck-io/supercheck/blob/v1.4.0/deploy/docker/README.md#environment-variables) |
+| `SRE_AUTOMATION_ENABLED` | `false` | Automatic alert triage; can incur provider charges. Set in app and worker |
+| `DEVICE_AUTH_ENABLED` | `false` | Browser sign-in for `supercheck login`. Needs HTTPS (or localhost) |
+| `TRUSTED_PROXY_HOPS` | `0` | Extra trusted proxies in front of Traefik, such as a CDN |
+| `TRUST_CF_CONNECTING_IP` | `false` | `true` only if the server is reachable exclusively through Cloudflare |
+
+</Accordion>
+<Accordion title="Super Admin access" id="super-admin-access">
 
 ```bash
-docker compose pull
-KUBECONFIG_FILE=/etc/rancher/k3s/supercheck-worker.kubeconfig docker compose up -d
+sudo docker compose exec app node scripts/bootstrap-admin.js your-email@example.com
 ```
 
-The same file and profiles are used for installation and updates. After changing environment values, recreate the affected services; `restart` does not load new `.env` values:
+</Accordion>
+<Accordion title="Connecting AI tools (MCP)" id="connecting-ai-tools-mcp-off-by-default">
+
+Off by default. Lets Claude, Cursor, VS Code and other [MCP clients](/docs/mcp) read one project over read-only OAuth 2.1.
+
+| Step | Action |
+|---|---|
+| **1. Enable** | Set `MCP_SERVER_ENABLED=true` and recreate the app |
+| **2. Public URL** | `BETTER_AUTH_URL` must be the public HTTPS URL (`http://localhost:3000` for local use). Docker derives it from `APP_DOMAIN` |
+| **3. Check** | `/api/config/app` reports `mcp.enabled: true`; `POST /api/mcp` returns `401` with `WWW-Authenticate` |
+
+Optional: `MCP_DYNAMIC_CLIENT_REGISTRATION=false` accepts only clients with a Client ID Metadata Document.
+
+</Accordion>
+</Accordions>
+
+## Maintenance
+
+<Accordions>
+<Accordion title="Updates" id="updates">
+
+<Callout type="warn">
+Installations from a release that bundled MinIO must migrate storage to RustFS before updating. Run `migrate-minio-to-rustfs.sh` from your current checkout; see the [deployment README](https://github.com/supercheck-io/supercheck/blob/v1.4.0/deploy/docker/README.md#upgrading).
+</Callout>
+
+Back up first. From `deploy/docker`, set `SUPERCHECK_VERSION` in `.env`, then:
 
 ```bash
-docker compose up -d --force-recreate app worker
+sudo docker compose pull
+sudo env KUBECONFIG_FILE=/etc/rancher/k3s/supercheck-worker.kubeconfig docker compose up -d --wait --wait-timeout 300
 ```
 
-Recreate `private-agent` too when its settings change, preserving its state volume. Existing deployments may keep using `docker-compose-secure.yml`; it is a compatibility entry point backed by the main Compose file. HTTPS certificates and application data keep their existing named volumes.
+Migrations run automatically. Never run `docker compose down -v`; it deletes the database, artifacts, and queue. If workers cannot read their kubeconfig after an update, re-run `sudo bash setup-k3s.sh`.
 
-**Upgrading from before 1.3.3:** Back up your data and run `sudo bash setup-k3s.sh` before updating to the isolated execution sandbox.
+</Accordion>
+<Accordion title="Backups" id="backups">
 
-## Next Steps
+Back up PostgreSQL, the `rustfs-data` volume, `.env`, and (for HTTPS) the `traefik-letsencrypt` volume. Keep `.env` private and off the server: its secrets are needed to read encrypted data.
 
-- [AI SRE Setup](/docs/app/admin/ai-sre-setup) — add services and read-only evidence sources.
-- [Private Agent](/docs/app/deployment/private-agent) — reach sources inside another network.
-- [Multi-Location](/docs/app/deployment/multi-location) — add regional execution workers.
+```bash
+install -m 600 /dev/null "$HOME/supercheck-backup.sql" && \
+  sudo docker compose exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"' > "$HOME/supercheck-backup.sql"
+```
+
+The SQL export does not include files, `.env`, or certificates.
+
+</Accordion>
+</Accordions>
+
+## Next steps
+
+<Cards>
+  <Card title="Multi-Server" href="/docs/app/deployment/multi-server" description="Add execution workers on separate servers" />
+  <Card title="AI SRE Setup" href="/docs/app/admin/ai-sre-setup" description="Add services and read-only evidence sources" />
+  <Card title="Private Agent" href="/docs/app/deployment/private-agent" description="Reach sources inside another network" />
+</Cards>

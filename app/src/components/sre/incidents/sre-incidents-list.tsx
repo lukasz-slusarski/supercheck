@@ -26,7 +26,9 @@ import {
   createManualSreIncident,
   type SreIncidentListItem,
 } from "@/actions/sre-incidents";
+import { PageHeader } from "@/components/shared/page-header";
 import { DashboardEmptyState } from "@/components/dashboard/dashboard-empty-state";
+import { DataTableFacetedFilter } from "@/components/ui/data-table-faceted-filter";
 import { TableBadge, type TableBadgeTone } from "@/components/ui/table-badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -204,8 +206,9 @@ export function SreIncidentsList({
   const [summary, setSummary] = useState("");
   const [search, setSearch] = useState("");
   const deferredSearch = useDeferredValue(search);
-  const [severityFilter, setSeverityFilter] = useState("all");
-  const [statusFilter, setStatusFilter] = useState("active");
+  const [severityFilter, setSeverityFilter] = useState<string[]>([]);
+  const [statusFilter, setStatusFilter] = useState<string[]>(["active"]);
+  const [serviceFilter, setServiceFilter] = useState<string[]>([]);
   const [sortKey, setSortKey] = useState<IncidentSortKey>("updatedAt");
   const [sortDirection, setSortDirection] = useState<SortDirection>("desc");
   const [pageIndex, setPageIndex] = useState(0);
@@ -262,16 +265,38 @@ export function SreIncidentsList({
     [incidents],
   );
 
+  const serviceOptions = useMemo(
+    () =>
+      Array.from(
+        new Map(
+          incidents.map((incident) => [
+            incident.primaryServiceId ?? "unlinked",
+            {
+              value: incident.primaryServiceId ?? "unlinked",
+              label: incident.primaryServiceName ?? "No service linked",
+            },
+          ]),
+        ).values(),
+      ).sort((a, b) => a.label.localeCompare(b.label)),
+    [incidents],
+  );
+
   const filteredIncidents = useMemo(() => {
     const query = deferredSearch.trim().toLowerCase();
     const filtered = incidents.filter((incident) => {
       const matchesSeverity =
-        severityFilter === "all" || incident.severity === severityFilter;
+        severityFilter.length === 0 ||
+        severityFilter.includes(incident.severity);
       const matchesStatus =
-        statusFilter === "all" ||
-        (statusFilter === "active"
-          ? incident.status !== "resolved"
-          : incident.status === statusFilter);
+        statusFilter.length === 0 ||
+        statusFilter.some((status) =>
+          status === "active"
+            ? incident.status !== "resolved"
+            : incident.status === status,
+        );
+      const matchesService =
+        serviceFilter.length === 0 ||
+        serviceFilter.includes(incident.primaryServiceId ?? "unlinked");
       const searchable = [
         incident.id,
         String(incident.incidentNumber),
@@ -287,6 +312,7 @@ export function SreIncidentsList({
       return (
         matchesSeverity &&
         matchesStatus &&
+        matchesService &&
         (!query || searchable.includes(query))
       );
     });
@@ -307,6 +333,7 @@ export function SreIncidentsList({
     deferredSearch,
     incidents,
     severityFilter,
+    serviceFilter,
     sortDirection,
     sortKey,
     statusFilter,
@@ -342,117 +369,123 @@ export function SreIncidentsList({
   }
 
   return (
-    <div className="w-full max-w-full space-y-4 overflow-x-hidden p-2">
-      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <div className="shrink-0">
-          <h2 className="text-2xl font-semibold">Incidents</h2>
-          <p className="text-sm text-muted-foreground">
-            Track, investigate, and resolve operational incidents.
-          </p>
-        </div>
-        <div
-          className="flex w-full flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center lg:w-auto lg:justify-end"
-          data-testid="incident-header-actions"
-        >
-          {incidents.length > 0 && (
-            <>
-              <div className="relative w-full sm:w-[250px]">
-                <Search className="absolute left-2 top-2 h-4 w-4 text-muted-foreground" />
-                <Input
-                  value={search}
-                  onChange={(event) => {
-                    setSearch(event.target.value);
-                    setPageIndex(0);
-                  }}
-                  placeholder="Search incidents..."
-                  className="h-8 pl-8 pr-8"
-                />
-                {search.length > 0 && (
-                  <button
-                    type="button"
-                    className="absolute right-2 top-1/2 -translate-y-1/2 rounded-sm text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                    onClick={() => {
-                      setSearch("");
-                      setPageIndex(0);
-                    }}
-                    aria-label="Clear incident search"
-                  >
-                    <X className="h-4 w-4" />
-                  </button>
-                )}
-              </div>
-              <Select
-                value={severityFilter}
-                onValueChange={(value) => {
-                  setSeverityFilter(value);
-                  setPageIndex(0);
-                }}
-              >
-                <SelectTrigger className="h-8 w-full sm:w-[140px]">
-                  <SelectValue placeholder="Severity" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">All severities</SelectItem>
-                  <SelectItem value="sev1">SEV1</SelectItem>
-                  <SelectItem value="sev2">SEV2</SelectItem>
-                  <SelectItem value="sev3">SEV3</SelectItem>
-                  <SelectItem value="sev4">SEV4</SelectItem>
-                </SelectContent>
-              </Select>
-              <Select
-                value={statusFilter}
-                onValueChange={(value) => {
-                  setStatusFilter(value);
-                  setPageIndex(0);
-                }}
-              >
-                <SelectTrigger className="h-8 w-full sm:w-[140px]">
-                  <SelectValue placeholder="Status" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="active">Active incidents</SelectItem>
-                  <SelectItem value="all">All incidents</SelectItem>
-                  <SelectItem value="resolved">Resolved</SelectItem>
-                  {statusOptions
-                    .filter((status) => status !== "resolved")
-                    .map((status) => (
-                      <SelectItem key={status} value={status}>
-                        {formatStatus(status)}
-                      </SelectItem>
-                    ))}
-                </SelectContent>
-              </Select>
-            </>
-          )}
-          <Button asChild type="button" variant="outline" className="h-8">
-            <Link href="/alerts">Review alerts</Link>
-          </Button>
-          <Button asChild type="button" variant="outline" className="h-8">
-            <Link href="/incidents/analytics">
-              <BarChart3 className="h-4 w-4" />
-              Trends
-            </Link>
-          </Button>
-          {projectError && (
-            <p role="status" className="text-sm text-muted-foreground">
-              Permissions unavailable. Refresh to try again.
-            </p>
-          )}
-          {(canCreate || projectLoading) && (
-            <Button
-              type="button"
-              className="h-8"
-              disabled={!canCreate}
-              aria-busy={projectLoading || undefined}
-              title={projectLoading ? "Loading permissions..." : undefined}
-              onClick={() => setDialogOpen(true)}
-            >
-              <Plus className="h-4 w-4" />
-              New incident
+    <div className="w-full max-w-full mt-6 space-y-4 p-2">
+      <PageHeader
+        title="Incidents"
+        description="Track, investigate, and resolve operational incidents."
+        className="mb-4 -mt-2"
+        actions={
+          <div
+            className="flex flex-wrap items-center gap-2"
+            data-testid="incident-header-actions"
+          >
+            <Button asChild type="button" variant="outline" className="h-8">
+              <Link href="/alerts">Review alerts</Link>
             </Button>
+            <Button asChild type="button" variant="outline" className="h-8">
+              <Link href="/incidents/analytics">
+                <BarChart3 className="h-4 w-4" />
+                Trends
+              </Link>
+            </Button>
+            {projectError && (
+              <p role="status" className="text-sm text-muted-foreground">
+                Permissions unavailable. Refresh to try again.
+              </p>
+            )}
+            {(canCreate || projectLoading) && (
+              <Button
+                type="button"
+                className="h-8"
+                disabled={!canCreate}
+                aria-busy={projectLoading || undefined}
+                title={projectLoading ? "Loading permissions..." : undefined}
+                onClick={() => setDialogOpen(true)}
+              >
+                <Plus className="h-4 w-4" />
+                New incident
+              </Button>
+            )}
+          </div>
+        }
+      />
+
+      {incidents.length > 0 && (
+        <div
+          className="flex flex-wrap items-center gap-2"
+          data-testid="incident-toolbar"
+        >
+        <div className="relative w-full sm:w-[250px]">
+          <Search className="absolute left-2 top-2 h-4 w-4 text-muted-foreground" />
+          <Input
+            value={search}
+            onChange={(event) => {
+              setSearch(event.target.value);
+              setPageIndex(0);
+            }}
+            aria-label="Search incidents"
+            placeholder="Search incidents..."
+            className="h-8 pl-8 pr-8"
+          />
+          {search.length > 0 && (
+            <button
+              type="button"
+              className="absolute right-2 top-1/2 -translate-y-1/2 rounded-sm text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              onClick={() => {
+                setSearch("");
+                setPageIndex(0);
+              }}
+              aria-label="Clear incident search"
+            >
+              <X className="h-4 w-4" />
+            </button>
           )}
         </div>
-      </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <DataTableFacetedFilter
+            title="Severity"
+            value={severityFilter}
+            onValueChange={(values) => {
+              setSeverityFilter(values);
+              setPageIndex(0);
+            }}
+            options={["sev1", "sev2", "sev3", "sev4"].map((value) => ({
+              value,
+              label: value.toUpperCase(),
+            }))}
+          />
+          <DataTableFacetedFilter
+            title="Service"
+            value={serviceFilter}
+            onValueChange={(values) => {
+              setServiceFilter(values);
+              setPageIndex(0);
+            }}
+            options={serviceOptions}
+          />
+          <DataTableFacetedFilter
+            title="Status"
+            value={statusFilter}
+            onValueChange={(values) => {
+              // The active shortcut is exclusive so a specific status narrows the list.
+              setStatusFilter(
+                values.includes("active") &&
+                  !statusFilter.includes("active")
+                  ? ["active"]
+                  : values.filter((value) => value !== "active"),
+              );
+              setPageIndex(0);
+            }}
+            options={[
+              { value: "active", label: "Active incidents" },
+              ...Array.from(new Set([...statusOptions, "resolved"])).map(
+                (value) => ({ value, label: formatStatus(value) }),
+              ),
+            ]}
+          />
+        </div>
+        </div>
+      )}
 
       {incidents.length === 0 ? (
         <DashboardEmptyState
@@ -463,17 +496,25 @@ export function SreIncidentsList({
         />
       ) : (
         <>
-          <div className="w-full max-w-full overflow-hidden rounded-t-lg border">
-            <Table>
+          <div className="relative max-w-full overflow-x-auto rounded-t-lg border">
+            <Table className="w-full min-w-[900px]">
               <TableHeader>
                 <TableRow>
                   <SortableHead
-                    label="Incident"
+                    label="Incident ID"
+                    sortKey="incidentNumber"
+                    activeKey={sortKey}
+                    direction={sortDirection}
+                    onSort={handleSort}
+                    className="w-32"
+                  />
+                  <SortableHead
+                    label="Title"
                     sortKey="title"
                     activeKey={sortKey}
                     direction={sortDirection}
                     onSort={handleSort}
-                    className="w-[420px]"
+                    className="w-[360px]"
                   />
                   <SortableHead
                     label="Severity"
@@ -521,7 +562,7 @@ export function SreIncidentsList({
                 {pagedIncidents.length === 0 ? (
                   <TableRow>
                     <TableCell
-                      colSpan={6}
+                      colSpan={7}
                       className="h-24 text-center text-muted-foreground"
                     >
                       No incidents match the current filters.
@@ -542,18 +583,18 @@ export function SreIncidentsList({
                       }}
                       aria-label={`View incident ${incident.id}: ${incident.title}`}
                     >
-                      <TableCell className="max-w-[420px] py-2.5">
+                      <TableCell className="py-2.5">
+                        {/* Same badge style as the UUID columns in other tables. */}
+                        <code className="rounded-sm bg-muted/60 px-2 py-1 font-mono text-xs dark:bg-muted">
+                          #{incident.incidentNumber}
+                        </code>
+                      </TableCell>
+                      <TableCell className="max-w-[360px] py-2.5">
                         <span
                           className="block truncate font-medium"
                           title={incident.title}
                         >
-                          #{incident.incidentNumber} · {incident.title}
-                        </span>
-                        <span className="text-xs text-muted-foreground">
-                          {incident.alertCount} alert
-                          {incident.alertCount === 1 ? "" : "s"} ·{" "}
-                          {incident.evidenceCount} evidence item
-                          {incident.evidenceCount === 1 ? "" : "s"}
+                          {incident.title}
                         </span>
                       </TableCell>
                       <TableCell className="py-2.5">
@@ -616,7 +657,8 @@ export function SreIncidentsList({
 
           <div className="flex flex-col gap-3 px-2 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex-1 text-sm text-muted-foreground">
-              Total {filteredIncidents.length} {filteredIncidents.length === 1 ? "incident" : "incidents"}
+              Total {filteredIncidents.length}{" "}
+              {filteredIncidents.length === 1 ? "incident" : "incidents"}
             </div>
             <div className="flex flex-wrap items-center gap-3 sm:gap-6 lg:gap-8">
               <div className="flex items-center space-x-2">

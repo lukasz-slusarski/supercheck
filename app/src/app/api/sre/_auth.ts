@@ -3,6 +3,31 @@ import { NextRequest, NextResponse } from "next/server";
 import { isAuthError, requireAuthContext } from "@/lib/auth-context";
 import { checkPermissionWithContext } from "@/lib/rbac/middleware";
 import { requireSameOriginRequest } from "@/lib/security/same-origin";
+import { subscriptionService, SubscriptionAccessDeniedError } from "@/lib/services/subscription-service";
+
+/**
+ * Call after authentication and RBAC, before starting billable SRE work. A free trial counts its own
+ * investigations, so work that is not counted against that allowance (chat, evidence briefs) passes
+ * `allowTrial: false` and needs a plan.
+ */
+export async function requireSreSubscription(
+  organizationId: string,
+  options: { allowTrial?: boolean } = {},
+): Promise<NextResponse | null> {
+  try {
+    await subscriptionService.blockUntilSubscribed(organizationId, options);
+    await subscriptionService.requireValidPolarCustomer(organizationId, options);
+    return null;
+  } catch (error) {
+    if (error instanceof SubscriptionAccessDeniedError) {
+      return NextResponse.json({ error: error.message, code: error.reason }, { status: 402 });
+    }
+    return NextResponse.json(
+      { error: "Unable to verify SRE subscription. Please try again shortly." },
+      { status: 503 },
+    );
+  }
+}
 
 type SreApiPermission = {
   resource: Parameters<typeof checkPermissionWithContext>[0];
