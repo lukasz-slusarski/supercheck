@@ -725,6 +725,22 @@ export async function getCapacityQueues(): Promise<{
   };
 }
 
+/** Closes DB runs stuck in "queued" after their capacity queue entry expired. */
+async function closeOrphanedQueuedRuns(connection: Redis): Promise<void> {
+  try {
+    const { failOrphanedQueuedRuns } = await import("./orphaned-queued-runs");
+    const { db } = await import("@/utils/db");
+    const q = await getCapacityQueues();
+    await failOrphanedQueuedRuns({
+      db,
+      redis: connection,
+      queues: [...Object.values(q.playwrightQueues), ...Object.values(q.k6Queues)],
+    });
+  } catch (error) {
+    queueLogger.error({ err: error }, "Error while closing orphaned queued runs");
+  }
+}
+
 /**
  * Sets up periodic cleanup of orphaned Redis keys to prevent unbounded growth
  */
@@ -800,6 +816,7 @@ async function setupQueueCleanup(
             "Error during scheduled capacity reconciliation"
           );
         }
+        await closeOrphanedQueuedRuns(connection);
       },
       5 * 60 * 1000
     ); // Run reconciliation every 5 minutes
